@@ -10868,3 +10868,270 @@ _CS_CALM_LO = 192
 _CS_CALM_HI = 1024
 _CS_DYNAMIC_LO = 96
 _CS_DYNAMIC_HI = 512
+
+
+def _conditional_stability(
+    rng: np.random.Generator, n: int, L: int, *,
+    calm_kind_fixed: int | None = None,
+    calm_noise: float = 0.0,
+) -> np.ndarray:
+    """Alternating calm and dynamic segments, with the calm law selectable.
+
+    ``calm_noise`` is the standard deviation of observation noise added inside a
+    calm segment, in the same units as the segment level. At the default 0.0 the
+    calm modes behave as before: mode 0 is exactly constant for the whole calm
+    span and mode 1 drifts by so little that the integer rounding downstream
+    flattens it back to constant. Measured in isolation those two modes emit mean
+    held-runs of 216 and 62 samples against 9.9 in the eval pool, and the four
+    modes together supply a third of the corpus's excess. A non-zero value breaks
+    the exact-equality runs without changing the segment structure, which is why
+    it is a separate knob from the segment lengths -- it costs one vectorised draw
+    per segment rather than multiplying the number of segments.
+    """
+
+
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    if L <= 0:
+        return np.empty((n, 0), dtype=np.float64)
+
+    # Build each dynamic ingredient ONLY for the rows that will use it. The original
+    # materialised all four at full (n, L) and then used one per row -- 4x wasted work on
+    # the slowest family in the set. Row content is a different (equally valid) draw, since
+    # the RNG is consumed in a different order.
+    kind = rng.integers(0, 4, size=n)
+    dyn = np.empty((n, L), dtype=np.float64)
+    for _k in range(4):
+        _rows = np.nonzero(kind == _k)[0]
+        if _rows.size == 0:
+            continue
+        _m = int(_rows.size)
+        if _k == 0:
+            _v = _seasonal(rng, _m, L, k_max=2)
+        elif _k == 1:
+            _v = _ar1_batch(
+                rng.normal(size=(_m, L)) * rng.uniform(0.12, 0.55, size=(_m, 1)),
+                rng.uniform(0.35, 0.92, size=_m),
+            )
+        elif _k == 2:
+            _v = _spectral_gp(rng, _m, L)
+        else:
+            _v = np.cumsum(
+                rng.normal(size=(_m, L)) * rng.uniform(0.025, 0.16, size=(_m, 1)),
+                axis=1,
+            )
+        dyn[_rows] = _v
+    ingredients = None
+    calm_kind = rng.integers(0, 4, size=n)
+    if calm_kind_fixed is not None:
+        # pin every row's CALM behaviour to one marginal; the dynamic segments stay a
+        # random mix of {seasonal, ar1, smooth, walk} exactly as in the unsplit family
+        calm_kind = np.full(n, int(calm_kind_fixed), dtype=calm_kind.dtype)
+    level = rng.normal(0.0, 2.0, size=n)
+    # Vary calm/dynamic regime durations per generated call, following
+    # gen-4095e1095e74's conditional-stability meta-scale idea.
+    cs_meta = np.exp(rng.uniform(np.log(0.5), np.log(2.0)))
+    scale = np.exp(rng.uniform(np.log(0.4), np.log(12.0), size=n))
+    dynamic_amp = rng.uniform(0.6, 2.2, size=n)
+    start_calm = rng.random(n) < 0.65
+    out = np.empty((n, L), dtype=np.float64)
+
+    # The row calibration below the loop head touches no rng and each row is
+    # independent, so n normalisations collapse into one. Each row still
+    # reduces over a contiguous slice, so numpy's pairwise summation sees the
+    # same element order and mean/std are the same float64 (checked over 240
+    # shapes, constant rows included, and by corpus digest). Dividing the
+    # degenerate rows by exactly 1.0 reproduces the `> 1e-12` guard, since
+    # x / 1.0 == x. The subtraction builds a fresh array rather than a view of
+    # dyn, and `dynamic` is only read below, so the per-row copy is not needed.
+    _cal = dyn[:, : min(L, 512)]
+    _cal_std = _cal.std(axis=1)
+    _dyn_norm = dyn - _cal.mean(axis=1)[:, None]
+    _dyn_norm /= np.where(_cal_std > 1e-12, _cal_std, 1.0)[:, None]
+
+    for row in range(n):
+        dynamic = _dyn_norm[row]
+
+        current = float(level[row])
+        calm = bool(start_calm[row])
+        pos = 0
+        segment_index = 0
+        mode2_seen = False
+        while pos < L:
+            if calm:
+                seg_len = int(
+                    rng.integers(
+                        int(_CS_CALM_LO * cs_meta),
+                        int(_CS_CALM_HI * cs_meta) + 1,
+                    )
+                )
+            else:
+                seg_len = int(
+                    rng.integers(
+                        int(_CS_DYNAMIC_LO * cs_meta),
+                        int(_CS_DYNAMIC_HI * cs_meta) + 1,
+                    )
+                )
+
+
+            if segment_index == 0 and L >= 2 * _CS_DYNAMIC_LO:
+                seg_len = min(seg_len, L - _CS_DYNAMIC_LO)
+            end = min(pos + max(seg_len, 1), L)
+            span = end - pos
+
+            if calm:
+                mode = int(calm_kind[row])
+                if mode == 0:
+                    values = np.full(span, current)
+                    if calm_noise > 0.0:
+                        values = values + rng.normal(0.0, calm_noise, size=span)
+                elif mode == 1:
+
+
+                    drift = rng.normal(0.0, 0.0025, size=span).cumsum()
+                    drift += np.linspace(
+                        0.0, float(rng.normal(0.0, 0.025)), span
+                    )
+                    values = current + drift
+                    if calm_noise > 0.0:
+                        values = values + rng.normal(0.0, calm_noise, size=span)
+                elif mode == 2:
+
+                    if not mode2_seen:
+                        count_level = max(0.0, float(np.rint(abs(current) * 8.0)))
+                        mode2_seen = True
+                    else:
+                        count_level = max(0.0, float(np.rint(current)))
+                    updates = rng.random(span) < 0.06
+                    changes = updates * _CHOICE_PM1[
+                        rng.integers(0, 2, size=span)
+                    ]
+                    values = np.maximum(
+                        count_level + np.cumsum(changes), 0.0
+                    )
+                else:
+
+
+                    events = rng.random(span) < 0.012
+                    values = events * rng.gamma(1.5, 0.35, size=span)
+            else:
+                piece = dynamic[pos:end] * float(dynamic_amp[row])
+                values = piece - piece[0] + current
+                if span > 1 and values.max() - values.min() < 1e-10:
+                    values = current + np.linspace(0.0, 1.0, span)
+
+            out[row, pos:end] = values
+            current = float(values[-1])
+            pos = end
+            calm = not calm
+            segment_index += 1
+
+
+        row_scale = 1.0 if int(calm_kind[row]) == 2 else float(scale[row])
+        out[row] *= row_scale
+
+
+        if L > 1 and out[row].max() - out[row].min() < 1e-10:
+            out[row, -1] += max(1e-3, 0.01 * row_scale)
+    return out
+
+
+def _sanitize(block: np.ndarray) -> np.ndarray:
+
+
+    x = np.asarray(block, dtype=np.float64)
+    # nan_to_num walks the array ~6 times (isnan, isinf+signbit twice, copyto)
+    # and is a no-op on finite input, so gate it behind a single finiteness
+    # reduction. Rows carrying a non-finite value take the original path.
+    if not np.isfinite(x.sum()):
+        np.nan_to_num(x, copy=False, nan=0.0, posinf=1e6, neginf=-1e6)
+    # max|x| is max(max x, -min x) exactly, and two reductions beat
+    # materialising a whole |x| just to reduce it.
+    if x.ndim == 1:
+        peak = float(max(x.max(), -x.min()))
+        if peak > 1e6:
+            x *= 1e6 / peak
+    else:
+        peak = np.maximum(
+            x.max(axis=1, keepdims=True), -x.min(axis=1, keepdims=True)
+        )
+        # Nothing over the cap means every scale is 1.0, and multiplying a
+        # finite array by 1.0 leaves it untouched.
+        if peak.max() > 1e6:
+            scale = np.where(peak > 1e6, 1e6 / np.maximum(peak, 1e-12), 1.0)
+            x *= scale
+    return x
+
+
+def _cs_flat(rng: np.random.Generator, n: int, L: int, *,
+             calm_noise: float = 0.0) -> np.ndarray:
+    return _conditional_stability(rng, n, L, calm_kind_fixed=0,
+                                  calm_noise=calm_noise)
+
+def _cs_drift(rng: np.random.Generator, n: int, L: int, *,
+              calm_noise: float = 0.0) -> np.ndarray:
+    return _conditional_stability(rng, n, L, calm_kind_fixed=1,
+                                  calm_noise=calm_noise)
+
+def _cs_countwalk(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    return _conditional_stability(rng, n, L, calm_kind_fixed=2)
+
+def _cs_pulse(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    return _conditional_stability(rng, n, L, calm_kind_fixed=3)
+
+
+# Recalibrated against the real 08-07 eval pool (1,374 series, domain tags
+# from metadata.json): weighted by the 08-05..08-07 domain mix (transport
+# 33.0%, energy 20.4%, nature 18.4%, healthcare 11.0%, econ_fin 6.5%, sales
+# 6.0%, web_cloudops 4.7%), transport/healthcare/sales/web_cloudops (61.2% of
+# weight) have frac_neg == 0 at the *90th percentile* of their series — i.e.
+# essentially none of their real series ever go negative — yet the previous
+# 0.85 nonneg rate let 15% of every non-exempt-family row go negative
+# regardless of domain, teaching negative excursions that are impossible for
+# most of the weighted eval mix. Measured frac_int medians are ~1.0 for
+# transport/healthcare/sales/web_cloudops vs ~0.02-0.10 for energy/nature/
+# econ_fin, whose signed/continuous character is already carried by the
+# exempt families (grid_flow, spiky_price, price_shock, ou_stochastic_vol,
+# spectral_gp, long_memory) rather than this generic prior, so the generic
+# pool (~86% of total family mass: step_level, ar2, conditional_stability,
+# the four cs_* splits, threshold_ar, etc.) can safely skew further toward
+# the majority-weighted count-like reality without starving the dedicated
+# continuous families of their own signal.
+_NONNEG_FRAC = 0.93
+_NONNEG_INTEGER_FRAC = 0.86
+
+
+def _spread_flat_levels(
+    rng: np.random.Generator, rows: np.ndarray, spread: float
+) -> np.ndarray:
+    """Move exactly-constant rows onto distinct integer levels.
+
+    Rounding leaves a constant row on whichever small integer its level happened
+    to land on, and the corpus makes enough of them that they collide. Measured
+    on an 8192-row corpus at a 0.37 frozen-tail share, *every* duplicate series
+    was a constant row, 42 groups in total, and the largest single group was 266
+    copies of the all-zero series. The trainer rejects a corpus once 5% of its
+    series are exact copies, so those collisions -- not anything about forecast
+    quality -- are what caps the plateau dose, and the plateau dose is what the
+    08-26-1 ladder showed buys transport and sales.
+
+    Offsetting a constant row leaves it exactly as constant as it was, so the
+    structure the heavy domains reward is untouched; only the level moves. It
+    also puts the counts in the hundreds or thousands, which is where the pool's
+    transport counts sit -- the integer-prior docstring makes the same point
+    about rows that round onto two or three levels.
+
+    The draw is uniform rather than log-uniform because the objective here is
+    distinctness: expected collisions among n flat rows go as n^2/(2*spread), so
+    a flat prior over the range is what buys headroom. At spread 0.0 nothing is
+    drawn and the stream is identical to the parent's.
+    """
+    if spread <= 0.0 or rows.size == 0:
+        return rows
+    flat = rows.min(axis=1) == rows.max(axis=1)
+    n_flat = int(flat.sum())
+    if n_flat == 0:
+        return rows
+    level = rng.integers(0, int(spread), size=(n_flat, 1)).astype(np.float64)
+    rows[flat] += level
+    return rows
