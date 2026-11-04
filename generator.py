@@ -1100,3 +1100,270 @@ def profile_free_periodic(rng, n, L, ph, H=16):
 
 
 SHAPE_PROBS = (0.40, 0.30, 0.15, 0.10, 0.05)  # harmonic / trapezoid / double / warped / freeGP
+
+
+def seasonal_profile(rng: np.random.Generator, n: int, L: int, period: np.ndarray,
+                     cfg: dict | None = None, allow_drift: bool = True) -> np.ndarray:
+    """Unit-std periodic profile at ``period`` samples, one row per series.
+
+    Shapes: harmonic series, business-hours trapezoid, double von-Mises peak,
+    circle-map-warped variant, free periodic GP.  Optional slow phase drift and
+    genuine period drift (a phase accumulator over a varying instantaneous
+    frequency), which no fixed-grid seasonal model can express.
+    """
+    sea = (cfg or {}).get("seasonality", {})
+    shape_probs = sea.get("shape_mix", SHAPE_PROBS)
+    p_phase = float(sea.get("phase_drift_rate", 0.35))
+    p_period = float(sea.get("period_drift_rate", 0.12))
+    period = np.asarray(period, dtype=np.float64).reshape(n, 1)
+    phase0 = rng.random((n, 1))
+    drift = np.where(rng.random((n, 1)) < p_phase,
+                     rng.uniform(0.02, 0.10, size=(n, 1)) * np.sign(rng.standard_normal((n, 1))),
+                     0.0) if allow_drift else None
+    pdrift = np.where(rng.random((n, 1)) < p_period,
+                      rng.uniform(0.005, 0.03, size=(n, 1)) * np.sign(rng.standard_normal((n, 1))),
+                      0.0) if allow_drift else None
+    ph = phase_of(L, period, phase0, drift, pdrift)
+
+    kind = categorical(rng, shape_probs, n)
+    kappa = rng.uniform(-0.6, 0.6, size=(n, 1))
+    ph_w = warp_phase(ph, kappa)
+
+    out = np.zeros((n, L))
+    for k, fn, use_warp in (
+        (0, profile_harmonic, False),
+        (1, profile_trapezoid, False),
+        (2, profile_double_peak, False),
+        (3, profile_harmonic, True),
+        (4, profile_free_periodic, False),
+    ):
+        m = kind == k
+        if not m.any():
+            continue
+        sub = int(m.sum())
+        out[m] = fn(rng, sub, L, (ph_w if use_warp else ph)[m])
+    return unit_std(out)
+
+
+# ────────────────────────────── misc processes ─────────────────────────────
+
+def hawkes(rng: np.random.Generator, n: int, L: int, mu: np.ndarray,
+           branching: np.ndarray, tau: np.ndarray,
+           power_law: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Discrete-time self-exciting arrivals; returns (intensity, counts).
+
+    ``power_law`` rows use four exponential components geometrically spaced over
+    three decades, which approximates a genuine long-memory power-law kernel.
+    """
+    K_COMP = 4
+    tau = np.asarray(tau, dtype=np.float64).reshape(n, 1)
+    br = np.clip(np.asarray(branching, dtype=np.float64).reshape(n, 1), 0.0, 0.95)
+    taus = np.repeat(tau, K_COMP, axis=1)
+    wts = np.zeros((n, K_COMP))
+    if power_law is None:
+        power_law = np.zeros(n, dtype=bool)
+    pl = np.asarray(power_law).reshape(n, 1)
+    mult = np.array([1.0, 4.6416, 21.544, 100.0])[None, :]
+    taus = np.where(pl, tau * mult, taus)
+    w_pl = np.array([0.55, 0.25, 0.13, 0.07])[None, :]
+    w_ex = np.array([1.0, 0.0, 0.0, 0.0])[None, :]
+    wts = np.where(pl, w_pl, w_ex)
+    taus = np.maximum(taus, 1.0)
+    decays = np.exp(-1.0 / taus)
+    # branching ratio n = sum_k alpha_k * tau_k  -> normalise
+    norm = np.sum(wts * taus, axis=1, keepdims=True)
+    alpha = wts * br / np.maximum(norm, 1e-9)
+    lam = np.zeros((n, L))
+    cnt = np.zeros((n, L))
+    u = rng.random((n, L))
+    z = rng.standard_normal((n, L))
+    k_hawkes(np.ascontiguousarray(mu), np.ascontiguousarray(decays),
+               np.ascontiguousarray(alpha), u, z, lam, cnt)
+    return lam, cnt
+
+
+def decay_convolve(x: np.ndarray, tau: np.ndarray) -> np.ndarray:
+    """Causal exponential smoothing with per-row timescale (via k_arma)."""
+    n, L = x.shape
+    phi = np.exp(-1.0 / np.maximum(np.asarray(tau, dtype=np.float64).reshape(n, 1), 1e-3))
+    out = np.zeros((n, L))
+    k_arma(np.ascontiguousarray(phi), np.ones(n, dtype=np.int64),
+             np.zeros((n, 1)), np.zeros(n, dtype=np.int64),
+             np.ascontiguousarray(x), out)
+    return out
+
+
+GAMMA_NORMAL_SHAPE = 60.0
+
+
+def gamma_shape_mix(rng: np.random.Generator, n: int, L: int,
+                    k: np.ndarray) -> np.ndarray:
+    """Gamma(k, 1/k) variates (unit mean) with a per-row shape.
+
+    Above ``GAMMA_NORMAL_SHAPE`` the Wilson-Hilferty cube-root transform of a
+    normal is accurate to better than 1e-3 in the body and far cheaper than a
+    rejection sampler; below it we draw exactly.
+    """
+    k = np.maximum(np.asarray(k, dtype=np.float64).reshape(n, 1), 1e-3)
+    big = k >= GAMMA_NORMAL_SHAPE
+    if big.all():
+        z = rng.standard_normal((n, L))
+        c = 1.0 / (9.0 * k)
+        return np.maximum((1.0 - c + z * np.sqrt(c)) ** 3, 0.0)
+    if not big.any():
+        return rng.gamma(np.broadcast_to(k, (n, L))) / k
+    out = rng.gamma(np.broadcast_to(k, (n, L))) / k
+    idx = np.nonzero(big[:, 0])[0]
+    z = rng.standard_normal((idx.size, L))
+    c = 1.0 / (9.0 * k[idx])
+    out[idx] = np.maximum((1.0 - c + z * np.sqrt(c)) ** 3, 0.0)
+    return out
+
+
+POISSON_NORMAL_LAMBDA = 200.0
+
+
+def nb_counts(rng: np.random.Generator, mean: np.ndarray, k: np.ndarray) -> np.ndarray:
+    """Negative-binomial counts via a Gamma-mixed Poisson (var = mu + mu^2/k).
+
+    Above ``POISSON_NORMAL_LAMBDA`` the Poisson layer is replaced by a
+    continuity-corrected normal (relative error < 1e-3 there, and the
+    over-dispersion that actually shapes the series comes from the Gamma mix).
+    """
+    n, L = mean.shape
+    lam = np.minimum(np.maximum(mean, 0.0) * gamma_shape_mix(rng, n, L, k), 1e8)
+    big = lam > POISSON_NORMAL_LAMBDA
+    if not big.any():
+        return rng.poisson(lam).astype(np.float64)
+    small = rng.poisson(np.where(big, 0.0, lam)).astype(np.float64)
+    z = rng.standard_normal((n, L))
+    approx = np.maximum(np.floor(lam + np.sqrt(lam) * z + 0.5), 0.0)
+    return np.where(big, approx, small)
+
+
+def round_tick(x: np.ndarray, tick: np.ndarray) -> np.ndarray:
+    tick = np.maximum(np.asarray(tick, dtype=np.float64).reshape(-1, 1), 1e-300)
+    return np.round(x / tick) * tick
+
+
+def human_tick(scale: np.ndarray, rng: np.random.Generator, n: int,
+               rel_lo=1e-3, rel_hi=0.2) -> np.ndarray:
+    """A round human tick {1,2,5}x10^k sized relative to a series scale.
+
+    ``rel_lo`` / ``rel_hi`` may be scalars or (n, 1) columns.  Ticks are round
+    human values because that is what real reporting granularity looks like, and
+    a *recurring* tick is learnable in a way an arbitrary quantiser is not.
+    """
+    lo = np.broadcast_to(np.asarray(rel_lo, dtype=np.float64).reshape(-1, 1), (n, 1))
+    hi = np.maximum(np.broadcast_to(
+        np.asarray(rel_hi, dtype=np.float64).reshape(-1, 1), (n, 1)), lo * 1.001)
+    rel = np.exp(rng.uniform(np.log(lo), np.log(hi), size=(n, 1)))
+    raw = np.maximum(np.asarray(scale).reshape(n, 1), 1e-300) * rel
+    ex = np.floor(np.log10(raw))
+    mant = raw / (10.0 ** ex)
+    mant = np.where(mant < 1.5, 1.0, np.where(mant < 3.5, 2.0, 5.0))
+    return mant * (10.0 ** ex)
+
+
+def rolling_agg(x: np.ndarray, k: int, mode: int) -> np.ndarray:
+    """Causal rolling aggregate over the last ``k`` samples (mode 0/1/2/3 =
+    mean/sum/max/min)."""
+    n, L = x.shape
+    if k <= 1:
+        return x
+    if mode <= 1:
+        c = np.cumsum(x, axis=1)
+        pad = np.zeros((n, 1))
+        cp = np.concatenate([pad, c], axis=1)
+        idx = np.maximum(np.arange(L) - k + 1, 0)
+        s = c - cp[:, idx]
+        cnt = np.minimum(np.arange(L) + 1, k)[None, :].astype(np.float64)
+        return s / cnt if mode == 0 else s
+    origin = (k - 1) - k // 2
+    if _HAVE_NDIMAGE:
+        f = _max_filter if mode == 2 else _min_filter
+        return f(x, size=k, axis=1, mode="nearest", origin=origin)
+    acc = x.copy()
+    for j in range(1, k):
+        shifted = np.empty_like(x)
+        shifted[:, j:] = x[:, :-j]
+        shifted[:, :j] = x[:, :1]
+        if mode == 2:
+            np.maximum(acc, shifted, out=acc)
+        else:
+            np.minimum(acc, shifted, out=acc)
+    return acc
+
+
+# ─────────────────────────── per-row capability flags ──────────────────────
+
+FLAG_DEFAULTS = {
+    "scale_mode": 0,      # 0 free (standardise + offset/scale) | 1 positive | 2 as-is
+    "offset_pref": 0,     # 0 mixture | 1 large offset | 2 zero anchor | 3 sign crossing
+    "integer": False,     # values already lie on a discrete lattice
+    "count": False,       # genuine integer counts (set by the batch builder)
+    "bounded": False,     # has hard bounds that artefacts must not break
+    "positive": False,    # non-negative by construction
+    "quant_boost": 1.0,   # multiplier on the quantisation stage probability
+    "quant_rel_hi": 0.2,  # upper bound on tick/std for the quantiser
+    "obs_boost": 1.0,     # multiplier on every observation-artefact rate
+    "allow_agg": True,    # may participate in structured hierarchical aggregation
+}
+
+_FLAG_DTYPE = {
+    "scale_mode": np.int8, "offset_pref": np.int8, "integer": bool,
+    "count": bool,
+    "bounded": bool, "positive": bool, "quant_boost": np.float64,
+    "quant_rel_hi": np.float64, "obs_boost": np.float64, "allow_agg": bool,
+}
+
+
+def new_flags(n: int, **over) -> dict:
+    """Per-row capability flags with family overrides."""
+    f = {}
+    for k, v in FLAG_DEFAULTS.items():
+        f[k] = np.full(n, over.get(k, v), dtype=_FLAG_DTYPE[k])
+    for k in over:
+        if k not in FLAG_DEFAULTS:
+            raise KeyError(f"unknown row flag {k!r}")
+    return f
+
+
+def complete_dwell_table(rng, dwell, L, median, sigma, minimum=1.0,
+                         heavy=None, pareto_a=None):
+    """Extend only exhausted renewal tables; never tile or freeze the last slot.
+
+    Called after the legacy builder has drawn its carriers/noise, so extending
+    a table cannot move any of those draws. median/sigma have one column for
+    iid durations or two columns for an alternating process. The existing
+    floating dwell law and floor(cumsum) event locations are preserved.
+    Returns affected original row indices, their completed table, and the first
+    invalid legacy sample. Non-exhausted rows consume no extension randomness.
+    """
+    end = np.floor(np.cumsum(np.maximum(dwell, 1.0), axis=1)[:, -1]).astype(np.int64)
+    rows = np.flatnonzero(end < L)
+    if rows.size == 0:
+        return rows, dwell[:0], end[:0]
+    table = dwell[rows].copy()
+    med = np.asarray(median, dtype=np.float64).reshape(dwell.shape[0], -1)[rows]
+    sig = np.broadcast_to(np.asarray(sigma, dtype=np.float64),
+                          (dwell.shape[0], med.shape[1]))[rows]
+    if med.shape[1] not in (1, 2) or np.any(med <= 0) or np.any(sig < 0):
+        raise ValueError('invalid native renewal duration parameters')
+    # Every appended duration is >= minimum >= 1. Thus even the shortest
+    # possible draws terminate after at most L extra slots; no probabilistic cap.
+    while np.any(np.floor(np.cumsum(table, axis=1)[:, -1]) < L):
+        width = min(64, max(1, int(np.ceil(L / max(minimum, 1.0))) + 1 - table.shape[1]))
+        columns = (table.shape[1] + np.arange(width)) % med.shape[1]
+        centre = med[:, columns]
+        sd = sig[:, columns]
+        extra = np.exp(rng.normal(np.log(np.maximum(centre, 1.0)), sd))
+        if heavy is not None:
+            u = np.maximum(rng.random(extra.shape), 1e-9)
+            shape = np.asarray(pareto_a, dtype=np.float64)[rows, None]
+            tail = centre * np.power(u, -1.0 / shape)
+            use = ((rng.random(extra.shape) < 0.15)
+                   & np.asarray(heavy, dtype=bool)[rows, None])
+            extra = np.where(use, tail, extra)
+        table = np.concatenate((table, np.maximum(extra, minimum)), axis=1)
+    return rows, table, end[rows]
