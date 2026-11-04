@@ -5351,3 +5351,296 @@ def chunk_batch_size(produced: int) -> int:
     if produced == _STARTUP_CHUNK:
         return _RAMP_CHUNK
     return _CHUNK
+
+
+# --- domain mix (inlined from cascade_gen/domains.py) ---
+
+DOMAINS: tuple[str, ...] = (
+    "econ_fin",
+    "energy",
+    "healthcare",
+    "nature",
+    "sales",
+    "transport",
+    "web_cloudops",
+)
+
+# Sentinel fam slot for the per-chunk domain-assignment stream (impl uses 999).
+DISPATCH_STREAM_DOMAIN = 998
+
+# Domain-targeted families (Chronoforge blocks, POOL4, ED5, native domain laws).
+FAMILY_DOMAIN: dict[str, str] = {
+    # nature
+    "met_thermal": "nature",
+    "met_pressure_smooth": "nature",
+    "met_bounded_atom": "nature",
+    "met_wind_speed": "nature",
+    "wet_dry_intermittent": "nature",
+    "gauge_rain": "nature",
+    "physical_sensors": "nature",
+    "tidal_constituents": "nature",
+    "tidal_harmonic": "nature",
+    "coastal_residual": "nature",
+    "flow_recession": "nature",
+    "rk4_flows": "nature",
+    # web_cloudops
+    "ops_diurnal_traffic": "web_cloudops",
+    "ops_saturating_feedback": "web_cloudops",
+    "ops_counter_reset": "web_cloudops",
+    "ops_latency_queue": "web_cloudops",
+    "ops_deploy_transient": "web_cloudops",
+    "ops_rate_plateau": "web_cloudops",
+    "heavy_traffic_counts": "web_cloudops",
+    "dispatch_blocks": "web_cloudops",
+    "web_session_attr": "web_cloudops",
+    "cluster_job_attr": "web_cloudops",
+    "web_traffic_plateau": "web_cloudops",
+    "weekly_web_counts": "web_cloudops",
+    # healthcare
+    "epi_renewal": "healthcare",
+    "admin_reporting_counts": "healthcare",
+    "physio_quasiperiodic": "healthcare",
+    "clinical_bounded_vitals": "healthcare",
+    "sparse_admin_counts": "healthcare",
+    "epi_decay": "healthcare",
+    "reported_epi_counts": "healthcare",
+    "seasonal_counts": "healthcare",
+    "sticky_station": "healthcare",
+    "capacity_counts": "healthcare",
+    "overdispersed_counts": "healthcare",
+    # energy
+    "energy_load_price_solar": "energy",
+    "storm_outage_counts": "energy",
+    "grid_flow": "energy",
+    "envelope_mod": "energy",
+    "spiky_price": "energy",
+    "broadband_path_attr": "energy",
+    "dispatch_price": "energy",
+    # transport
+    "transport_flow": "transport",
+    "transport_flow_tail": "transport",
+    "settle_hold": "transport",
+    # sales
+    "retail_promo_intermittent": "sales",
+    "retail_promo_tail": "sales",
+    "weekly_demand": "sales",
+    "intermittent": "sales",
+    "store_sales_panel": "sales",
+    "sales_promo_stockout_panel": "sales",
+    "biz_day_counts": "sales",
+    # econ_fin
+    "econ_release_staircase": "econ_fin",
+    "level_ladder_staircase": "econ_fin",
+    "smooth_drift_extrapolable": "econ_fin",
+    "price_shock": "econ_fin",
+    "garch_leverage": "econ_fin",
+    "epi_season_decay": "healthcare",
+    "weekday_ledger_counts": "healthcare",
+    "surveillance_counts": "healthcare",
+    "pull_counter_ramp": "web_cloudops",
+    "weekly_cycle_downloads": "web_cloudops",
+    "hourly_social_counts": "web_cloudops",
+    "intraday_event_counts": "healthcare",
+    "intraday_spot_price": "energy",
+    "road_commute_counts": "transport",
+}
+
+# Cross-domain stochastic / regime backbone — included in every domain pool.
+GENERAL_FAMILIES: frozenset[str] = frozenset(
+    {
+        "trend_seasonal_ar",
+        "regime_shift",
+        "multiplicative",
+        "ar2",
+        "integrated",
+        "threshold_ar",
+        "chaotic",
+        "spectral_gp",
+        "long_memory",
+        "ou_stochastic_vol",
+        "pulse_outlier",
+        "conditional_stability",
+        "step_level",
+        "vol_regime_switch",
+        "bounded_counts",
+        "held_rate",
+        "cs_flat",
+        "cs_drift",
+        "cs_countwalk",
+        "cs_pulse",
+        "rate_counts",
+        "dispersion_counts",
+        "cycle_profile",
+        "regime_dwell_flat",
+        "regime_dwell_microdrift",
+        "regime_dwell_intcounter",
+        "regime_dwell_zerosparse",
+        "regime_dwell_transitional",
+        "arma_sarima",
+        "hawkes_marked",
+        "chaotic_delay",
+        "spectral_kernel_zoo",
+        "changepoint_composite",
+    }
+)
+
+
+def validate_family_coverage(families: tuple[str, ...]) -> None:
+    """Every registry family must be domain-tagged or general."""
+    missing = [
+        f
+        for f in families
+        if f not in FAMILY_DOMAIN and f not in GENERAL_FAMILIES
+    ]
+    if missing:
+        raise ValueError(
+            f"families missing domain tag: {sorted(missing)}"
+        )
+
+
+def _parse_weight_dict(
+    raw: dict[str, Any],
+    *,
+    label: str,
+) -> np.ndarray:
+    w = np.zeros(len(DOMAINS), dtype=np.float64)
+    for i, name in enumerate(DOMAINS):
+        if name not in raw:
+            raise ValueError(f"{label} missing domain {name!r}")
+        value = float(raw[name])
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{label}[{name!r}] must be finite and non-negative")
+        w[i] = value
+    if w.sum() <= 0:
+        raise ValueError(f"{label} must not be all zero")
+    return w / w.sum()
+
+
+def parse_domain_mix(
+    cfg: dict[str, Any],
+    families: tuple[str, ...],
+) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
+    """Return (enabled, final_domain_weights, start_domain_weights)."""
+    validate_family_coverage(families)
+    block = dict(cfg.get("domain_mix", {}))
+    if not block.get("enabled", False):
+        return False, None, None
+    final = _parse_weight_dict(dict(block.get("weights", {})), label="domain_mix.weights")
+    start_raw = dict(block.get("start_weights", {}))
+    if start_raw:
+        start = _parse_weight_dict(start_raw, label="domain_mix.start_weights")
+    else:
+        start = final.copy()
+    return True, final, start
+
+
+def build_domain_pool_indices(
+    families: tuple[str, ...],
+) -> dict[str, np.ndarray]:
+    """For each domain, family indices = tagged ∪ general."""
+    validate_family_coverage(families)
+    general = np.array(
+        [i for i, f in enumerate(families) if f in GENERAL_FAMILIES],
+        dtype=np.int64,
+    )
+    pools: dict[str, np.ndarray] = {}
+    for domain in DOMAINS:
+        tagged = [
+            i for i, f in enumerate(families) if FAMILY_DOMAIN.get(f) == domain
+        ]
+        pools[domain] = np.array(sorted(set(tagged) | set(general.tolist())),
+                                   dtype=np.int64)
+    return pools
+
+
+def _largest_remainder(weights: np.ndarray, total: int) -> np.ndarray:
+    """Allocate ``total`` integer slots proportional to ``weights`` (sum 1)."""
+    exact = weights * total
+    counts = np.floor(exact).astype(np.int64)
+    remainder = total - int(counts.sum())
+    if remainder > 0:
+        fractional = exact - counts
+        order = np.argsort(-fractional)
+        for i in order[:remainder]:
+            counts[i] += 1
+    return counts
+
+
+def dispatch_domain_mix(
+    base_seed: int,
+    chunk_index: int,
+    batch_size: int,
+    domain_weights: np.ndarray,
+    family_weights: np.ndarray,
+    pool_indices: dict[str, np.ndarray],
+) -> np.ndarray:
+    """Two-stage stratified dispatch: domain quota, then family within domain."""
+    fam_ids = np.empty(batch_size, dtype=np.int64)
+
+    counts = _largest_remainder(domain_weights, batch_size)
+    domain_ids = np.empty(batch_size, dtype=np.int64)
+    pos = 0
+    for domain_idx, count in enumerate(counts):
+        domain_ids[pos : pos + count] = domain_idx
+        pos += count
+
+    domain_rng = np.random.default_rng(
+        np.random.SeedSequence(
+            (base_seed, chunk_index, DISPATCH_STREAM_DOMAIN, 0, 0)
+        )
+    )
+    domain_rng.shuffle(domain_ids)
+
+    for domain_idx, domain in enumerate(DOMAINS):
+        mask = domain_ids == domain_idx
+        n_slots = int(mask.sum())
+        if n_slots == 0:
+            continue
+        indices = pool_indices[domain]
+        pool_w = family_weights[indices]
+        pool_sum = pool_w.sum()
+        if pool_sum <= 0:
+            raise RuntimeError(
+                f"domain {domain!r} has zero family weight in its pool"
+            )
+        cdf = np.cumsum(pool_w / pool_sum)
+        cdf[-1] = 1.0
+        fam_rng = np.random.default_rng(
+            np.random.SeedSequence(
+                (base_seed, chunk_index, DISPATCH_STREAM_DOMAIN, domain_idx + 1, 0)
+            )
+        )
+        picks = cdf.searchsorted(fam_rng.random(n_slots), side="right")
+        fam_ids[mask] = indices[picks]
+
+    return fam_ids
+
+
+def assign_domain_slots(
+    base_seed: int,
+    chunk_index: int,
+    batch_size: int,
+    domain_weights: np.ndarray,
+) -> np.ndarray:
+    """Return shuffled domain index per slot (stage 1 only; for tests)."""
+    counts = _largest_remainder(domain_weights, batch_size)
+    domain_ids = np.empty(batch_size, dtype=np.int64)
+    pos = 0
+    for domain_idx, count in enumerate(counts):
+        domain_ids[pos : pos + count] = domain_idx
+        pos += count
+    domain_rng = np.random.default_rng(
+        np.random.SeedSequence(
+            (base_seed, chunk_index, DISPATCH_STREAM_DOMAIN, 0, 0)
+        )
+    )
+    domain_rng.shuffle(domain_ids)
+    return domain_ids
+
+
+def family_allowed_in_domain(family_name: str, domain: str) -> bool:
+    """True if ``family_name`` may be dispatched under ``domain``."""
+    tagged = FAMILY_DOMAIN.get(family_name)
+    if tagged is not None:
+        return tagged == domain
+    return family_name in GENERAL_FAMILIES
