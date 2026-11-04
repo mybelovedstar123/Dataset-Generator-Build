@@ -18997,3 +18997,260 @@ _teach_batch.__defaults__ = (4096, _TEACH_FAMILIES, None)
 
 # SeedSequence tag of that per-row decision.
 _Q = 0.296
+_CPL = 0.2
+_TAG = 0x5A17C0DE
+_TMIX = 0.4375
+_TMIX_TAG = 0x7EAC0001
+
+
+# ---- teach2 extension (w9q): daily ED-visit share for the NSSP pathogens other than RSV ----
+# Targets cdc_nssp_ed_{influenza,covid19,ari,pathogen_mix}_daily_by_state and
+# cdc_nssp_ed_respiratory_daily (408 local windows, 4.1%; the king's gain over init there is
+# +0.75 pp, and w9nq only ties it, while on rsv, which has its own teach2 family, w9nq is
+# +8.6% / +4.7% over the king). Calibrated to by-state group statistics of the pool snapshot
+# (gain2/w9q_nssp_real.py), no single series fitted:
+#   influenza  trough ~0.04 %, winter peak ~8 % (5.9-10.2), half-widths 14 / 17 d, deep floor at the end
+#   covid19    trough ~0.07 %, winter peak ~1 % (0.4-1.9), half-widths 23 / 53 d, summer wave ~end-18 d
+#   ari        trough ~6.9 % (5.5-8.3), winter peak ~22 %, half-widths 24 / 40 d
+# Records are ~516 d long and every state's last winter peak sits at end-266 d (264-269), so
+# the h256 context ends ~10 d after the peak and the target is the decay to the floor.
+# 60% of rows anchor the last winter peak at end-U(235, 310) d (covers today's phase plus
+# ~6 weeks of drift); 40% draw the phase uniformly. Same kernel as season_onset (Poisson
+# numerator over the day's visits, weekend effect, 0.01 % publication lattice).
+_T2ED_MODE_P = np.array([0.36, 0.34, 0.30])  # influenza, covid19, ari
+_T2ED_ANCHOR = 0.6
+
+
+def _t2ed_core(rng, n, L):
+    u = rng.random(n)
+    S = np.where(u < 0.55, rng.uniform(480.0, 560.0, size=n),
+                 np.where(u < 0.80, rng.uniform(560.0, 1500.0, size=n), _t2_eval_len(rng, n, 300.0)))
+    S = np.clip(S, 64, L).astype(np.int64)
+    Sf = S.astype(np.float64)
+    W = int(S.max())
+    mode = rng.choice(3, size=n, p=_T2ED_MODE_P)
+    flu, cov, ari = mode == 0, mode == 1, mode == 2
+    nw = int(W / 365.25) + 3
+    anch = rng.random(n) < _T2ED_ANCHOR
+    last_w = np.where(anch, Sf - rng.uniform(235.0, 310.0, size=n), Sf - rng.uniform(0.0, 365.25, size=n))
+    j = (np.arange(nw) - (nw - 2)).astype(np.float64)[None, :]
+    wc = last_w[:, None] + 365.25 * j + rng.normal(0.0, 10.0, size=(n, nw)) * (j != 0.0)
+    # per-mode winter season
+    trough = np.where(flu, np.exp(rng.uniform(math.log(0.03), math.log(0.2), size=n)),
+                      np.where(cov, np.exp(rng.uniform(math.log(0.04), math.log(0.2), size=n)),
+                               np.exp(rng.uniform(math.log(5.0), math.log(8.5), size=n))))
+    base = np.where(flu, np.exp(rng.uniform(math.log(4.0), math.log(12.0), size=n)),
+                    np.where(cov, np.exp(rng.uniform(math.log(0.5), math.log(2.5), size=n)),
+                             trough * rng.uniform(0.8, 1.6, size=n)))
+    wpk = base[:, None] * np.exp(rng.normal(0.0, 0.35, size=(n, nw)))
+    wwl = np.where(flu[:, None], rng.uniform(9.0, 16.0, size=(n, nw)), rng.uniform(15.0, 28.0, size=(n, nw)))
+    wwr = np.where(flu[:, None], rng.uniform(10.0, 19.0, size=(n, nw)),
+                   np.where(cov[:, None], rng.uniform(30.0, 50.0, size=(n, nw)), rng.uniform(25.0, 42.0, size=(n, nw))))
+    wfl = np.where(flu[:, None], rng.uniform(0.0, 10.0, size=(n, nw)),
+                   np.where(cov[:, None], rng.uniform(0.0, 15.0, size=(n, nw)), rng.uniform(0.0, 20.0, size=(n, nw))))
+    # second bump per year: covid summer wave (peak ~end-18 d on anchored rows); influenza
+    # broad shoulders around its sharp peak (plus a spring B tail); ari broad Oct-Mar
+    # respiratory season under its sharp winter peak (real ari median ~1.5x its summer low)
+    sc = np.where(cov[:, None], wc + rng.uniform(220.0, 265.0, size=(n, nw)),
+                  np.where(flu[:, None], wc + rng.uniform(15.0, 70.0, size=(n, nw)), wc - rng.uniform(0.0, 30.0, size=(n, nw))))
+    spk = np.where(cov[:, None], np.exp(rng.uniform(math.log(0.2), math.log(1.2), size=(n, 1)) + rng.normal(0.0, 0.4, size=(n, nw))),
+                   np.where(flu[:, None], wpk * rng.uniform(0.06, 0.2, size=(n, nw)),
+                            trough[:, None] * rng.uniform(0.6, 1.1, size=(n, nw))))
+    swl = np.where(cov[:, None], rng.uniform(18.0, 35.0, size=(n, nw)),
+                   np.where(flu[:, None], rng.uniform(30.0, 60.0, size=(n, nw)), rng.uniform(60.0, 95.0, size=(n, nw))))
+    swr = np.where(cov[:, None], rng.uniform(18.0, 40.0, size=(n, nw)),
+                   np.where(flu[:, None], rng.uniform(35.0, 70.0, size=(n, nw)), rng.uniform(50.0, 90.0, size=(n, nw))))
+    sfl = np.where(cov[:, None], rng.uniform(0.0, 15.0, size=(n, nw)),
+                   np.where(flu[:, None], rng.uniform(0.0, 20.0, size=(n, nw)), rng.uniform(0.0, 30.0, size=(n, nw))))
+    cen = np.ascontiguousarray(np.concatenate([wc, sc], axis=1))
+    peak = np.ascontiguousarray(np.concatenate([wpk, spk], axis=1))
+    wl = np.ascontiguousarray(np.concatenate([wwl, swl], axis=1))
+    wr = np.ascontiguousarray(np.concatenate([wwr, swr], axis=1))
+    flat = np.ascontiguousarray(np.concatenate([wfl, sfl], axis=1))
+    nsd = np.where(ari, rng.uniform(0.02, 0.06, size=n), rng.uniform(0.05, 0.15, size=n))
+    noise = _t2_ar1_small(rng.standard_normal((n, W)), rng.uniform(0.5, 0.9, size=n)) * nsd[:, None]
+    visits = np.round(np.exp(rng.uniform(math.log(800.0), math.log(4e4), size=n)))
+    out = _t2_season_kernel(cen, peak, wl, wr, flat, trough, noise, rng.integers(0, 7, size=n),
+                            rng.uniform(0.9, 1.25, size=n), rng.uniform(0.75, 1.0, size=n), visits,
+                            rng.random((n, W)), S, np.empty((n, L)))
+    out = _t2_fix_const(rng, out, S, 0.01)
+    return out, {"freq": np.full(n, "D"), "S": S, "mode": mode, "anchored": anch, "last_winter_from_end": Sf - last_w}
+
+
+def _t2ed_share(rng, n, L):
+    return _t2ed_core(rng, n, L)[0]
+
+
+_TEACH2_FAMILIES = _TEACH2_FAMILIES + (("ed_visit_share", _t2ed_share),)
+# teach2 row shares (renormalised by the caller). Same teach2 dose as w9nq (Q .296, TMIX .4375):
+# signed_flow cut from its overdose (.22 -> .06), ixp trimmed at 97% saturation (.30 -> .22),
+# sparse trimmed (.14 -> .08), web raised (.24 -> .36, cumulative and players modes), season
+# kept near its still-responding dose (.10 -> .12), new ed_visit_share at .16.
+_TEACH2_MIX = {"ixp_traffic": 0.22, "signed_flow": 0.06, "web_counter": 0.36, "season_onset": 0.12,
+               "sparse_counts": 0.08, "ed_visit_share": 0.16}
+_TEACH_FAMILIES = _TEACH2_FAMILIES
+_TEACH_MIX = _TEACH2_MIX
+_teach_batch.__defaults__ = (4096, _TEACH_FAMILIES, None)
+
+
+# ---- w9q: season-phase-faithful RKI hospitalisation rows for the P1 partner family ----
+# Every rki_germany_covid_hospitalizations window is the LAST h days of a series and all 25
+# series end on the same date, so each horizon cuts at a fixed season phase (gain2/rki.md):
+# endemic winter peaks ~1000 / ~680 / ~290 days before the end, then a burn-out to a floor of
+# ~1e-3 of the max (h256 = the post-peak burn-out, h720 = cut 40 days before the penultimate
+# peak). P1's rki_epidemic_weekly_sums (== 111 epi_burnout_counts) matches the global stats but
+# centres its last wave at m*U(.855,.915), i.e. anywhere from 70 days before to 70 days after
+# the h256 cut, so it grows a new wave inside the target far too often (tgtpk256 .55 vs .15).
+# This builder keeps the P1 body/observation code and places the three endemic peaks at the
+# real end phase; _W9Q_RKI_PHASED_P of the family's rows use it, the rest keep the original
+# random-phase builder. Heights are calibrated to gain2/rki_peaks.log.
+_W9Q_RKI_PHASED_P = 0.70
+_W9Q_RKI_LAST_SHOULDER = 2.2
+
+
+def _w9q_rki_endemic_sums(rng, n):
+    m = int(rng.integers(2350, 2401))
+    t = np.arange(m + 6, dtype=np.float64)
+    T = float(m + 5)
+    # pandemic era: the P1 body (pre / main / fading waves), ending at winter 22/23
+    n_pre_waves = int(rng.integers(1, 3))
+    n_main_waves = int(rng.integers(2, 4))
+    n_fading_waves = int(rng.integers(1, 3))
+    W = n_pre_waves + n_main_waves + n_fading_waves
+    body_amps = np.empty(W)
+    body_amps[n_pre_waves] = 1.0
+    for j in range(n_pre_waves - 1, -1, -1):
+        body_amps[j] = body_amps[j + 1] * rng.uniform(0.3, 0.6)
+    for j in range(n_pre_waves + 1, n_pre_waves + n_main_waves):
+        body_amps[j] = body_amps[j - 1] * rng.uniform(0.72, 1.06)
+    for j in range(n_pre_waves + n_main_waves, W):
+        body_amps[j] = body_amps[j - 1] * rng.uniform(0.3, 0.6)
+    body_amps /= body_amps.max()
+    a0 = m * rng.uniform(0.02, 0.09)
+    a1 = T - rng.uniform(1300.0, 1420.0)
+    u = (np.arange(W, dtype=np.float64) / (W - 1.0)) ** rng.uniform(0.72, 1.05)
+    body_centers = a0 + (a1 - a0) * u + rng.normal(0.0, 0.09 * (a1 - a0) / (W - 1.0), W)
+    # endemic winters at the real end phase (days before the end), common drift of the pool date
+    drift = rng.normal(0.0, 8.0)
+    tail_centers = T - np.array([rng.uniform(960.0, 1025.0), rng.uniform(645.0, 760.0),
+                                 rng.uniform(250.0, 325.0)]) + drift
+    e1 = float(rng.uniform(0.08, 1.0))
+    e2 = e1 * rng.uniform(0.25, 0.68)
+    e3 = min(1.0, e2 * float(np.exp(rng.normal(np.log(0.95), 0.45))))
+    tail_amps = np.array([e1, e2, e3])
+    centers = np.concatenate([body_centers, tail_centers])
+    amps = np.concatenate([body_amps, tail_amps])
+    k = W + 3
+    rise_widths = rng.uniform(13.0, 32.0, k) * rng.uniform(0.85, 1.45)
+    fall_widths = rise_widths * rng.uniform(1.0, 1.9, k)
+    wave_curve = np.zeros(m + 6, dtype=np.float64)
+    for j in range(k):
+        wave_curve += amps[j] * _pt_asymmetric_gaussian_wave(t, centers[j], rise_widths[j], fall_widths[j])
+        for _ in range(2):
+            if rng.random() < 0.7:
+                side = 1.0 if rng.random() < 0.65 else -1.0
+                # the last winter's post-peak shoulder stays inside its season (real: .3-.8 of the
+                # peak at +60 d, ~0 by +150 d), so it does not start a new wave in the h256 target
+                off_hi = _W9Q_RKI_LAST_SHOULDER if j == k - 1 else 3.2
+                wave_curve += amps[j] * rng.uniform(0.25, 0.75) * _pt_asymmetric_gaussian_wave(
+                    t, centers[j] + side * fall_widths[j] * rng.uniform(1.4, off_hi),
+                    rise_widths[j] * rng.uniform(0.6, 1.3), fall_widths[j] * rng.uniform(0.6, 1.3))
+    peak = float(wave_curve.max())
+    if peak > 1e-12:
+        wave_curve /= peak
+    background_frac = float(np.exp(rng.uniform(np.log(0.005), np.log(0.026))))
+    ramp_in_end = m * rng.uniform(0.02, 0.09)
+    ramp_out_start = m * rng.uniform(0.74, 0.88)
+    g = 10.0 ** (-rng.uniform(0.5, 1.7) * np.clip((ramp_in_end - t) / max(ramp_in_end, 1.0), 0.0, 1.0)) \
+        * 10.0 ** (-rng.uniform(0.5, 1.9) * np.clip((t - ramp_out_start) / max(m - ramp_out_start, 1.0), 0.0, 1.0))
+    count_scale = 10.0 ** float(np.clip(rng.normal(2.25, 0.76), 0.95, 3.25))
+    log_noise = rng.uniform(0.08, 0.3) * _pt_smooth_random_curve(rng, m + 6, rng.uniform(25.0, 90.0))
+    daily_mean = count_scale * (background_frac * g + (1.0 - background_frac) * wave_curve) \
+        * np.exp(log_noise - 0.5 * log_noise.var())
+    dow = (np.arange(m + 6, dtype=np.int64) + int(rng.integers(0, 7))) % 7
+    wk = np.exp(rng.normal(0.0, rng.uniform(0.04, 0.16), 7))
+    wk[5:] *= rng.uniform(0.7, 0.97)
+    daily_mean = daily_mean * (wk[dow] / wk.mean())
+    c = _pt_overdispersed_poisson_counts(rng, np.maximum(daily_mean, 0.0) / 7.0,
+                                         float(np.exp(rng.uniform(np.log(3.0), np.log(45.0)))))
+    x = np.rint(np.convolve(c, _pt_SEVEN_DAY_SUM_KERNEL, mode='valid'))
+    np.maximum(x, 0.0, out=x)
+    if rng.random() < 0.25:
+        x[-1] = np.floor(x[-1] * rng.uniform(0.0, 0.7))
+    np.nan_to_num(x, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.any(x != x[0]):
+        x = x.copy()
+        x[-1] = x[-1] + 1.0
+    return np.ascontiguousarray(x, dtype=np.float64)
+
+
+def _w9q_rki_weekly_sums(rng, n):
+    if rng.random() < _W9Q_RKI_PHASED_P:
+        return _w9q_rki_endemic_sums(rng, n)
+    return _pt_epidemic_weekly_sums(rng, n)
+
+
+_pt_FAMILY_BUILDERS['rki_epidemic_weekly_sums'] = _w9q_rki_weekly_sums
+
+
+# ---- w9q: partner rows of these families skip the _CPL coupling ----
+# The coupling adds 0.2*sd(diff) of the main channel's normalised diffs to the partner channel.
+# On RKI-like 7-day integer sums that noise (median SD .86) sits above the real terminal floor
+# (median .27) on 80% of rows, so exact-zero floors become +-noise; 111 and u105 have no
+# coupling and win the h256 burn-out-to-floor windows (gain2/rki.md 3).
+_W9Q_NOCPL_FAMS = frozenset(('rki_epidemic_weekly_sums', 'rki_endemic'))
+
+
+class Generator(DataGenerator):
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        self._seed = int(seed)
+        self._g0 = _EngineGenerator(config_dir, seed=self._seed)
+        self._g1 = _pt_Generator(config_dir, seed=(self._seed * 7919 + 104729) % (2 ** 31))
+        self._teach = _TeachStream((self._seed ^ 0x5EED7EAC) & ((1 << 64) - 1))
+
+    def _partner_row(self, i, it1):
+        self._cpl_off = False
+        if _TMIX > 0.0 and (_TMIX >= 1.0 or np.random.default_rng(
+                np.random.SeedSequence([self._seed, _TMIX_TAG], spawn_key=(i,))).random() < _TMIX):
+            return np.asarray(self._teach.next(), dtype=np.float64)
+        y = np.asarray(next(it1), dtype=np.float64)
+        self._cpl_off = getattr(self._g1, '_last_fam', None) in _W9Q_NOCPL_FAMS
+        return y
+
+    @property
+    def name(self) -> str:
+        return 'w9qedrki'
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        it0 = self._g0.generate(n); it1 = self._g1.generate(max(1, int(n * _Q) + 4)); live = True
+        try:
+            for i in range(n):
+                try:
+                    x = np.asarray(next(it0), dtype=np.float64)
+                except StopIteration:
+                    return
+                if live and _Q > 0.0:
+                    u = np.random.default_rng(np.random.SeedSequence([self._seed, _TAG], spawn_key=(i,))).random()
+                    if u < _Q:
+                        try:
+                            y = self._partner_row(i, it1)
+                        except StopIteration:
+                            live = False
+                        else:
+                            a = x.reshape(-1, x.shape[-1]); b = y.reshape(-1, y.shape[-1]); L = min(a.shape[-1], b.shape[-1])
+                            z = np.concatenate([a[:, a.shape[-1] - L:], b[:, b.shape[-1] - L:]], axis=0)
+                            if _CPL > 0.0 and z.shape[0] == 2 and not self._cpl_off:
+                                d0 = np.diff(z[0]); s0 = float(np.std(d0)); d1 = np.diff(z[1]); s1 = float(np.std(d1))
+                                if s0 > 0.0 and s1 > 0.0 and np.isfinite(s0) and np.isfinite(s1):
+                                    zz = np.concatenate([[0.0], np.clip((d0 - d0.mean()) / s0, -6.0, 6.0)])
+                                    p = int(np.argmax(z[1] != z[1][0]))
+                                    zz[:p] = 0.0
+                                    z = np.stack([z[0], z[1] + (_CPL * s1) * zz])
+                            if np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12)) and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12):
+                                x = np.ascontiguousarray(z)
+                yield x
+        finally:
+            it0.close(); it1.close()
