@@ -3406,3 +3406,140 @@ def active_base(rng, n, L, kind, cad, cfg):
             sub = ou(rng, cnt, L, logu(rng, 4.0, 600.0, cnt))
         out[m] = sub
     return out
+
+
+# ═════════════════════════════ D1 regime_dwell ═════════════════════════════
+
+def d1_params(rng, B, cfg):
+    p = cfg["families"]["regime_dwell"]
+    return {
+        "d_dorm": logu(rng, p["dormant_dwell"][0], p["dormant_dwell"][1], B),
+        "d_act": logu(rng, p["active_dwell"][0], p["active_dwell"][1], B),
+        "dwell_sigma": rng.uniform(0.6, 1.3, B),
+        "pareto_a": rng.uniform(1.2, 2.0, B),
+        "heavy_tail": rng.random(B) < p["pareto_mix"],
+        "kind": rng.integers(0, N_ACTIVE_KINDS, B),
+        "amp": logu(rng, 0.3, 12.0, B),
+        "level_step": logu(rng, 0.05, 3.0, B),
+        "var_switch": logu(rng, 1.0, 8.0, B),
+        "start_active": rng.random(B) < 0.35,
+        "micro_slope": rng.normal(0.0, 0.02, B),
+        "counter_step": logu(rng, 1.0, 50.0, B),
+        "sparse_p": logu(rng, 1e-4, 2e-2, B),
+        "sparse_amp": logu(rng, 0.5, 20.0, B),
+        "ramp_frac": rng.uniform(0.05, 0.15, B),
+        "noise": logu(rng, 1e-3, 0.2, B),
+    }
+
+
+def _heavy_dwell(rng, n, M, mean, sigma, pareto_a, heavy):
+    ln = np.exp(rng.normal(np.log(np.maximum(mean, 1.0)).reshape(n, 1),
+                           sigma.reshape(n, 1), size=(n, M)))
+    u = np.maximum(rng.random((n, M)), 1e-9)
+    par = np.maximum(mean, 1.0).reshape(n, 1) * np.power(u, -1.0 / pareto_a.reshape(n, 1))
+    take_par = (rng.random((n, M)) < 0.15) & heavy.reshape(n, 1)
+    return np.maximum(np.where(take_par, par, ln), 2.0)
+
+
+def d1_build_factory(mode):
+    def build(P, rng, L, cad, cal, cfg):
+        n = cad.n
+        M = 64
+        dorm = _heavy_dwell(rng, n, M, P["d_dorm"], P["dwell_sigma"],
+                            P["pareto_a"], P["heavy_tail"])
+        act = _heavy_dwell(rng, n, M, P["d_act"], P["dwell_sigma"],
+                           P["pareto_a"], P["heavy_tail"])
+        sa = P["start_active"].reshape(n, 1)
+        even = (np.arange(M)[None, :] % 2) == 0
+        dwell = np.where(even ^ sa, dorm, act)
+
+        seg_id, seg_start = segment_map(dwell, L)
+        seg_len = gather_levels(dwell, seg_id)
+        is_active = ((seg_id % 2) == 1) ^ sa
+
+        # segment levels follow a random walk; the variance switches too
+        steps = rng.standard_normal((n, M)) * P["level_step"].reshape(n, 1)
+        levels = np.cumsum(steps, axis=1)
+        lvl_t = gather_levels(levels, seg_id)
+        prev_lvl = gather_levels(np.concatenate(
+            [levels[:, :1], levels[:, :-1]], axis=1), seg_id)
+
+        t = time_grid(L)[None, :]
+        pos = (t - seg_start) / np.maximum(seg_len, 1.0)
+
+        base = active_base(rng, n, L, P["kind"], cad, cfg) * P["amp"].reshape(n, 1)
+        var_hi = P["var_switch"].reshape(n, 1)
+        carrier = np.where(is_active, base * var_hi, base / var_hi)
+
+        if mode == DORMANT_FLAT:
+            dormant = lvl_t
+        elif mode == DORMANT_MICRO:
+            dormant = lvl_t + P["micro_slope"].reshape(n, 1) \
+                * P["level_step"].reshape(n, 1) * (t - seg_start)
+        elif mode == DORMANT_COUNTER:
+            step = P["counter_step"].reshape(n, 1)
+            dormant = np.round(lvl_t / step) * step
+        elif mode == DORMANT_ZERO:
+            spike = np.where(rng.random((n, L)) < P["sparse_p"].reshape(n, 1),
+                             rng.standard_normal((n, L)) * P["sparse_amp"].reshape(n, 1),
+                             0.0)
+            dormant = np.abs(spike)
+        else:  # DORMANT_TRANS — a smooth monotone ramp between levels
+            w = np.clip(pos / np.maximum(P["ramp_frac"].reshape(n, 1), 1e-3), 0.0, 1.0)
+            w = 0.5 * (1.0 + np.tanh(6.0 * (w - 0.5)))
+            dormant = prev_lvl + (lvl_t - prev_lvl) * w
+
+        noise = rng.standard_normal((n, L)) * P["noise"].reshape(n, 1) \
+            * P["amp"].reshape(n, 1)
+        y = np.where(is_active, lvl_t + carrier + noise, dormant)
+        if mode == DORMANT_ZERO:
+            y = np.where(is_active, np.abs(carrier) + noise * 0.0, dormant)
+
+        extended = np.zeros(n, dtype=bool)
+        if cfg.get('_complete_native_renewals', False):
+            med = np.column_stack((np.where(P['start_active'], P['d_act'], P['d_dorm']),
+                                   np.where(P['start_active'], P['d_dorm'], P['d_act'])))
+            rr, dd, first = complete_dwell_table(
+                rng, dwell, L, med, P['dwell_sigma'].reshape(n, 1), 2.0,
+                P['heavy_tail'], P['pareto_a'])
+            if rr.size:
+                extended[rr] = True
+                extra = dd.shape[1] - M
+                add = np.cumsum(rng.standard_normal((rr.size, extra))
+                                * P['level_step'][rr, None], axis=1)
+                lev = np.concatenate((levels[rr], levels[rr, -1:] + add), axis=1)
+                sid, start = segment_map(dd, L)
+                slen = gather_levels(dd, sid)
+                active = ((sid % 2) == 1) ^ sa[rr]
+                now = gather_levels(lev, sid)
+                previous = gather_levels(np.concatenate((lev[:, :1], lev[:, :-1]), axis=1), sid)
+                if mode == DORMANT_FLAT:
+                    calm = now
+                elif mode == DORMANT_MICRO:
+                    calm = now + P['micro_slope'][rr, None] * P['level_step'][rr, None] * (t - start)
+                elif mode == DORMANT_COUNTER:
+                    tick = P['counter_step'][rr, None]
+                    calm = np.round(now / tick) * tick
+                elif mode == DORMANT_ZERO:
+                    calm = dormant[rr]  # already-drawn sparse observations
+                else:
+                    progress = (t - start) / np.maximum(slen, 1.0)
+                    w = np.clip(progress / np.maximum(P['ramp_frac'][rr, None], 1e-3), 0.0, 1.0)
+                    w = 0.5 * (1.0 + np.tanh(6.0 * (w - 0.5)))
+                    calm = previous + (now - previous) * w
+                carrier_new = np.where(active, base[rr] * var_hi[rr], base[rr] / var_hi[rr])
+                fixed = np.where(active, now + carrier_new + noise[rr], calm)
+                if mode == DORMANT_ZERO:
+                    fixed = np.where(active, np.abs(carrier_new), calm)
+                y[rr] = np.where(t >= first[:, None], fixed, y[rr])
+
+        fl = new_flags(n, scale_mode=1 if mode == DORMANT_ZERO else 0,
+                       positive=(mode == DORMANT_ZERO),
+                       quant_boost=1.4 if mode == DORMANT_COUNTER else 0.9)
+        if mode == DORMANT_ZERO:
+            fl["offset_pref"] = np.full(n, 2, dtype=np.int8)
+        if cfg.get('_complete_native_renewals', False):
+            fl['renewal_extended'] = extended
+        return y, fl
+
+    return build
