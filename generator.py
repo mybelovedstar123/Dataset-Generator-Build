@@ -2448,3 +2448,53 @@ def a3_build(P, rng, L, cad, cal, cfg):
                    quant_boost=0.0, obs_boost=0.5, allow_agg=False)
     fl["integer"] = (P["quantise"] & (P["upper"] > 1.0))
     return y, fl
+
+
+# ═══════════════════════════ A4 met_wind_speed ═════════════════════════════
+
+def a4_params(rng, B, cfg):
+    p = cfg["families"]["met_wind_speed"]
+    return {
+        "ell": logu(rng, p["component_ell"][0], p["component_ell"][1], B),
+        "mean_wind": logu(rng, 0.2, 6.0, B),
+        "gamma_mix": rng.uniform(-0.4, 0.8, B),
+        "gust": rng.random(B) < p["gust_rate"],
+        "gust_phi": rng.uniform(0.1, 0.5, B),
+        "gust_sig": rng.uniform(0.35, 0.7, B),
+        "drift_amp": rng.uniform(0.0, 1.2, B),
+        "quantise": rng.random(B) < p["quantise_rate"],
+        "quant_step": np.where(rng.random(B) < 0.5, 0.1, 1.0),
+    }
+
+
+def a4_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    p_day = cad.p_day.reshape(n, 1)
+
+    u = matern_gp(rng, n, L, P["ell"], nu=1.5)
+    v = matern_gp(rng, n, L, P["ell"], nu=1.5)
+
+    has_day = p_day >= 3.0
+    ph = t / np.where(has_day, p_day, 1e9) + rng.random((n, 1))
+    prof = np.where(has_day, np.sin(_cf_prims_TWO_PI * ph - 1.2), 0.0)
+    sig = 1.0 + P["gamma_mix"].reshape(n, 1) * 0.5 * prof
+    sig = np.maximum(sig, 0.15)
+
+    drift = matern_gp(rng, n, L, np.full(n, L / 2.0), nu=1.5) \
+        * P["drift_amp"].reshape(n, 1)
+    mw = P["mean_wind"].reshape(n, 1)
+    # Rice/Weibull marginal with a genuine hard floor at zero
+    s = np.sqrt((u * sig + drift) ** 2 + (v * sig) ** 2) * mw
+
+    g = P["gust"].reshape(n, 1)
+    lg = ar1(rng, n, L, P["gust_phi"]) * P["gust_sig"].reshape(n, 1) + np.log(0.35)
+    s = np.where(g, s * (1.0 + np.exp(np.clip(lg, -20.0, 6.0))), s)
+
+    q = P["quantise"].reshape(n, 1)
+    step = P["quant_step"].reshape(n, 1)
+    s = np.where(q, np.round(s / step) * step, s)
+
+    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.5,
+                   quant_rel_hi=0.4)
+    return s, fl
