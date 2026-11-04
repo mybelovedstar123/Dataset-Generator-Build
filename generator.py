@@ -10427,3 +10427,290 @@ def _spectral_gp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     z[:, 0] = 0.0
     x = np.fft.irfft(z * np.sqrt(envelope), n=embed, axis=1)[:, :L]
     return _prefix_standardize(x)
+
+
+def _long_memory(
+    rng: np.random.Generator,
+    n: int,
+    L: int,
+    *,
+    beta_lo: float = -0.6,
+    beta_hi_end: float = 2.4,
+) -> np.ndarray:
+    """Gaussian noise shaped to a prescribed spectral slope, 1/f^beta.
+
+    The slope range is the knob. Measured on the pool, the corpus spans beta from
+    -0.17 to 3.13 at the 1st and 99th percentiles, but nature reaches 3.78 and
+    web_cloudops reaches -1.05, so 11% of nature series are steeper than anything
+    the corpus emits and 21% of web_cloudops series are flatter. Steep slopes are
+    strongly persistent smooth signals; negative slopes are blue noise, which is
+    anti-correlated and no AR family here produces. Widening this range is the
+    cheapest way to cover both, because the mechanism is already exact -- the
+    slope is imposed in the frequency domain rather than approximated by a
+    recurrence.
+
+    Draw counts do not depend on the bounds, so the stream is unchanged at any
+    setting and the defaults reproduce the previous hardcoded range.
+    """
+    embed = 2 * L
+    f = np.fft.rfftfreq(embed)
+    safe_f = np.maximum(f, 1.0 / embed)[None, :]
+    beta = rng.uniform(beta_lo, beta_hi_end, size=(n, 1))
+    amp = safe_f ** (-0.5 * beta)
+
+
+    multiscale = rng.random((n, 1)) < 0.4
+    split_idx = rng.integers(8, max(9, f.size // 3), size=(n, 1))
+    split_f = np.maximum(split_idx / embed, 1.0 / embed)
+    beta_hi = rng.uniform(beta_lo, beta_hi_end + 0.4, size=(n, 1))
+    above = np.arange(f.size)[None, :] > split_idx
+    amp_hi = split_f ** (-0.5 * beta) \
+        * (safe_f / split_f) ** (-0.5 * beta_hi)
+    amp = np.where(multiscale & above, amp_hi, amp)
+    amp[:, 0] = 0.0
+    z = rng.standard_normal((n, f.size)) + 1j * rng.standard_normal((n, f.size))
+    x = np.fft.irfft(z * amp, n=embed, axis=1)[:, :L]
+    integrate = rng.random(n) < 0.25
+    if integrate.any():
+        x[integrate] = np.cumsum(x[integrate], axis=1)
+    return _prefix_standardize(x)
+
+
+def _ou_stochastic_vol(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+
+
+    switch_rate = np.exp(rng.uniform(np.log(0.001), np.log(0.15), size=(n, 1)))
+    switches = rng.random((n, L)) < switch_rate
+    switches[:, 0] = rng.random(n) < 0.5
+    regime = np.bitwise_and(np.cumsum(switches, axis=1), 1).astype(np.int8)
+
+
+    slow = rng.random((n, 1)) < 0.5
+    phi = np.where(
+        slow,
+        rng.uniform(0.995, 0.9995, size=(n, 1)),
+        rng.uniform(0.90, 0.99, size=(n, 1)),
+    )
+    mu0 = rng.normal(-2.0, 1.0, size=(n, 1))
+    mu1 = rng.normal(2.0, 1.0, size=(n, 1))
+    mean = np.where(regime == 0, mu0, mu1)
+    seasonal_on = rng.random((n, 1)) < 0.6
+    mean += seasonal_on * _seasonal(rng, n, L, k_max=3) \
+        * rng.uniform(0.5, 3.0, size=(n, 1))
+
+    log_sigma0 = rng.normal(np.log(0.3), 0.3, size=(n, 1))
+    log_sigma1 = rng.normal(np.log(1.5), 0.5, size=(n, 1))
+    log_sigma_mean = np.where(regime == 0, log_sigma0, log_sigma1)
+    vol_rho = rng.uniform(0.951, 0.995, size=(n, 1))
+    vol_eta = rng.uniform(0.03, 0.20, size=(n, 1))
+    vol_eps = rng.standard_normal((n, L))
+    vol_drive = (
+        (1.0 - vol_rho) * log_sigma_mean
+        + np.sqrt(1.0 - vol_rho * vol_rho) * vol_eta * vol_eps
+    )
+    log_vol = np.empty((n, L), dtype=np.float64)
+    log_vol[:, 0] = log_sigma_mean[:, 0]
+    for i in range(n):
+        rho = float(vol_rho[i, 0])
+        log_vol[i, 1:] = lfilter(
+            [1.0],
+            [1.0, -rho],
+            vol_drive[i, 1:],
+            zi=[rho * log_vol[i, 0]],
+        )[0]
+    vol = np.exp(np.clip(log_vol, -5.0, 5.0))
+
+    eps = rng.standard_normal((n, L))
+    heavy = np.nonzero(rng.random(n) < 0.35)[0]
+    if heavy.size:
+
+
+        eps[heavy] = (
+            rng.standard_t(4.0, size=(heavy.size, L)) / np.sqrt(2.0)
+        )
+    shocks = rng.random((n, L)) < (3.0 / L)
+    shock_rows, shock_cols = np.nonzero(shocks)
+
+    eps[shock_rows, shock_cols] += rng.normal(
+        0.0, 5.0, size=shock_rows.size
+    )
+
+    innovation_scale = np.sqrt(np.maximum(1.0 - phi * phi, 1e-6))
+    drive = (1.0 - phi) * mean + innovation_scale * vol * eps
+    out = np.empty((n, L), dtype=np.float64)
+    out[:, 0] = mean[:, 0] + vol[:, 0] * eps[:, 0]
+    for i in range(n):
+        p = float(phi[i, 0])
+        out[i, 1:] = lfilter(
+            [1.0], [1.0, -p], drive[i, 1:], zi=[p * out[i, 0]]
+        )[0]
+
+    scale = np.exp(rng.uniform(np.log(0.1), np.log(50.0), size=(n, 1)))
+    shift = rng.uniform(-100.0, 100.0, size=(n, 1))
+    return out * scale + shift
+
+
+def _physical_sensors(rng: np.random.Generator, n: int, L: int, *, native_metadata: bool = False):
+
+
+    seasonal = _seasonal(rng, n, L, k_max=2)
+    smooth = _spectral_gp(rng, n, L)
+    fronts = np.cumsum(
+        _sparse_jumps(rng, n, L, rate=5.0 / L, scale=1.0), axis=1
+    )
+    base = (
+        seasonal * rng.uniform(0.3, 2.0, size=(n, 1))
+        + smooth * rng.uniform(0.2, 1.2, size=(n, 1))
+        + fronts * rng.uniform(0.2, 1.0, size=(n, 1))
+    )
+
+    kind = rng.integers(0, 4, size=n)
+    out = base.copy()
+
+    bounded = kind == 1
+    if bounded.any():
+        gain = rng.uniform(0.8, 3.5, size=(int(bounded.sum()), 1))
+        midpoint = rng.uniform(-0.8, 0.8, size=(int(bounded.sum()), 1))
+        out[bounded] = 100.0 / (1.0 + np.exp(-gain * (base[bounded] - midpoint)))
+
+    pressure = kind == 2
+    if pressure.any():
+        count = int(pressure.sum())
+
+
+        diffusion = np.exp(
+            rng.uniform(np.log(0.03), np.log(0.20), size=(count, 1))
+        )
+        walk = np.cumsum(
+            rng.standard_normal((count, L)) * diffusion, axis=1
+        )
+        level = rng.uniform(900.0, 1100.0, size=(count, 1))
+        out[pressure] = (
+            level + walk + 2.0 * fronts[pressure] + 0.5 * seasonal[pressure]
+        )
+
+    magnitude = kind == 3
+    if magnitude.any():
+        count = int(magnitude.sum())
+        gusts = (rng.random((count, L)) < (8.0 / L)) \
+            * rng.lognormal(0.0, 0.8, size=(count, L))
+        power = rng.uniform(1.0, 1.6, size=(count, 1))
+        out[magnitude] = np.abs(base[magnitude]) ** power + gusts
+
+    if native_metadata:
+        flags = {"bounded": bounded & _CAS1_BOUNDED_SENSOR_ENABLED,
+                 "integer": np.zeros(n, dtype=bool)}
+        return out, flags
+    return out
+
+
+def _seasonal_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+
+
+    t = _time_index(L)
+    period = rng.choice(
+        _SEASONAL_PERIODS, size=(n, 1), p=_SEASONAL_PROBS
+    )
+    phase = rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
+    amp = rng.uniform(0.15, 0.8, size=(n, 1))
+    log_rate = amp * np.sin(2.0 * np.pi * t / period + phase)
+    second = rng.random((n, 1)) < 0.55
+    log_rate += second * (0.5 * amp) * np.sin(
+        4.0 * np.pi * t / period + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
+    )
+
+
+    calendar = rng.random((n, 1)) < 0.35
+    day_period = rng.choice([24, 48, 96, 144], size=(n, 1))
+    day_idx = (np.floor_divide(np.arange(L)[None, :], day_period) % 7).astype(np.int64)
+    day_factors = rng.normal(0.0, 0.12, size=(n, 7))
+    day_factors[:, 5:] += rng.uniform(-0.8, 0.3, size=(n, 1))
+    calendar_effect = np.take_along_axis(day_factors, day_idx, axis=1)
+    log_rate += calendar * calendar_effect
+    excursion = rng.uniform(-0.5, 0.5, size=(n, 1))
+    log_rate += excursion * t / max(L - 1, 1)
+
+
+    impulses = (
+        (rng.random((n, L)) < (2.0 / L))
+        * rng.uniform(1.0, 10.0, size=(n, L))
+    )
+    burst = _ar1_batch(impulses, rng.uniform(0.85, 0.995, size=(n, 1)))
+    base = np.exp(rng.uniform(np.log(3.0), np.log(3000.0), size=(n, 1)))
+    lam = base * np.exp(np.clip(log_rate, -5.0, 5.0)) * (1.0 + burst)
+    np.clip(lam, 0.0, 1.0e7, out=lam)
+
+
+    overdispersed = rng.random((n, 1)) < 0.5
+    shape = rng.uniform(0.5, 4.0, size=(n, 1))
+    mixed = lam * rng.gamma(shape, 1.0 / shape, size=(n, L))
+    return rng.poisson(np.where(overdispersed, mixed, lam)).astype(np.float64)
+
+
+def _dispersion_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Integer counts whose dispersion is drawn, not inherited from the sampler.
+
+    Every existing count family fixes its dispersion by choosing a distribution:
+    ``_rate_counts`` and ``_seasonal_counts`` are Poisson or Poisson-Gamma, and a
+    Poisson process has variance equal to its mean by construction, so the Fano
+    factor var/mean can only land at or above 1. Their rates are also capped
+    (100 and 3000), which bounds how far the measured factor can travel.
+
+    Measured on the 2026-08-11 pool that is the largest coverage hole in the
+    corpus: 25% of nature's integer series sit *below* the corpus 1st percentile
+    of 0.039, because they are near-deterministic counters -- a level in the
+    thousands carrying a variance of a few -- while energy sits far above instead,
+    median 237 against the corpus median 1.8. Neither tail is reachable by any
+    family here, and no reweighting can create a statistic the mechanisms cannot
+    emit.
+
+    So dispersion becomes a first-class parameter. Draw a target Fano factor and
+    a level, then pick whichever distribution can realise the pair exactly:
+
+        phi < 1   Binomial(N, p),  p = 1 - phi,  N = mu / p
+                  mean = Np = mu,  var = Np(1-p) = mu*phi     underdispersed
+        phi = 1   Poisson(mu)                                 equidispersed
+        phi > 1   NegBinomial(r, q),  r = mu / (phi - 1),  q = r / (r + mu)
+                  mean = mu,  var = mu*(1 + mu/r) = mu*phi    overdispersed
+
+    A seasonal level of relative depth d contributes mu*d^2/2 to the *measured*
+    factor, which at mu=5e4 swamps any sampling phi, so depth and phi are drawn
+    jointly against the target rather than independently: the depth is capped so
+    the level term cannot exceed the target, and the count noise supplies the
+    remainder. Verified against the pool in scripts/proto_dispersion.py, where
+    this reaches 0.001 to 9.1e3 against nature's 0.001 to 2.2e4.
+    """
+    t = _time_index(L)
+    target = np.exp(rng.uniform(np.log(1.0e-3), np.log(1.0e4), size=(n, 1)))
+    level = np.exp(rng.uniform(np.log(0.5), np.log(5.0e4), size=(n, 1)))
+
+    period = _RATE_PERIODS[
+        _RATE_PERIOD_CDF.searchsorted(rng.random((n, 1)), side="right")
+    ]
+    phase = rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
+    depth_cap = np.sqrt(target / np.maximum(level, 1e-9))
+    depth = np.minimum(rng.uniform(0.0, 0.9, size=(n, 1)), depth_cap)
+    phi = np.clip(target - level * depth * depth / 2.0, 1.0e-3, 1.0e4)
+
+    season = 1.0 + depth * np.sin(2.0 * np.pi * t / period + phase)
+    # A second harmonic on some rows, so the level is not a pure sinusoid; it is
+    # scaled by the same depth and therefore respects the variance budget above.
+    second = rng.random((n, 1)) < 0.45
+    season += second * (0.35 * depth) * np.sin(
+        4.0 * np.pi * t / period + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
+    )
+    mu = np.maximum(level * np.maximum(season, 0.0), 1.0e-9)
+
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        p_i = float(phi[i, 0])
+        if p_i < 0.98:
+            keep = 1.0 - p_i
+            trials = np.maximum(np.rint(mu[i] / keep), 1.0).astype(np.int64)
+            out[i] = rng.binomial(trials, keep)
+        elif p_i <= 1.02:
+            out[i] = rng.poisson(mu[i])
+        else:
+            r = np.maximum(mu[i] / (p_i - 1.0), 1.0e-6)
+            out[i] = rng.negative_binomial(r, r / (r + mu[i]))
+    return out
