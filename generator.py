@@ -5710,3 +5710,11 @@ _POOL4: tuple[str, ...] = (
     "storm_outage_counts",
     "gauge_rain",
 )
+
+# --- DeepEcho/DoppelGANger-inspired (reference only; no deps) ----------
+_DEEP1: tuple[str, ...] = (
+    "store_sales_panel",
+    "web_session_attr",
+    "broadband_path_attr",
+    "cluster_job_attr",
+)
