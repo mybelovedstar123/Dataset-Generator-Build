@@ -17155,3 +17155,256 @@ def _pt_finalize_nonconstant_series(x: np.ndarray, n: int) -> np.ndarray:
         x = x.copy()
         x[-1] = x[-1] + 1.0
     return np.ascontiguousarray(x, dtype=np.float64)
+
+def _pt_daily_profile_counts_with_drift(rng: np.random.Generator, n: int) -> np.ndarray:
+    n = int(n)
+    p = _pt_draw_intraday_period(rng, n)
+    day_profile = _pt_random_daily_profile(rng, p)
+    step_idx = np.arange(n, dtype=np.int64)
+    seasonal = day_profile[step_idx % p]
+    seasonal = seasonal * _pt_weekday_factor_series(rng, n, p, rng.uniform(0.02, 0.28), rng.uniform(-0.7, 0.2))
+    log_drift = np.cumsum(rng.normal(0.0, rng.uniform(0.0004, 0.004), size=n))
+    if rng.random() < 0.3:
+        for _ in range(int(rng.integers(1, 4))):
+            s = int(rng.integers(n // 10 + 1, n))
+            log_drift[s:] += rng.uniform(-0.35, 0.35)
+    ar_noise = _pt_ar1_noise_from_coef(rng, n, rng.uniform(0.55, 0.95), rng.uniform(0.03, 0.42))
+    base_level = 10.0 ** (rng.uniform(4.0, 6.0) if rng.random() < 0.15 else rng.uniform(0.6, 4.0))
+    mu = base_level * seasonal * np.exp(log_drift + ar_noise - 0.5 * ar_noise.var())
+    x = _pt_poisson_or_overdispersed_counts(rng, mu)
+    median_count = float(np.median(x))
+    if rng.random() < 0.35 and median_count > 8.0:
+        ok = _pt_ROUNDING_GRID_STEPS[_pt_ROUNDING_GRID_STEPS <= median_count / 4.0]
+        if ok.size:
+            q = float(rng.choice(ok))
+            x = np.rint(x / q) * q
+    x = _pt_insert_zero_or_hold_gaps(rng, x, 0.3)
+    if rng.random() < 0.08:
+        cap = float(np.percentile(x, rng.uniform(85.0, 97.0)))
+        if cap > 0:
+            x = np.minimum(x, np.rint(cap))
+    return _pt_finalize_nonconstant_series(x, n)
+
+def _pt_long_period_seasonal_levels(rng: np.random.Generator, n: int) -> np.ndarray:
+    n = int(n)
+    t = np.arange(n, dtype=np.float64)
+    if rng.random() < 0.55:
+        p = float(rng.uniform(max(12.0, n / 14.0), max(20.0, n / 2.5)))
+    else:
+        allowed_periods = _pt_INTRADAY_PERIOD_CHOICES[(_pt_INTRADAY_PERIOD_CHOICES >= 96) & (_pt_INTRADAY_PERIOD_CHOICES <= max(96, n // 3))]
+        p = float(allowed_periods[rng.integers(allowed_periods.size)]) if allowed_periods.size else float(max(24, n // 4))
+    season_amp = rng.uniform(0.03, 0.3)
+    shape = np.zeros(n, dtype=np.float64)
+    n_harmonics = int(rng.integers(2, 4))
+    for h in range(1, n_harmonics + 1):
+        shape += rng.uniform(0.35, 1.0) / h * np.cos(2.0 * np.pi * h * t / p + rng.uniform(0.0, 2.0 * np.pi))
+    sd = float(shape.std())
+    if sd > 1e-12:
+        shape *= season_amp / sd
+    slow_wander = _pt_ar1_noise_from_coef(rng, n, min(0.9999, float(np.exp(-rng.uniform(1.5, 8.0) / max(n, 2)))), rng.uniform(0.03, 0.22))
+    day_steps = p if p >= 8 else 8.0
+    wk = _pt_weekday_factor_series(rng, n, int(max(1, round(day_steps))), rng.uniform(0.02, 0.2), rng.uniform(-0.35, 0.35))
+    jitter_ar = _pt_ar1_noise_from_coef(rng, n, rng.uniform(0.95, 0.998), rng.uniform(0.001, 0.028))
+    log_trend = np.linspace(0.0, rng.uniform(-0.35, 0.35), n)
+    base_level = 10.0 ** rng.uniform(1.0, 12.0)
+    x = base_level * np.exp(shape + slow_wander + jitter_ar + log_trend) * wk
+    if base_level < 1000000.0:
+        q = 1.0
+    else:
+        e = int(np.floor(np.log10(base_level))) - int(rng.integers(2, 7))
+        q = 10.0 ** max(e, 0)
+        if rng.random() < 0.3:
+            q *= 2.0
+    x = np.rint(x / q) * q
+    if rng.random() < 0.2:
+        cap = float(np.percentile(x, rng.uniform(90.0, 99.5)))
+        x = np.minimum(x, cap)
+        x = np.maximum(x - float(np.percentile(x, rng.uniform(0.0, 8.0))), 0.0)
+    if rng.random() < 0.5:
+        fresh_mask = rng.random(n) >= rng.uniform(0.02, 0.28)
+        fresh_mask[0] = True
+        last_fresh_idx = np.maximum.accumulate(np.where(fresh_mask, np.arange(n), 0))
+        x = x[last_fresh_idx]
+    if rng.random() < 0.25:
+        edit_end = min(n, n if rng.random() < 0.1 else max(80, n - 64))
+        for _ in range(int(rng.integers(1, 4))):
+            ln = int(rng.integers(1, 9))
+            s = int(rng.integers(1, max(2, edit_end - ln)))
+            x[s:s + ln] = 0.0 if rng.random() < 0.4 else x[s - 1] * rng.uniform(0.05, 0.4)
+    return _pt_finalize_nonconstant_series(np.rint(np.maximum(x, 0.0) / q) * q, n)
+
+def _pt_lognormal_ar_with_spikes(rng: np.random.Generator, n: int) -> np.ndarray:
+    n = int(n)
+    p = _pt_draw_intraday_period(rng, n)
+    base_level = 10.0 ** rng.uniform(0.7, 3.6)
+    log_ar = _pt_ar1_noise_from_coef(rng, n, rng.uniform(0.95, 0.999), rng.uniform(0.04, 0.38))
+    day = rng.uniform(0.0, 0.35) * np.sin(2.0 * np.pi * np.arange(n, dtype=np.float64) / p + rng.uniform(0.0, 6.283))
+    log_jitter = rng.normal(0.0, rng.uniform(0.012, 0.16), size=n)
+    x = base_level * np.exp(log_ar + day + log_jitter)
+    spike_rate = rng.uniform(0.004, 0.09)
+    k = int(rng.binomial(n, spike_rate))
+    if k:
+        spike_pos = rng.integers(0, n, size=k)
+        a = rng.uniform(1.3, 2.6)
+        spike_cap = rng.uniform(4.0, 40.0)
+        spike_mult = 1.0 + np.minimum(rng.pareto(a, size=k) * rng.uniform(0.8, 2.6), spike_cap)
+        spike_excess = np.zeros(n, dtype=np.float64)
+        np.maximum.at(spike_excess, spike_pos, spike_mult - 1.0)
+        spike_decay = rng.uniform(0.08, 0.62)
+        spike_excess = lfilter([1.0], [1.0, -spike_decay], spike_excess)
+        x = x * (1.0 + spike_excess)
+    if rng.random() < 0.85:
+        x = np.rint(x)
+        median_count = float(np.median(x))
+        if rng.random() < 0.45 and median_count > 80.0:
+            ok = _pt_ROUNDING_GRID_STEPS[_pt_ROUNDING_GRID_STEPS <= median_count / 16.0]
+            if ok.size:
+                q = float(rng.choice(ok))
+                x = np.rint(x / q) * q
+    return _pt_finalize_nonconstant_series(np.maximum(x, 0.0), n)
+
+def _pt_cumulative_download_counter(rng: np.random.Generator, n: int) -> np.ndarray:
+    n = int(n)
+    p = _pt_draw_intraday_period(rng, n)
+    day_profile = _pt_random_daily_profile(rng, p) if rng.random() < 0.75 else np.ones(p)
+    day_profile = 1.0 + rng.uniform(0.1, 0.9) * (day_profile - 1.0)
+    rate = day_profile[np.arange(n, dtype=np.int64) % p]
+    rate = rate * _pt_weekday_factor_series(rng, n, p, rng.uniform(0.01, 0.25), rng.uniform(-0.6, 0.1))
+    rate = rate * np.exp(_pt_ar1_noise_from_coef(rng, n, rng.uniform(0.96, 0.999), rng.uniform(0.02, 0.18)))
+    if rng.random() < 0.12:
+        s = int(rng.integers(n // 6 + 1, n))
+        rate[s:] *= rng.uniform(0.45, 2.2)
+    start_total = 10.0 ** rng.uniform(5.0, 11.0)
+    growth_frac = max(10.0 ** rng.uniform(-2.75, -1.5), 120.0 / start_total)
+    m = rate.mean()
+    rate = rate * (start_total * growth_frac / n / (m if m > 1e-12 else 1.0))
+    increments = _pt_poisson_or_overdispersed_counts(rng, rate)
+    if rng.random() < 0.1:
+        decrements = _pt_poisson_or_overdispersed_counts(rng, rate * rng.uniform(0.55, 0.95))
+        increments = increments - decrements
+    x = start_total + np.cumsum(increments)
+    return _pt_finalize_nonconstant_series(np.rint(np.maximum(x, 0.0)), n)
+_pt_EPI_DAY_BLOCKS_MIN, _pt_EPI_DAY_BLOCKS_STOP = (64, 77)
+_pt_SEVEN_DAY_SUM_KERNEL = np.ones(7)
+
+def _pt_asymmetric_gaussian_wave(t, c, rise_width, fall_width):
+    u = t - c
+    return np.exp(-0.5 * (u / np.where(u < 0.0, rise_width, fall_width)) ** 2)
+
+def _pt_epidemic_weekly_sums(rng, n):
+    m = 32 * int(rng.integers(_pt_EPI_DAY_BLOCKS_MIN, _pt_EPI_DAY_BLOCKS_STOP))
+    t = np.arange(m + 6, dtype=np.float64)
+    n_pre_waves = int(rng.integers(1, 3))
+    n_main_waves = int(rng.integers(2, 4))
+    n_fading_waves = int(rng.integers(1, 3))
+    n_tail_waves = int(rng.integers(1, 3))
+    W = n_pre_waves + n_main_waves + n_fading_waves
+    wave_amps = np.empty(W + n_tail_waves)
+    wave_amps[n_pre_waves] = 1.0
+    for j in range(n_pre_waves - 1, -1, -1):
+        wave_amps[j] = wave_amps[j + 1] * rng.uniform(0.3, 0.6)
+    for j in range(n_pre_waves + 1, n_pre_waves + n_main_waves):
+        wave_amps[j] = wave_amps[j - 1] * rng.uniform(0.72, 1.06)
+    for j in range(n_pre_waves + n_main_waves, W):
+        wave_amps[j] = wave_amps[j - 1] * rng.uniform(0.3, 0.6)
+    for j in range(W, W + n_tail_waves):
+        wave_amps[j] = wave_amps[j - 1] * rng.uniform(0.55, 0.92)
+    wave_amps /= wave_amps.max()
+    tail_window = int(rng.integers(760, 1081))
+    a0 = m * rng.uniform(0.02, 0.09)
+    a1 = float(m - tail_window - 150)
+    if W > 1:
+        u = (np.arange(W, dtype=np.float64) / (W - 1.0)) ** rng.uniform(0.72, 1.05)
+        wave_centers = a0 + (a1 - a0) * u + rng.normal(0.0, 0.09 * (a1 - a0) / (W - 1.0), W)
+    else:
+        wave_centers = np.array([a0 + 0.5 * (a1 - a0)])
+    last_tail_center = m * rng.uniform(0.855, 0.915)
+    if n_tail_waves == 1:
+        tail_centers = np.array([last_tail_center])
+    else:
+        tail_centers = np.array([a1 + (last_tail_center - a1) * rng.uniform(0.35, 0.62), last_tail_center])
+    wave_centers = np.concatenate([wave_centers, tail_centers])
+    k = W + n_tail_waves
+    rise_widths = rng.uniform(13.0, 32.0, k) * rng.uniform(0.85, 1.45)
+    fall_widths = rise_widths * rng.uniform(1.0, 1.9, k)
+    body_curve = np.zeros(m + 6, dtype=np.float64)
+    tail_curve = np.zeros(m + 6, dtype=np.float64)
+    for j in range(k):
+        e = body_curve if j < W else tail_curve
+        e += wave_amps[j] * _pt_asymmetric_gaussian_wave(t, wave_centers[j], rise_widths[j], fall_widths[j])
+        for _ in range(2):
+            if rng.random() < 0.7:
+                side = 1.0 if rng.random() < 0.65 else -1.0
+                e += wave_amps[j] * rng.uniform(0.25, 0.75) * _pt_asymmetric_gaussian_wave(t, wave_centers[j] + side * fall_widths[j] * rng.uniform(1.4, 3.2), rise_widths[j] * rng.uniform(0.6, 1.3), fall_widths[j] * rng.uniform(0.6, 1.3))
+    peak = float((body_curve + tail_curve).max())
+    if peak > 1e-12:
+        body_curve /= peak
+        tail_curve /= peak
+    tail_peak_ratio = float(np.exp(rng.normal(np.log(0.19), 0.5)))
+    j0 = m + 6 - 760
+    body_recent_max = float(body_curve[j0:].max())
+    tail_recent_max = float(tail_curve[j0:].max())
+    if tail_recent_max > 1e-09:
+        tail_curve *= float(np.clip((tail_peak_ratio - body_recent_max) / tail_recent_max, 0.02, 25.0))
+    wave_curve = body_curve + tail_curve
+    background_frac = float(np.exp(rng.uniform(np.log(0.005), np.log(0.026))))
+    ramp_in_end = m * rng.uniform(0.02, 0.09)
+    ramp_out_start = m * rng.uniform(0.74, 0.88)
+    g = 10.0 ** (-rng.uniform(0.5, 1.7) * np.clip((ramp_in_end - t) / max(ramp_in_end, 1.0), 0.0, 1.0)) * 10.0 ** (-rng.uniform(0.5, 1.9) * np.clip((t - ramp_out_start) / max(m - ramp_out_start, 1.0), 0.0, 1.0))
+    count_scale = 10.0 ** float(np.clip(rng.normal(2.25, 0.76), 0.95, 3.25))
+    log_noise = rng.uniform(0.08, 0.3) * _pt_smooth_random_curve(rng, m + 6, rng.uniform(25.0, 90.0))
+    daily_mean = count_scale * (background_frac * g + (1.0 - background_frac) * wave_curve) * np.exp(log_noise - 0.5 * log_noise.var())
+    dow = (np.arange(m + 6, dtype=np.int64) + int(rng.integers(0, 7))) % 7
+    wk = np.exp(rng.normal(0.0, rng.uniform(0.04, 0.16), 7))
+    wk[5:] *= rng.uniform(0.7, 0.97)
+    daily_mean = daily_mean * (wk[dow] / wk.mean())
+    c = _pt_overdispersed_poisson_counts(rng, np.maximum(daily_mean, 0.0) / 7.0, float(np.exp(rng.uniform(np.log(3.0), np.log(45.0)))))
+    x = np.rint(np.convolve(c, _pt_SEVEN_DAY_SUM_KERNEL, mode='valid'))
+    np.maximum(x, 0.0, out=x)
+    if rng.random() < 0.25:
+        x[-1] = np.floor(x[-1] * rng.uniform(0.0, 0.7))
+    np.nan_to_num(x, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.any(x != x[0]):
+        x = x.copy()
+        x[-1] = x[-1] + 1.0
+    return np.ascontiguousarray(x, dtype=np.float64)
+_pt_NATIVE_SCALE_FAMILIES = frozenset(('integer_staircase', 'hourly_diurnal_counts', 'ixp_traffic_5min', 'daily_pageviews_or_download_total', 'weather_station_readings', 'hydrology_flow_stage', 'tide_gauge_levels', 'rainfall_or_air_pollutant', 'electricity_net_demand', 'electricity_spot_price', 'discrete_levels_or_outages', 'energy_solar_wind_unit_load_flow', 'flu_season_percent_positive', 'business_day_ledger_counts', 'diurnal_harmonic_counts', 'financial_price_series', 'x', 'road_traffic_counts_or_speed', 'arrival_counts_or_occupancy', 'seasonal_test_positivity', 'solar_pv_output', 'unit_dispatch_load_or_carbon_intensity', 'scheduled_or_clipped_flow', 'count_ladder_or_spot_price', 'sparse_pulse_response', 'integrated_ar_drift', 'two_timescale_ar_sensor', 'markov_intermittent_amounts', 'dock_occupancy_latent_fill', 'dock_occupancy_arrival_queue', 'dock_occupancy_jump_walk', 'intraday_peak_profile_counts', 'long_cycle_seasonal_level', 'lognormal_ar_with_spikes', 'cumulative_download_counter', 'rki_epidemic_weekly_sums'))
+
+def _pt_hold_flat_tail(rng, x, min_len, max_frac, extreme_prob):
+    n = x.size
+    hi = int(max_frac * n)
+    if hi <= min_len:
+        return x
+    L = int(np.exp(rng.uniform(np.log(min_len), np.log(hi))))
+    s = n - L
+    v = float(x[s - 1]) if s >= 1 else float(x[0])
+    if rng.random() < extreme_prob and s > 0 and (float(x[:s].min()) >= 0.0):
+        v = 0.0 if rng.random() < 0.5 else float(np.max(x[:s]))
+    out = x.copy()
+    out[s:] = v
+    return out
+
+def _pt_hold_random_segments(rng, x, max_segments, min_seg_len, max_seg_len, extreme_prob):
+    n = x.size
+    out = x.copy()
+    was_nonneg = bool(out.min() >= 0.0)
+    k = int(rng.integers(1, max_segments + 1))
+    for _ in range(k):
+        hi = min(max_seg_len, n - 2)
+        if hi <= min_seg_len:
+            break
+        seg_len = int(np.exp(rng.uniform(np.log(min_seg_len), np.log(hi))))
+        s = int(rng.integers(1, n - seg_len))
+        e = s + seg_len
+        v = float(out[s - 1])
+        at_extreme = False
+        if rng.random() < extreme_prob and was_nonneg:
+            v = 0.0 if rng.random() < 0.5 else float(np.max(out[:s]))
+            at_extreme = True
+        if e < n and (not at_extreme):
+            out[e:] += v - out[e]
+        out[s:e] = v
+    if was_nonneg:
+        np.maximum(out, 0.0, out=out)
+    return out
+_pt_FAMILY_BUILDERS = {'hourly_diurnal_counts': _pt_hourly_counts_random_regime, 'ixp_traffic_5min': _pt_ixp_traffic_5min, 'daily_pageviews_or_download_total': _pt_web_daily_or_cumulative_counts, 'weather_station_readings': _pt_weather_station_series, 'hydrology_flow_stage': _pt_hydro_rain_runoff_series, 'tide_gauge_levels': _pt_tide_gauge_series, 'rainfall_or_air_pollutant': _pt_rainfall_or_air_pollutant, 'electricity_net_demand': _pt_grid_net_load, 'electricity_spot_price': _pt_electricity_price, 'discrete_levels_or_outages': _pt_discrete_levels_or_outages, 'energy_solar_wind_unit_load_flow': _pt_energy_solar_wind_unit_flow, 'flu_season_percent_positive': _pt_flu_season_positivity_pct, 'business_day_ledger_counts': _pt_business_day_counts, 'diurnal_harmonic_counts': _pt_diurnal_activity_counts, 'financial_price_series': _pt_market_price_series, 'x': _pt_dock_and_parking_availability, 'road_traffic_counts_or_speed': _pt_traffic_volume_or_speed, 'arrival_counts_or_occupancy': _pt_diurnal_counts_or_occupancy, 'seasonal_test_positivity': _pt_seasonal_positivity_percent, 'multi_harmonic_ar': _pt_harmonics_plus_ar_noise, 'markov_switching_ar': _pt_markov_switching_ou_series, 'gp_kernel_mixture': lambda rng, n: _pt_random_kernel_gp_draw(rng, n), 'poisson_gp_intensity_counts': _pt_poisson_exp_gp_counts, 'bounded_integer_walk': _pt_dock_occupancy_walk, 'arma_arima': _pt_random_arima_series, 'piecewise_linear_trend': _pt_piecewise_linear_trend, 'random_dwell_steps': _pt_random_dwell_steps, 'sparse_jump_decay': _pt_sparse_decaying_jumps, 'weekday_poisson_counts': _pt_weekday_business_counts, 'garch_price_path': _pt_garch_price_path, 'periodic_profile': _pt_periodic_profile_series, 'smooth_log_level': _pt_smooth_log_level_series, 'integer_staircase': _pt_integer_staircase_series, 'solar_pv_output': _pt_solar_pv_series, 'unit_dispatch_load_or_carbon_intensity': _pt_power_unit_load_carbon_intensity, 'scheduled_or_clipped_flow': _pt_interconnector_net_flow, 'count_ladder_or_spot_price': _pt_count_ladder_or_spot_price, 'sparse_pulse_response': _pt_sparse_pulse_response_series, 'integrated_ar_drift': _pt_integrated_ar_mixture_series, 'two_timescale_ar_sensor': _pt_two_timescale_weather_series, 'markov_intermittent_amounts': _pt_markov_intermittent_precip_series, 'dock_occupancy_latent_fill': _pt_occupancy_latent_fraction_counts, 'dock_occupancy_arrival_queue': _pt_occupancy_arrival_departure_counts, 'dock_occupancy_jump_walk': _pt_occupancy_dwell_jump_counts, 'intraday_peak_profile_counts': _pt_daily_profile_counts_with_drift, 'long_cycle_seasonal_level': _pt_long_period_seasonal_levels, 'lognormal_ar_with_spikes': _pt_lognormal_ar_with_spikes, 'cumulative_download_counter': _pt_cumulative_download_counter, 'rki_epidemic_weekly_sums': _pt_epidemic_weekly_sums}
