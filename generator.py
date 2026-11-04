@@ -15171,3 +15171,292 @@ def _pt_harmonic_log_profile(rng, period, trough_ratio):
     if span > 1e-09:
         profile = (profile - profile.max()) / span * np.log(1.0 / trough_ratio)
     return profile
+
+def _pt_diurnal_activity_counts(rng, n):
+    mode = rng.choice(3, p=[0.3, 0.25, 0.45])
+    t = np.arange(n)
+    if mode == 0:
+        period = int(rng.choice(np.array([24, 288, 60, 144]), p=[0.45, 0.3, 0.15, 0.1]))
+        log_profile = _pt_harmonic_log_profile(rng, period, _pt_counts_log_uniform(rng, 0.01, 0.6))
+        phase_offset = int(rng.integers(0, period * 7))
+        ph = (t + phase_offset) % period
+        day = (t + phase_offset) // period % 7
+        lg = log_profile[ph] + log_profile.mean() * 0.0
+        lg += rng.uniform(0.05, 0.3) * _pt_knot_interpolated_noise(rng, n, rng.uniform(1.0, 4.0) * period)
+        if period in (24, 144, 288):
+            lg += np.where(day >= 5, np.log(rng.uniform(0.25, 1.1)), 0.0)
+        mu = _pt_counts_log_uniform(rng, 1.0, 200.0)
+        mean_rate = mu * np.exp(lg - lg.mean())
+        if rng.random() < 0.35:
+            mean_rate *= 1.0 + _pt_decaying_spike_train(rng, n, _pt_counts_log_uniform(rng, 0.002, 0.02), 2.0, 60.0, rng.uniform(0.3, 0.9))
+        c = _pt_negative_binomial_counts(rng, mean_rate, _pt_counts_log_uniform(rng, 2.0, 50.0))
+        if rng.random() < 0.5 and (c > 0).sum() > 8:
+            c = _pt_left_pad_to_length(c[c > 0], n)
+        return c
+    if mode == 1:
+        period = int(rng.choice(np.array([288, 144, 24]), p=[0.7, 0.15, 0.15]))
+        log_profile = _pt_harmonic_log_profile(rng, period, rng.uniform(0.3, 0.85))
+        phase_offset = int(rng.integers(0, period * 7))
+        ph = (t + phase_offset) % period
+        day = (t + phase_offset) // period % 7
+        lg = log_profile[ph] + np.where(day >= 5, np.log(rng.uniform(0.95, 1.2)), 0.0)
+        lg += rng.uniform(0.03, 0.2) * _pt_knot_interpolated_noise(rng, n, rng.uniform(1.0, 5.0) * period)
+        lg += lfilter([1.0], [1.0, -0.97], rng.normal(0.0, rng.uniform(0.001, 0.006), n))
+        x = np.round(_pt_counts_log_uniform(rng, 500.0, 500000.0) * np.exp(lg - lg.mean()))
+        hold_mask = rng.random(n) < rng.uniform(0.02, 0.2)
+        hold_mask[0] = False
+        src_index = np.where(hold_mask, 0, t)
+        src_index = np.maximum.accumulate(src_index)
+        return x[src_index]
+    base_level = _pt_counts_log_uniform(rng, 50.0, 10000000.0)
+    dow = (t + int(rng.integers(0, 7))) % 7
+    wk = np.exp(rng.normal(0.0, 0.04, 7))
+    wk[5:] *= rng.uniform(0.2, 0.5) if rng.random() < 0.6 else rng.uniform(0.75, 1.1)
+    lg = rng.normal(0.0, 0.001) * t + rng.uniform(0.05, 0.25) * _pt_knot_interpolated_noise(rng, n, rng.uniform(10, 80))
+    lg += rng.uniform(0.02, 0.12) * rng.standard_normal(n)
+    mean_rate = base_level * wk[dow] * np.exp(lg - lg[-min(n, 60):].mean())
+    if rng.random() < 0.5:
+        mean_rate *= 1.0 + _pt_decaying_spike_train(rng, n, _pt_counts_log_uniform(rng, 0.003, 0.03), 0.5, 20.0, rng.uniform(0.2, 0.85))
+    x = rng.poisson(np.clip(mean_rate, 0.0, 1000000000000.0)).astype(np.float64)
+    if rng.random() < 0.5:
+        x[rng.random(n) < _pt_counts_log_uniform(rng, 0.003, 0.04)] = 0.0
+    if rng.random() < 0.8:
+        x[-1] = 0.0
+    return x
+
+def _pt_market_price_series(rng, n):
+    mode = rng.choice(3, p=[0.5, 0.25, 0.25])
+    if mode == 0:
+        base_price = _pt_counts_log_uniform(rng, 40.0, 700.0)
+        df = rng.uniform(2.2, 5.0)
+        e = rng.standard_t(df, n) * rng.uniform(0.002, 0.015)
+        ar_coef = rng.uniform(0.97, 1.0)
+        lg = lfilter([1.0], [1.0, -ar_coef], e)
+        t = np.arange(n)
+        lg += rng.uniform(0.0, 0.08) * np.sin(_pt_COUNTS_TWO_PI * t / 252.0 + rng.uniform(0, _pt_COUNTS_TWO_PI))
+        lg += (rng.uniform(0.0, 0.012) if rng.random() < 0.5 else 0.0) * rng.standard_normal(n)
+        x = base_price * np.exp(lg - lg.mean())
+        hold_mask = rng.random(n) < (rng.uniform(0.0, 0.1) if rng.random() < 0.3 else 0.0)
+        hold_mask[0] = False
+        x = x[np.maximum.accumulate(np.where(hold_mask, 0, t))]
+        x = np.round(x, 2)
+        if rng.random() < 0.3:
+            x[rng.random(n) < _pt_counts_log_uniform(rng, 0.01, 0.6)] = 0.0
+        return x
+    if mode == 1:
+        base_price = rng.uniform(1.2, 2.3) if rng.random() < 0.7 else _pt_counts_log_uniform(rng, 1.0, 300.0)
+        jump_mask = rng.random(n) < 1.0 / _pt_counts_log_uniform(rng, 20.0, 800.0)
+        log_returns = np.where(jump_mask, rng.normal(rng.normal(0, 0.002), rng.uniform(0.004, 0.02), n), 0.0)
+        return np.round(base_price * np.exp(np.cumsum(log_returns)), 3)
+    value_scale = _pt_counts_log_uniform(rng, 20000.0, 1000000.0)
+    trades_per_step = 1 + rng.poisson(_pt_counts_log_uniform(rng, 0.2, 12.0), n)
+    n_trades = int(trades_per_step.sum())
+    trade_sigma = rng.uniform(0.4, 1.3)
+    trade_multipliers = np.exp(trade_sigma * rng.standard_normal(n_trades))
+    trade_step = np.repeat(np.arange(n), trades_per_step)
+    mean_trade_multiplier = np.bincount(trade_step, weights=trade_multipliers, minlength=n) / trades_per_step
+    lg = rng.uniform(0.02, 0.15) * _pt_knot_interpolated_noise(rng, n, rng.uniform(30, 150))
+    x = value_scale * mean_trade_multiplier * np.exp(lg)
+    return np.round(x, 2)
+
+def _pt_mobility_log_uniform(rng, lo, hi):
+    return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+
+def _pt_smooth_random_curve(rng, n, length_scale):
+    m = 1 << int(np.ceil(np.log2(max(n, 16))))
+    f = np.fft.rfftfreq(m)
+    spectral_gain = np.exp(-0.5 * (f * length_scale * 2.5) ** 2)
+    spectral_gain[0] = 0.0
+    c = (rng.standard_normal(len(f)) + 1j * rng.standard_normal(len(f))) * spectral_gain
+    y = np.fft.irfft(c, m)[:n]
+    s = y.std()
+    return y / s if s > 1e-12 else y
+_pt_TOD_BIN_COUNT = 1024
+_pt_TOD_BIN_CENTERS = (np.arange(_pt_TOD_BIN_COUNT) + 0.5) / _pt_TOD_BIN_COUNT
+
+def _pt_smooth_random_curve_pair(rng, n, length_scale):
+    m = 1 << int(np.ceil(np.log2(max(n, 16))))
+    f = np.fft.rfftfreq(m)
+    spectral_gain = np.exp(-0.5 * (f * length_scale * 2.5) ** 2)
+    spectral_gain[0] = 0.0
+    w = rng.standard_normal((2, len(f))) * spectral_gain
+    z = np.fft.fft(np.concatenate((w[0] + 1j * w[1], np.zeros(m - len(f)))))[:n]
+    a, b = (z.real, z.imag)
+    return (a / max(a.std(), 1e-12), b / max(b.std(), 1e-12))
+
+def _pt_daily_gaussian_bump(tod_bin, center, width):
+    d = (_pt_TOD_BIN_CENTERS - center + 0.5) % 1.0 - 0.5
+    return np.exp(-0.5 * (d / width) ** 2)[tod_bin]
+
+def _pt_time_of_day_and_weekday(rng, n, steps_per_day):
+    t = np.arange(n, dtype=np.float64) / steps_per_day + rng.uniform(0.0, 7.0)
+    return ((t % 1.0 * _pt_TOD_BIN_COUNT).astype(np.int64), t.astype(np.int64) % 7)
+
+def _pt_pick_option_by_weight(rng, options, weights):
+    return options[int(np.searchsorted(np.cumsum(weights), rng.random() * np.sum(weights)))]
+
+def _pt_sample_and_hold_random(rng, x, refresh_prob):
+    n = len(x)
+    is_refresh = rng.random(n) < refresh_prob
+    is_refresh[0] = True
+    src_index = np.maximum.accumulate(np.where(is_refresh, np.arange(n), 0))
+    return x[src_index]
+
+def _pt_overdispersed_poisson_counts(rng, mean_count, shape):
+    return rng.poisson(mean_count * rng.gamma(shape, 1.0 / shape, size=mean_count.shape)).astype(np.float64)
+
+@njit(cache=False)
+def _pt_simulate_dock_occupancy(x0, arrivals, departures, capacity, is_rebalance, rebalance_level, arrival_uniform, departure_uniform, arrival_fill_exp, departure_fill_exp):
+    n = arrivals.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    x = x0
+    for t in range(n):
+        if is_rebalance[t]:
+            x = rebalance_level[t]
+        else:
+            fill_ratio = x / capacity
+            a = arrivals[t] if arrival_uniform[t] < (1.0 - fill_ratio) ** arrival_fill_exp else 0.0
+            d = departures[t] if departure_uniform[t] < fill_ratio ** departure_fill_exp else 0.0
+            x = x + a - d
+            if x < 0.0:
+                x = 0.0
+            elif x > capacity:
+                x = capacity
+        out[t] = x
+    return out
+
+@njit(cache=False)
+def _pt_simulate_occupancy_geometric_stays(arrivals, u, leave_prob, capacity):
+    n = arrivals.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    k = 0.0
+    for t in range(n):
+        kk = int(k)
+        if kk > 0:
+            q = 1.0 - leave_prob
+            pmf = q ** kk
+            cdf = pmf
+            j = 0
+            while cdf < u[t] and j < kk:
+                pmf = pmf * (kk - j) / (j + 1.0) * leave_prob / q
+                j += 1
+                cdf += pmf
+            k -= j
+        k += arrivals[t]
+        if k > capacity:
+            k = capacity
+        out[t] = k
+    return out
+
+def _pt_dock_and_parking_availability(rng, n):
+    steps_per_day = _pt_pick_option_by_weight(rng, (96.0, 288.0, 144.0, 48.0, 24.0, -1.0), (0.34, 0.22, 0.1, 0.1, 0.06, 0.18))
+    if steps_per_day < 0:
+        steps_per_day = rng.uniform(400.0, 1440.0)
+    steps_per_day *= rng.uniform(0.96, 1.01)
+    tod, dow = _pt_time_of_day_and_weekday(rng, n, steps_per_day)
+    is_weekend = dow >= 5
+    if rng.random() < 0.18:
+        capacity = np.round(_pt_mobility_log_uniform(rng, 10.0, 700.0))
+        kind = rng.random()
+        if kind < 0.5:
+            occupancy = _pt_daily_gaussian_bump(tod, rng.uniform(0.45, 0.58), rng.uniform(0.1, 0.17))
+            occupancy = occupancy * np.where(is_weekend, rng.uniform(0.15, 0.6), 1.0)
+        else:
+            occupancy = _pt_daily_gaussian_bump(tod, rng.uniform(0.58, 0.8), rng.uniform(0.08, 0.16))
+            occupancy = occupancy * np.where(is_weekend, rng.uniform(1.0, 1.4), 1.0)
+        occupancy_gain = rng.uniform(0.55, 1.05)
+        occupancy_floor = rng.uniform(0.0, 0.25)
+        occupancy = occupancy_floor + occupancy_gain * occupancy + 0.08 * rng.uniform(0.2, 1.0) * _pt_smooth_random_curve(rng, n, steps_per_day / rng.uniform(4, 24))
+        occupancy = occupancy + rng.uniform(0.0, 0.06) * rng.standard_normal(n)
+        free_spaces = np.clip(np.round(capacity * (1.0 - np.clip(occupancy, 0.0, 1.0))), 0.0, capacity)
+        return _pt_sample_and_hold_random(rng, free_spaces, rng.uniform(0.35, 1.0))
+    capacity = np.round(_pt_mobility_log_uniform(rng, 7.0, 36.0))
+    trips_per_day = _pt_mobility_log_uniform(rng, 6.0, 90.0)
+    trips_per_step = trips_per_day / steps_per_day
+    am = _pt_daily_gaussian_bump(tod, rng.uniform(0.3, 0.37), rng.uniform(0.03, 0.06))
+    pm = _pt_daily_gaussian_bump(tod, rng.uniform(0.7, 0.76), rng.uniform(0.04, 0.07))
+    midday_bump = _pt_daily_gaussian_bump(tod, rng.uniform(0.5, 0.6), rng.uniform(0.1, 0.18))
+    activity_floor = rng.uniform(0.02, 0.12)
+    wk = np.where(is_weekend, rng.uniform(0.2, 0.7), 1.0)
+    am_pm_asymmetry = rng.uniform(0.15, 0.8) * (1.0 if rng.random() < 0.5 else -1.0)
+    midday_weight = rng.uniform(0.2, 1.2)
+    activity_profile = activity_floor + wk * (am + pm) + midday_weight * np.where(is_weekend, 1.5, 0.6) * midday_bump
+    activity_profile = activity_profile / activity_profile.mean()
+    flow_imbalance = wk * am_pm_asymmetry * (am - pm)
+    imbalance_noise, activity_noise = _pt_smooth_random_curve_pair(rng, n, rng.uniform(1.5, 4.0) * steps_per_day)
+    flow_imbalance = flow_imbalance + rng.uniform(0.05, 0.4) * imbalance_noise
+    mod = np.exp(0.35 * activity_noise)
+    departure_rate = trips_per_step * 0.5 * activity_profile * np.clip(1.0 + flow_imbalance, 0.05, None) * mod
+    arrival_rate = trips_per_step * 0.5 * activity_profile * np.clip(1.0 - flow_imbalance, 0.05, None) * mod
+    group_trip_prob = rng.uniform(0.0, 0.35)
+    ug = rng.random((2, n))
+    trip_group_size = 1.0 + (ug < group_trip_prob) + (ug < 0.3 * group_trip_prob)
+    arrivals = rng.poisson(arrival_rate) * trip_group_size[0]
+    departures = rng.poisson(departure_rate) * trip_group_size[1]
+    rebalance_prob = rng.uniform(0.0, 0.9) / steps_per_day
+    is_rebalance = rng.random(n) < rebalance_prob
+    rebalance_level = np.zeros(n)
+    rebalance_level[is_rebalance] = np.round(capacity * rng.uniform(0.15, 0.75, int(is_rebalance.sum())))
+    accept_uniforms = rng.random((2, n))
+    x = _pt_simulate_dock_occupancy(float(np.round(capacity * rng.uniform(0.1, 0.7))), arrivals, departures, float(capacity), is_rebalance, rebalance_level, accept_uniforms[0], accept_uniforms[1], rng.uniform(0.3, 1.0), rng.uniform(0.08, 0.5))
+    if rng.random() < 0.12:
+        L = int(min(n - 1, rng.integers(int(steps_per_day // 4) + 1, int(3 * steps_per_day) + 2)))
+        s = int(rng.integers(0, n - L))
+        x[s:s + L] = 0.0 if rng.random() < 0.7 else x[s]
+    return _pt_sample_and_hold_random(rng, x, rng.uniform(0.45, 1.0))
+
+def _pt_weekday_weekend_diurnal_profile(rng, tod, is_off_day, kind):
+    if kind == 0:
+        weekday_profile = rng.uniform(0.7, 1.0) * _pt_daily_gaussian_bump(tod, rng.uniform(0.29, 0.35), rng.uniform(0.03, 0.06)) + rng.uniform(0.7, 1.0) * _pt_daily_gaussian_bump(tod, rng.uniform(0.68, 0.74), rng.uniform(0.04, 0.08)) + rng.uniform(0.35, 0.65) * _pt_daily_gaussian_bump(tod, 0.52, rng.uniform(0.12, 0.2))
+        weekend_profile = rng.uniform(0.45, 0.85) * _pt_daily_gaussian_bump(tod, rng.uniform(0.52, 0.62), rng.uniform(0.12, 0.18))
+    elif kind == 1:
+        weekday_profile = _pt_daily_gaussian_bump(tod, rng.uniform(0.5, 0.56), rng.uniform(0.08, 0.14)) + rng.uniform(0.3, 0.9) * _pt_daily_gaussian_bump(tod, rng.uniform(0.33, 0.37), 0.025) + rng.uniform(0.3, 0.9) * _pt_daily_gaussian_bump(tod, rng.uniform(0.7, 0.74), 0.035)
+        weekend_profile = rng.uniform(0.5, 1.2) * _pt_daily_gaussian_bump(tod, rng.uniform(0.55, 0.62), rng.uniform(0.1, 0.16))
+    else:
+        w = rng.uniform(0.16, 0.24)
+        weekday_profile = _pt_daily_gaussian_bump(tod, rng.uniform(0.5, 0.62), w) + 0.25 * _pt_daily_gaussian_bump(tod, 0.72, 0.05)
+        weekend_profile = rng.uniform(0.75, 1.0) * _pt_daily_gaussian_bump(tod, rng.uniform(0.55, 0.65), w)
+    profile = np.where(is_off_day, weekend_profile, weekday_profile)
+    return profile / profile.max()
+
+def _pt_traffic_volume_or_speed(rng, n):
+    steps_per_day = _pt_pick_option_by_weight(rng, (24.0, 96.0, 48.0, 288.0, 1.0), (0.45, 0.28, 0.1, 0.1, 0.07))
+    if steps_per_day > 1.0:
+        steps_per_day *= rng.uniform(0.97, 1.0) if rng.random() < 0.4 else 1.0
+    tod, dow = _pt_time_of_day_and_weekday(rng, n, steps_per_day)
+    day_index = np.floor(np.arange(n) / steps_per_day).astype(np.int64)
+    n_days = int(day_index[-1]) + 1
+    is_holiday = rng.random(n_days) < 1.0 / 45.0
+    is_off_day = (dow >= 5) | is_holiday[day_index]
+    if steps_per_day > 1.0 and rng.random() < 0.2:
+        free_flow_speed = _pt_pick_option_by_weight(rng, (50.0, 60.0, 80.0, 100.0, 120.0), (0.15, 0.15, 0.25, 0.3, 0.15)) * rng.uniform(0.85, 1.02)
+        rush_hour_dip = _pt_daily_gaussian_bump(tod, 0.32, 0.03) + _pt_daily_gaussian_bump(tod, 0.72, 0.04)
+        is_congested_day = rng.random(n_days) < rng.uniform(0.0, 0.5)
+        congestion_depth = rng.uniform(0.05, 0.5) * is_congested_day[day_index] * ~is_off_day
+        v = free_flow_speed * (1.0 - congestion_depth * rush_hour_dip) + rng.uniform(0.3, 2.0) * rng.standard_normal(n)
+        v = v - np.abs(rng.standard_normal(n)) * (rng.random(n) < 0.01) * free_flow_speed * 0.3
+        return _pt_sample_and_hold_random(rng, np.round(np.clip(v, 0.0, None)), rng.uniform(0.18, 0.5))
+    if steps_per_day == 1.0:
+        weekday_factors = np.array([1.0, 1.02, 1.03, 1.02, 0.98, rng.uniform(0.45, 0.8), rng.uniform(0.3, 0.7)])
+        weekday_shift = int(rng.integers(0, 7))
+        daily_profile = np.roll(weekday_factors, weekday_shift)[dow] * np.where(is_holiday[day_index], rng.uniform(0.35, 0.7), 1.0)
+    else:
+        kind = int(_pt_pick_option_by_weight(rng, (0, 1, 2), (0.45, 0.25, 0.3)))
+        profile_floor = _pt_mobility_log_uniform(rng, 0.01, 0.25)
+        daily_profile = profile_floor + (1.0 - profile_floor) * _pt_weekday_weekend_diurnal_profile(rng, tod, is_off_day, kind)
+    base_level = _pt_mobility_log_uniform(rng, 80.0, 9000.0) if rng.random() < 0.93 else _pt_mobility_log_uniform(rng, 10000.0, 1000000.0)
+    if steps_per_day == 1.0:
+        base_level = _pt_mobility_log_uniform(rng, 1000.0, 500000.0)
+    day_factor = np.exp(rng.uniform(0.03, 0.2) * _pt_smooth_random_curve(rng, n_days + 2, rng.uniform(1.0, 6.0))[day_index])
+    slow_drift = np.exp(rng.uniform(0.0, 0.15) * _pt_smooth_random_curve(rng, n, max(8.0, n / rng.uniform(1.5, 5.0))))
+    mean_count = base_level * daily_profile * day_factor * slow_drift
+    if rng.random() < 0.25:
+        L = int(min(n - 1, rng.integers(2, max(3, int(steps_per_day)) + 3)))
+        s = int(rng.integers(0, n - L))
+        mean_count[s:s + L] *= rng.uniform(0.05, 0.6)
+    mean_count = mean_count * np.exp(rng.uniform(0.03, 0.15) * _pt_smooth_random_curve(rng, n, max(1.5, steps_per_day / rng.uniform(6.0, 30.0))))
+    count_cv = rng.uniform(0.03, 0.16)
+    k = 1.0 / count_cv ** 2
+    if rng.random() < 0.15 and base_level < 5000:
+        return 12.0 * _pt_overdispersed_poisson_counts(rng, np.maximum(mean_count / 12.0, 0.001), k)
+    return _pt_overdispersed_poisson_counts(rng, np.maximum(mean_count, 0.001), k)
