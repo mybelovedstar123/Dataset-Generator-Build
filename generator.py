@@ -5959,3 +5959,26 @@ _DISPATCH_REF, _DISPATCH_REF_CDF = _build_dispatch_ref()
 # now or under any near-term graft (was len(_FAMILIES), which collides as
 # soon as a 35th family is appended: fam index 34 would share the old key).
 _DISPATCH_STREAM_FAM = 999
+
+
+# --- throughput: hoisted draw tables ---------------------------------------
+#
+# ``Generator.choice`` re-validates ``a``, re-normalises ``p`` and rebuilds the
+# cumulative table on EVERY call, which costs ~24us against ~2us for the draw
+# itself — and at n=1 this generator calls it once per row per family. numpy
+# implements the weighted case as ``cdf.searchsorted(self.random(shape),
+# side="right")`` and the unweighted case as ``a[self.integers(0, len(a),
+# shape)]``, so hoisting the table out reproduces both the values AND the
+
+# ==============================================================================
+# RNG: seeding, stream pools, self-check
+# ==============================================================================
+
+def _choice_cdf(p) -> np.ndarray:
+    """Pre-build the exact cumulative table ``Generator.choice`` derives."""
+    cdf = np.asarray(p, dtype=np.float64).cumsum()
+    cdf /= cdf[-1]
+    return cdf
+
+
+_CHOICE_PM1 = np.array([-1.0, 1.0], dtype=np.float64)
