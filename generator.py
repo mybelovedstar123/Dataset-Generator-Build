@@ -5109,3 +5109,35 @@ def _check_node(spec, node, path, family_names):
             _check_node(sub, node[k], f"{path}.{k}", family_names)
         return
     _check_scalar(spec, node, path)
+
+
+def validate(cfg, family_names):
+    """Validate eagerly at construction; raise ``ConfigError`` on any problem."""
+    if not isinstance(cfg, dict):
+        raise ConfigError("config.json must be a JSON object")
+    _check_node(SCHEMA, cfg, "", tuple(family_names))
+
+    lad = cfg["length_ladder"]
+    for key in ("fine", "coarse"):
+        if len(lad[key]["lengths"]) != len(lad[key]["weights"]):
+            raise ConfigError(f"length_ladder.{key}: lengths/weights length mismatch")
+        for x in lad[key]["lengths"]:
+            if x > cfg["internal_length"]:
+                raise ConfigError(f"length_ladder.{key}: {x} exceeds internal_length")
+    cad = cfg["cadence"]
+    for a, b in (("fine_seconds", "fine_weights"),
+                 ("coarse_seconds", "coarse_weights")):
+        if len(cad[a]) != len(cad[b]):
+            raise ConfigError(f"cadence: {a}/{b} length mismatch")
+    sc = cfg["scale"]
+    share = sc["zero_anchor_share"] + sc["large_offset_share"] + sc["sign_cross_share"]
+    if share > 1.0 + 1e-9:
+        raise ConfigError("scale: offset-regime shares exceed 1.0")
+    cal = cfg["calendar"]
+    if cal["holiday_count_lo"] > cal["holiday_count_hi"]:
+        raise ConfigError("calendar: holiday_count_lo exceeds holiday_count_hi")
+    if cal["holiday_comp_lo"] > cal["holiday_comp_hi"]:
+        raise ConfigError("calendar: holiday_comp_lo exceeds holiday_comp_hi")
+    if cfg["internal_length"] % 32 != 0:
+        raise ConfigError("internal_length must be a multiple of 32")
+    return cfg
