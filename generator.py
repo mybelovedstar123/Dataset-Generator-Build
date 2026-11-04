@@ -1960,3 +1960,69 @@ def apply_observation(rng, y, flags, cfg):
     if idx.size:
         y[idx] = np.clip(y[idx], lo_b[idx], hi_b[idx])
     return y
+
+
+# ═══════════════════════════ scale and offset ══════════════════════════════
+
+def apply_scale(rng, y, flags, cfg):
+    """Give every row a raw physical scale and offset.
+
+    The trainer's causal scaler removes absolute level and scale, so this is not
+    about magnitude for its own sake.  It is about the three things that *do*
+    survive that transform: the integer lattice relative to the running standard
+    deviation, the outlier-to-scale ratio under arcsinh, and how ``loc``/``scale``
+    themselves evolve.  The large-offset regime is deliberately over-represented
+    because a tiny relative variance on a large level is the small-MASE-
+    denominator regime, and the sign-crossing regime is over-represented because
+    a small sum|y| is what makes WQL a relative-error amplifier.
+    """
+    n, L = y.shape
+    s = cfg["scale"]
+    comps = s["log10_scale_mixture"]
+    ws = np.array([c["weight"] for c in comps], dtype=np.float64)
+    mus = np.array([c["mean"] for c in comps], dtype=np.float64)
+    sds = np.array([c["sigma"] for c in comps], dtype=np.float64)
+    k = np.searchsorted(np.cumsum(ws / ws.sum()), rng.random(n), side="right")
+    k = np.clip(k, 0, len(ws) - 1)
+    log10s = mus[k] + sds[k] * rng.standard_normal(n)
+    scale = np.power(10.0, np.clip(log10s, -11.0, 10.0)).reshape(n, 1)
+
+    mode = np.where(flags["count"], 2, flags["scale_mode"])
+    pref = flags["offset_pref"]
+
+    r = rng.random(n)
+    c0 = s["zero_anchor_share"]
+    c1 = c0 + s["large_offset_share"]
+    c2 = c1 + s["sign_cross_share"]
+    reg = np.where(r < c0, 0, np.where(r < c1, 1, np.where(r < c2, 2, 3)))
+    reg = np.where(pref == 1, 1, np.where(pref == 2, 0, np.where(pref == 3, 2, reg)))
+
+    big = rng.uniform(s["large_offset_ratio"][0], s["large_offset_ratio"][1], n)
+    off = np.where(reg == 0, 0.0,
+                   np.where(reg == 1, big,
+                            np.where(reg == 2, rng.standard_normal(n),
+                                     -np.abs(rng.standard_normal(n)) * big)))
+    # hard invariant: |offset| / scale <= 1e7, so the fluctuation always keeps
+    # at least nine significant digits of float64 headroom
+    off = np.clip(off, -1.0e7, 1.0e7).reshape(n, 1)
+
+    idx = _rows(mode == 0)
+    if idx.size:
+        sub = y[idx]
+        sub = sub - sub.mean(axis=1, keepdims=True)
+        sub = sub / safe_std(sub)
+        y[idx] = off[idx] * scale[idx] + scale[idx] * sub
+    idx = _rows(mode == 1)
+    if idx.size:
+        sub = y[idx]
+        mag = np.maximum(np.abs(sub).mean(axis=1, keepdims=True), 1e-200)
+        peak = np.maximum(np.abs(sub).max(axis=1, keepdims=True), 1e-200)
+        mult = np.minimum(scale[idx] / mag, MAX_PEAK / peak)
+        y[idx] = sub * mult
+    # keep the batch inside the magnitude envelope before anything downstream
+    # divides by a row statistic
+    peak = np.abs(y).max(axis=1, keepdims=True)
+    hot = _rows(peak[:, 0] > MAX_PEAK)
+    if hot.size:
+        y[hot] = y[hot] * (MAX_PEAK / peak[hot])
+    return y
