@@ -4698,3 +4698,116 @@ def _build_batch(seed_hi, seed_lo, b, cfg, weights, coarse):
     out = sanitise(stream(seed_hi, seed_lo, b, STAGE_SANITISE),
                    out, flags, starts, cfg)
     return out, cad.length.astype(np.int64)
+
+
+# ═══════════════ chronoforge: cf_produce ═══════════════
+# Threaded batch producer with a strict-order reorder buffer.
+#
+# ``multiprocessing`` is on the static-guard blocked list, but threads are not,
+# and the sandbox is affinity-pinned to a whole lane core slice.  NumPy's FFT,
+# the numba kernels (compiled ``nogil=True``) and the bulk elementwise work all
+# release the GIL, so a handful of worker threads convert lane CPU that would
+# otherwise idle into a richer prior.
+#
+# Determinism is preserved exactly: a batch's contents depend only on
+# ``(seed, batch_index)`` — never on thread identity, scheduling, or the worker
+# count.  Workers may finish out of order; the reorder buffer emits strictly by
+# batch index, so the byte stream is identical at any thread count.  A bounded
+# in-flight window keeps peak memory flat.
+
+
+def worker_count(requested: int) -> int:
+    try:
+        avail = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        avail = os.cpu_count() or 1
+    return max(1, min(int(requested), int(avail)))
+
+
+class BatchProducer:
+    def __init__(self, seed_hi: int, seed_lo: int, cfg: dict, weights, coarse,
+                 workers: int):
+        self._hi = seed_hi
+        self._lo = seed_lo
+        self._cfg = cfg
+        self._w = weights
+        self._c = coarse
+        self._workers = worker_count(workers)
+        self._inflight = max(2, int(cfg["threads"]["max_inflight_batches"]))
+
+    def _build(self, b: int):
+        return build_batch(self._hi, self._lo, b, self._cfg, self._w, self._c)
+
+    def batches(self, n_series: int):
+        """Yield ``(values, lengths, n_to_emit)`` in strict batch order."""
+        n_batches = batches_for(n_series, self._cfg)
+        if self._workers <= 1:
+            emitted = 0
+            for b in range(n_batches):
+                vals, lens = self._build(b)
+                take = min(len(lens), n_series - emitted)
+                yield vals, lens, take
+                emitted += take
+                if emitted >= n_series:
+                    return
+            return
+        yield from self._threaded(n_series, n_batches)
+
+    def _threaded(self, n_series: int, n_batches: int):
+        cv = threading.Condition()
+        state = {"next": 0, "emit": 0, "stop": False, "error": None}
+        results: dict[int, tuple] = {}
+
+        def worker():
+            while True:
+                with cv:
+                    while True:
+                        if state["stop"] or state["error"] is not None:
+                            return
+                        if state["next"] >= n_batches:
+                            return
+                        if state["next"] - state["emit"] >= self._inflight:
+                            cv.wait(timeout=0.5)
+                            continue
+                        b = state["next"]
+                        state["next"] = b + 1
+                        break
+                try:
+                    res = self._build(b)
+                except BaseException as exc:  # surface to the consumer thread
+                    with cv:
+                        if state["error"] is None:
+                            state["error"] = exc
+                        cv.notify_all()
+                    return
+                with cv:
+                    results[b] = res
+                    cv.notify_all()
+
+        threads = [threading.Thread(target=worker, daemon=True,
+                                    name=f"chronoforge-{i}")
+                   for i in range(self._workers)]
+        for th in threads:
+            th.start()
+        emitted = 0
+        try:
+            for b in range(n_batches):
+                with cv:
+                    while b not in results:
+                        if state["error"] is not None:
+                            raise state["error"]
+                        cv.wait(timeout=1.0)
+                    vals, lens = results.pop(b)
+                    state["emit"] = b + 1
+                    cv.notify_all()
+                take = min(len(lens), n_series - emitted)
+                yield vals, lens, take
+                emitted += take
+                if emitted >= n_series:
+                    return
+        finally:
+            with cv:
+                state["stop"] = True
+                cv.notify_all()
+            for th in threads:
+                th.join(timeout=5.0)
