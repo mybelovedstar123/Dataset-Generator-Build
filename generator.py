@@ -6660,3 +6660,299 @@ def _vol_regime_switch(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
                    rng.uniform(0.90, 0.999, size=(n, 1)))
     scale = np.exp(rng.uniform(np.log(1.0), np.log(500.0), size=(n, 1)))
     return x * scale + rng.uniform(-1.0, 1.0, size=(n, 1)) * scale
+
+
+def _weekly_demand(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Daily attention counts (per-article pageview class): 1 step = 1 day.
+
+    Typical daily per-article pageview feeds: level median 2.7e3
+    (10-90%: 5.6e2-1.2e4), integer, no zeros; robust day-to-day log noise
+    0.06-0.13; weak day-of-week profile (sd of DOW log means 0.02-0.09);
+    news bursts ~2/yr (0.7-5.5) at a median 2.5x the 29-day median (tail to
+    20-150x) that fall back to +0.40 / +0.13 / +0.07 log on days 1-3; yearly
+    log level change median -0.03 (IQR -0.15..+0.13) with rare large
+    permanent shifts; an annual cycle on about a third of feeds (lag-364
+    acf 0.3-0.7) whose strength varies from year to year; some topics only
+    emerge part-way through the history.
+
+    Construction: log level = drift U[-0.4, 0.1]/yr + random walk (daily sd
+    log-U[0.002, 0.01]) + interest waves (AR(1), tau U[20, 120] d, sd
+    U[0.05, 0.25]) + permanent shifts (U[0.05, 0.4]/yr, N(0, 0.35)) +
+    emergence ramp on 15% of rows; annual cycle on 30% (two harmonics,
+    amplitude U[0.05, 0.25], per-year gain lognormal 0.35) with a fixed-date
+    annual event bump on 30% of those; weak DOW profile (sd log-U[0.015,
+    0.12]); bursts at log-U[0.8, 10]/yr with log size 0.3 + Exp(0.6) (cap 5),
+    count excess decaying as a fast (U[0.15, 0.35]/day) plus slow (U[0.5,
+    0.85]/day) geometric pair, 10% leaving a small permanent gain; AR(1)
+    lognormal noise sd log-U[0.04, 0.13]; base log-U[1e2, 5e4], lowered
+    (never clipped) to keep the peak under the 1e6 sanitize rail; Poisson
+    below 5e3, integer, floor 1.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    t = _time_index(L)
+    days = np.arange(L, dtype=np.int64)[None, :]
+    yr = 365.25
+
+    def ar1(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
+        out = np.empty_like(innov)
+        for i in range(n):
+            out[i] = lfilter([1.0], [1.0, -float(phi[i, 0])], innov[i])
+        return out
+
+    drift = rng.uniform(-0.4, 0.1, size=(n, 1)) / yr
+    rw_sd = np.exp(rng.uniform(np.log(0.002), np.log(0.01), size=(n, 1)))
+    level = drift * t + np.cumsum(rng.normal(0.0, 1.0, size=(n, L)) * rw_sd, axis=1)
+    rho = np.exp(-1.0 / rng.uniform(20.0, 120.0, size=(n, 1)))
+    wave_sd = rng.uniform(0.05, 0.25, size=(n, 1))
+    level += ar1(
+        rng.normal(0.0, 1.0, size=(n, L)) * wave_sd * np.sqrt(1.0 - rho * rho), rho
+    )
+
+    def events(rate: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        k = rng.poisson(rate[:, 0] * L)
+        return np.repeat(np.arange(n), k), rng.integers(0, L, size=int(k.sum()))
+
+    # permanent level shifts (and the small gains some bursts leave behind)
+    jumps = np.zeros((n, L), dtype=np.float64)
+    r, c = events(rng.uniform(0.05, 0.4, size=(n, 1)) / yr)
+    np.add.at(jumps, (r, c), rng.normal(0.0, 0.35, size=r.size))
+
+    emerge = rng.random((n, 1)) < 0.15
+    t0 = rng.uniform(0.05, 0.7, size=(n, 1)) * L
+    ramp = rng.uniform(30.0, 300.0, size=(n, 1)) / 6.0
+    depth = rng.uniform(1.5, 4.0, size=(n, 1))
+    level -= np.where(
+        emerge, depth / (1.0 + np.exp(np.clip((t - t0) / ramp, -50.0, 50.0))), 0.0
+    )
+
+    # annual cycle with a year-to-year gain, plus an optional fixed-date event
+    seasonal = rng.random((n, 1)) < 0.3
+    a1 = rng.uniform(0.05, 0.25, size=(n, 1))
+    a2 = a1 * rng.uniform(0.0, 0.5, size=(n, 1))
+    ph1 = rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
+    ph2 = rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
+    ann = a1 * np.cos(2.0 * np.pi * t / yr + ph1) + a2 * np.cos(4.0 * np.pi * t / yr + ph2)
+    center = rng.uniform(0.0, yr, size=(n, 1))
+    year_idx = np.floor((t - center) / yr + 0.5).astype(np.int64) + 1
+    n_years = int(L / yr) + 3
+    gain = np.take_along_axis(
+        np.exp(rng.normal(0.0, 0.35, size=(n, n_years))), year_idx, axis=1
+    )
+    doy = np.mod(t - center, yr)
+    dist = np.minimum(doy, yr - doy)
+    event = rng.random((n, 1)) < 0.3
+    bump = rng.uniform(0.5, 2.0, size=(n, 1)) * np.exp(
+        -0.5 * (dist / rng.uniform(3.0, 30.0, size=(n, 1))) ** 2
+    )
+    level += np.where(seasonal, gain * (ann + np.where(event, bump, 0.0)), 0.0)
+
+    phase = rng.integers(0, 7, size=(n, 1))
+    dow = (days + phase) % 7
+    prof = rng.normal(0.0, 1.0, size=(n, 7)) * np.exp(
+        rng.uniform(np.log(0.015), np.log(0.12), size=(n, 1))
+    )
+    prof[:, 5:] += rng.uniform(-0.12, 0.08, size=(n, 1))
+    prof -= prof.mean(axis=1, keepdims=True)
+    level += np.take_along_axis(prof, dow, axis=1)
+
+    # news bursts: count excess with a fast and a slow geometric decay
+    r, c = events(np.exp(rng.uniform(np.log(0.8), np.log(10.0), size=(n, 1))) / yr)
+    size = np.minimum(0.3 + rng.exponential(0.6, size=r.size), 5.0)
+    amp = np.zeros((n, L), dtype=np.float64)
+    np.add.at(amp, (r, c), np.expm1(size))
+    a_fast = rng.uniform(0.9, 0.98, size=(n, 1))
+    excess = ar1(amp * a_fast, rng.uniform(0.15, 0.35, size=(n, 1))) + ar1(
+        amp * (1.0 - a_fast), rng.uniform(0.5, 0.85, size=(n, 1))
+    )
+    kept = rng.random(r.size) < 0.1
+    np.add.at(jumps, (r[kept], c[kept]), rng.uniform(0.03, 0.25, size=int(kept.sum())))
+    level += np.cumsum(jumps, axis=1)
+
+    phi = rng.uniform(0.1, 0.5, size=(n, 1))
+    sig = np.exp(rng.uniform(np.log(0.04), np.log(0.13), size=(n, 1)))
+    noise = ar1(
+        rng.normal(0.0, 1.0, size=(n, L)) * sig * np.sqrt(1.0 - phi * phi), phi
+    )
+
+    level = level - np.median(level[:, -28:], axis=1, keepdims=True)
+    path = np.exp(np.clip(level + noise, -12.0, 12.0)) * (1.0 + excess)
+    base = np.exp(rng.uniform(np.log(100.0), np.log(5.0e4), size=(n, 1)))
+    peak = path.max(axis=1, keepdims=True)
+    base = np.minimum(base, 9.0e5 / np.maximum(peak, 1e-9))
+    lam = base * path
+    small = lam < 5.0e3
+    counts = np.where(small, rng.poisson(np.where(small, lam, 0.0)), np.rint(lam))
+    return np.maximum(counts, 1.0).astype(np.float64)
+
+
+def _tidal_harmonic(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """A few incommensurate harmonics with fixed amplitudes — near deterministic.
+
+    The sum never repeats exactly, so it cannot be memorised as one period, but
+    it is fully determined. The correct predictive interval is very narrow, which
+    is precisely the case a globally-widened model gets wrong.
+    """
+    t = _time_index(L)
+    k = int(rng.integers(3, 6))
+    out = np.zeros((n, L), dtype=np.float64)
+    base = rng.uniform(10.0, 400.0, size=(n, 1))
+    for _ in range(k):
+        period = base * rng.uniform(0.31, 2.7, size=(n, 1))
+        out += (rng.uniform(0.2, 1.0, size=(n, 1))
+                * np.sin(2.0 * np.pi * t / period
+                         + rng.uniform(0, 2 * np.pi, size=(n, 1))))
+    sd = rng.uniform(0.005, 0.05, size=(n, 1))
+    scale = np.exp(rng.uniform(np.log(1.0), np.log(1000.0), size=(n, 1)))
+    out = out + rng.normal(0.0, 1.0, size=(n, L)) * sd
+    return out * scale + rng.uniform(-1.0, 1.0, size=(n, 1)) * scale
+
+
+def _flow_recession(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Persistent physical levels: hydrograph, stage, smooth nonnegative load.
+
+    The parent is sparse recharge plus geometric decay. That is one hydro
+    shape. Gauges, lakes, and 5-min zonal load are a different class: a
+    slow carrier against a hard daily clock, continuous, nonnegative, not
+    a rounded count. Mixture keeps the parent hydrograph so event-driven
+    recessions stay in the corpus.
+
+    About a third of the stage rows are river water-temperature records
+    (15/30-min loggers): measured on river gauge feeds, daily range 0.8-7
+    degrees with a day-to-day coefficient of variation of 0.2-0.45, daily
+    mean moving 0.2-0.55 degrees per day, warming over 0.3-0.45 of the day,
+    0.1 or 0.01 degree resolution holding 15-45% of readings.
+
+    Ported from v14/v18 for v19.4 (energy/load + hydro geomean drag).
+    """
+    t = _time_index(L)
+    kind = rng.random((n, 1))
+    is_hydro = kind < 0.28
+    is_stage = (kind >= 0.28) & (kind < 0.66)
+
+    rate = rng.uniform(1.0, 25.0, size=(n, 1)) / max(L, 1)
+    hits = (rng.random((n, L)) < rate).astype(np.float64)
+    mag = rng.gamma(2.0, 1.0, size=(n, L)) * rng.uniform(1.0, 12.0, size=(n, 1))
+    decay = rng.uniform(0.90, 0.998, size=(n, 1))
+    flow = _ar1_batch(hits * mag, decay)
+    baseflow = rng.uniform(0.03, 0.6, size=(n, 1))
+    scale_h = np.exp(rng.uniform(np.log(1.0), np.log(800.0), size=(n, 1)))
+    sd = rng.uniform(0.0, 0.02, size=(n, 1))
+    # Published discharge (USGS and most agencies) is rounded to three
+    # significant figures off a smooth rating curve, so a slow recession
+    # reads as long holds broken by single-digit steps.
+    sig3 = is_hydro & (rng.random((n, 1)) < 0.7)
+    sd = np.where(sig3, 0.05 * sd, sd)
+    y_h = np.maximum(
+        (flow + baseflow) * scale_h * (1.0 + rng.normal(0.0, 1.0, (n, L)) * sd),
+        0.0,
+    )
+    step3 = 10.0 ** (np.floor(np.log10(np.maximum(y_h, 1e-12))) - 2.0)
+    y_h = np.where(sig3, np.round(y_h / step3) * step3, y_h)
+
+    # stage / lake: slow level, optional M2, daily period in samples
+    day = rng.choice(np.array([96.0, 144.0, 288.0, 288.0]), size=(n, 1))
+    level = np.exp(rng.uniform(np.log(0.4), np.log(120.0), size=(n, 1)))
+    rho_s = rng.uniform(0.993, 0.9996, size=(n, 1))
+    ar_s = _ar1_batch(rng.normal(0.0, 1.0, size=(n, L)), rho_s)
+    ar_s = ar_s / np.maximum(np.std(ar_s, axis=1, keepdims=True), 1e-9)
+    namp = rng.uniform(0.008, 0.07, size=(n, 1)) * level
+    m2 = day * (12.420601 / 24.0)
+    tide = (
+        (rng.random((n, 1)) < 0.50)
+        * rng.uniform(0.02, 0.22, size=(n, 1))
+        * level
+        * np.sin(2.0 * np.pi * t / m2 + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1)))
+    )
+    y_s = np.maximum(level + namp * ar_s + tide, 0.0)
+    # Gauge heights are published at a fixed resolution (0.001 m, 1 cm,
+    # 0.01 ft), so a slowly moving level holds for several readings.
+    stq = is_stage & (rng.random((n, 1)) < 0.6)
+    tick_s = 10.0 ** np.round(np.log10(np.maximum(level, 1e-9)) - 3.0)
+    y_s = np.where(stq, np.round(y_s / tick_s) * tick_s, y_s)
+
+    # smooth nonnegative load: commute double-peak, high lag-1
+    day_l = rng.choice(np.array([96.0, 288.0, 288.0, 288.0, 48.0]), size=(n, 1))
+    phase = rng.uniform(0.0, 1.0, size=(n, 1))
+    frac = np.mod(t / day_l + phase, 1.0)
+    d_m = np.minimum(np.abs(frac - 0.33), 1.0 - np.abs(frac - 0.33))
+    d_e = np.minimum(np.abs(frac - 0.75), 1.0 - np.abs(frac - 0.75))
+    shape = 0.35 + 0.50 * np.exp(-0.5 * (d_m / 0.07) ** 2) + 0.65 * np.exp(
+        -0.5 * (d_e / 0.08) ** 2
+    )
+    shape = shape / np.maximum(shape.mean(axis=1, keepdims=True), 1e-9)
+    base_l = np.exp(rng.uniform(np.log(80.0), np.log(9000.0), size=(n, 1)))
+    rho_l = rng.uniform(0.96, 0.995, size=(n, 1))
+    ar_l = _ar1_batch(rng.normal(0.0, 1.0, size=(n, L)), rho_l)
+    ar_l = ar_l / np.maximum(np.std(ar_l, axis=1, keepdims=True), 1e-9)
+    y_l = np.maximum(
+        base_l * shape * np.exp(rng.uniform(0.02, 0.10, size=(n, 1)) * ar_l),
+        0.0,
+    )
+
+    # Water-temperature loggers share the gauge network: a slow daily-mean
+    # walk, a solar daily cycle that warms over roughly a third of the day and
+    # cools over the rest, a cycle range that changes with cloud from day to
+    # day, short weather departures, published at 0.1 or 0.01 degrees.
+    wtr = is_stage & (rng.random((n, 1)) < 0.35)
+    out = np.where(is_hydro, y_h, np.where(is_stage, y_s, y_l))
+    rows = np.flatnonzero(wtr[:, 0])
+    k = int(rows.size)
+    if k == 0:
+        return out
+    p_w = rng.choice(np.array([48.0, 96.0, 96.0]), size=(k, 1))
+    n_day = int(np.ceil(L / 48.0)) + 3
+    dayf = t / p_w + rng.uniform(0.0, 1.0, size=(k, 1))
+    day_i = np.floor(dayf).astype(np.int64)
+    day_f = dayf - day_i
+    phi_m = rng.uniform(0.2, 0.7, size=(k, 1))
+    step_m = rng.uniform(0.15, 0.55, size=(k, 1))
+    walk = _ar1_batch(rng.normal(0.0, 1.0, size=(k, n_day)) * step_m, phi_m)
+    trend = rng.uniform(-0.08, 0.08, size=(k, 1)) * np.arange(n_day)[None, :]
+    mean_d = rng.uniform(4.0, 26.0, size=(k, 1)) + np.cumsum(walk, axis=1) + trend
+    phi_a = rng.uniform(0.3, 0.7, size=(k, 1))
+    sd_a = rng.uniform(0.2, 0.45, size=(k, 1))
+    amp_d = np.exp(rng.uniform(np.log(0.2), np.log(3.5), size=(k, 1))) * np.exp(
+        _ar1_batch(rng.normal(0.0, 1.0, size=(k, n_day)) * sd_a
+                   * np.sqrt(1.0 - phi_a * phi_a), phi_a))
+    lo = np.take_along_axis(mean_d, day_i, axis=1)
+    hi = np.take_along_axis(mean_d, day_i + 1, axis=1)
+    level_w = lo + (hi - lo) * day_f
+    lo = np.take_along_axis(amp_d, day_i, axis=1)
+    hi = np.take_along_axis(amp_d, day_i + 1, axis=1)
+    amp_w = lo + (hi - lo) * day_f
+    rise = rng.uniform(0.28, 0.45, size=(k, 1))
+    u = np.mod(day_f + rng.uniform(0.0, 1.0, size=(k, 1)), 1.0)
+    cycle = np.where(u < rise, -np.cos(np.pi * u / rise),
+                     np.cos(np.pi * (u - rise) / (1.0 - rise)))
+    tau_w = rng.uniform(0.2, 1.2, size=(k, 1)) * p_w
+    wx = _ar1_batch(rng.normal(0.0, 1.0, size=(k, L)), np.exp(-1.0 / tau_w))
+    wx = wx / np.maximum(np.std(wx, axis=1, keepdims=True), 1e-9)
+    y_w = (level_w + amp_w * cycle
+           + rng.uniform(0.03, 0.3, size=(k, 1)) * wx
+           + rng.uniform(0.002, 0.02, size=(k, 1)) * rng.normal(0.0, 1.0, size=(k, L)))
+    res = rng.random((k, 1))
+    tick_w = np.where(res < 0.5, 0.1, 0.01)
+    out[rows] = np.where(res < 0.85, np.round(y_w / tick_w) * tick_w, y_w)
+    return out
+
+
+def _bounded_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Integer occupancy inside a hard capacity, near unit root, reflecting.
+
+    This is the shape of the pool's dominant profile — smooth, bounded, integer,
+    strongly persistent, aseasonal. The difference from the bounded_occupancy
+    attempt that failed is what the bounds do to the PREDICTION: reflection at 0
+    and at capacity truncates the predictive interval asymmetrically near the
+    edges, so the model has to learn a state-dependent spread rather than a
+    global one. Matching the marginal statistics was never the point.
+    """
+    cap = rng.integers(4, 80, size=(n, 1)).astype(np.float64)
+    step = (rng.normal(0.0, 1.0, size=(n, L))
+            * rng.uniform(0.01, 0.12, size=(n, 1)) * cap)
+    walk = np.cumsum(step, axis=1) + rng.uniform(0.0, 1.0, size=(n, 1)) * cap
+    span = 2.0 * cap
+    folded = cap - np.abs(np.mod(walk, span) - cap)
+    quiet = rng.random((n, 1)) < 0.35
+    folded = np.where(quiet, folded, folded + rng.normal(0.0, 0.35, size=(n, L)))
+    return np.clip(np.rint(folded), 0.0, cap)
