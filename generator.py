@@ -16048,3 +16048,253 @@ def _pt_twice_filtered_ar1_noise(rng, n: int, timescale: float) -> np.ndarray:
     y, _ = lfilter(b, a, z, zi=np.array([phi * rng.standard_normal()]))
     y, _ = lfilter(b, a, y, zi=np.array([phi * y[0] / max(b[0], 1e-12)]))
     return np.asarray(y, dtype=np.float64) * np.sqrt((1.0 - phi * phi) / (1.0 + phi * phi))
+
+def _pt_alternating_on_off_runs(rng, n: int, off_log_mean: float, off_log_sd: float, on_log_mean: float, on_log_sd: float, s0: int) -> tuple[np.ndarray, np.ndarray]:
+    e0 = max(1.0, float(np.exp(off_log_mean + 0.5 * off_log_sd * off_log_sd)))
+    e1 = max(1.0, float(np.exp(on_log_mean + 0.5 * on_log_sd * on_log_sd)))
+    k = int(min(max(n // 2 + 2, 4), max(4, 1.6 * n / (e0 + e1) + 6)))
+    a = np.maximum(1.0, np.round(np.exp(rng.normal(off_log_mean, off_log_sd, k)))).astype(np.int64)
+    b = np.maximum(1.0, np.round(np.exp(rng.normal(on_log_mean, on_log_sd, k)))).astype(np.int64)
+    np.minimum(a, n, out=a)
+    np.minimum(b, n, out=b)
+    L = np.empty(2 * k, dtype=np.int64)
+    if s0 == 0:
+        L[0::2], L[1::2] = (a, b)
+        st = np.tile(np.array([0, 1], dtype=np.int64), k)
+    else:
+        L[0::2], L[1::2] = (b, a)
+        st = np.tile(np.array([1, 0], dtype=np.int64), k)
+    c = np.cumsum(L)
+    if c[-1] < n:
+        L = np.append(L, np.int64(n - c[-1]))
+        st = np.append(st, np.int64(1 - st[-1]))
+        return (L, st)
+    j = int(np.searchsorted(c, n))
+    L = L[:j + 1].copy()
+    L[j] -= int(c[j] - n)
+    return (L, st[:j + 1])
+
+def _pt_split_time_of_day(rng, n: int, P: int) -> tuple[np.ndarray, np.ndarray, int]:
+    start_offset = int(rng.integers(0, P))
+    t = np.arange(n, dtype=np.int64) + start_offset
+    day = t // P
+    return ((t % P).astype(np.float64) / float(P), day, int(day[-1] - day[0] + 1))
+
+def _pt_daily_ar1_factor(rng, nd: int, phi: float, sd: float) -> np.ndarray:
+    if nd <= 1:
+        return rng.normal(0.0, sd, max(nd, 1))
+    return sd * _pt_ar1_noise_by_timescale(rng, nd, -1.0 / np.log(max(phi, 1e-06)))
+
+def _pt_erfinv_approx(y: float) -> float:
+    y = float(min(max(y, -0.999999), 0.999999))
+    a = 0.147
+    ln = np.log(1.0 - y * y)
+    t = 2.0 / (np.pi * a) + 0.5 * ln
+    return float(np.sign(y) * np.sqrt(max(np.sqrt(t * t - ln / a) - t, 0.0)))
+
+def _pt_maybe_quantize_to_grid(rng, x: np.ndarray, apply_prob: float, min_levels: float=60.0, max_levels: float=40000.0, decimal_prob: float=0.45, decimal_weights=(0.45, 0.33, 0.22)) -> np.ndarray:
+    if rng.random() >= apply_prob:
+        return x
+    peak_abs = float(np.max(np.abs(x))) if x.size else 0.0
+    if peak_abs <= 0.0:
+        return x
+    if rng.random() < decimal_prob:
+        n_decimals = int(_pt_pick_weighted_option(rng, (0, 1, 2), decimal_weights))
+        step = 10.0 ** (-n_decimals)
+        if peak_abs / step < min_levels:
+            step = peak_abs / min_levels
+    else:
+        step = peak_abs / _pt_power_log_uniform(rng, min_levels, max_levels)
+    if peak_abs / step > 120000.0:
+        step = peak_abs / 120000.0
+    return np.round(x / step) * step
+
+def _pt_solar_pv_series(rng, n):
+    P = int(_pt_pick_weighted_option(rng, (96, 288, 48, 144, 24), (0.63, 0.12, 0.13, 0.07, 0.05)))
+    tod, day, nd = _pt_split_time_of_day(rng, n, P)
+    d0 = day - day[0]
+    h0 = float(rng.uniform(0.235, 0.42))
+    daylen_amp = float(rng.uniform(0.0, 0.05))
+    daylen_period = float(rng.uniform(90.0, 900.0))
+    half_width_by_day = h0 + daylen_amp * np.sin(rng.uniform(0.0, 2.0 * np.pi) + 2.0 * np.pi * np.arange(nd) / daylen_period)
+    np.clip(half_width_by_day, 0.08, 0.49, out=half_width_by_day)
+    hw = half_width_by_day[d0]
+    if rng.random() < 0.72:
+        noon_phase = (tod[-1] + 0.5 + float(rng.uniform(-0.5, 0.5)) * (0.5 - h0)) % 1.0
+    else:
+        noon_phase = float(rng.uniform(0.0, 1.0))
+    dd = tod - noon_phase
+    dd -= np.round(dd)
+    u = dd / hw
+    shape = float(rng.uniform(0.85, 1.95))
+    clear_sky = np.where(np.abs(u) < 1.0, np.cos(0.5 * np.pi * np.clip(u, -1.0, 1.0)), 0.0)
+    clear_sky = clear_sky ** shape
+    daily_cloud = _pt_daily_ar1_factor(rng, nd, float(rng.uniform(0.15, 0.75)), 1.0)[d0]
+    slow_cloud = _pt_ar1_noise_by_timescale(rng, n, float(rng.uniform(0.18, 1.4)) * P)
+    fast_cloud = _pt_ar1_noise_by_timescale(rng, n, float(rng.uniform(0.02, 0.1)) * P)
+    daily_cloud_weight = float(rng.uniform(0.7, 1.55))
+    slow_cloud_weight = float(rng.uniform(0.35, 1.05))
+    fast_cloud_weight = float(rng.uniform(0.01, 0.16))
+    m = float(rng.uniform(0.55, 1.65)) + daily_cloud_weight * daily_cloud + slow_cloud_weight * slow_cloud + fast_cloud_weight * fast_cloud
+    clearness = 1.0 / (1.0 + np.exp(-m))
+    capacity = _pt_power_log_uniform(rng, 5.0, 60000.0)
+    x = capacity * clear_sky * clearness
+    if rng.random() < 0.28:
+        np.minimum(x, capacity * float(rng.uniform(0.45, 0.92)), out=x)
+    if rng.random() < 0.15:
+        x = x + capacity * float(rng.uniform(0.0002, 0.02)) * (1.0 + 0.3 * fast_cloud)
+    x = _pt_maybe_quantize_to_grid(rng, x, 0.6, 40.0, 60000.0, 0.62, (0.55, 0.27, 0.18))
+    np.maximum(x, 0.0, out=x)
+    return x
+
+def _pt_power_unit_load_carbon_intensity(rng, n):
+    mode = _pt_pick_weighted_option(rng, ('unit', 'load', 'intensity'), (0.58, 0.24, 0.18))
+    if _pt_FORCED_SUBMODE is not None:
+        mode = _pt_FORCED_SUBMODE
+    P = _pt_sample_daily_period(rng)
+    if mode == 'unit':
+        off_log_mean = float(rng.uniform(np.log(1.5), np.log(150.0)))
+        off_log_sd = float(rng.uniform(0.7, 1.8))
+        on_log_mean = float(rng.uniform(np.log(4.0), np.log(220.0)))
+        on_log_sd = float(rng.uniform(0.8, 2.1))
+        run_lengths, st = _pt_alternating_on_off_runs(rng, n, off_log_mean, off_log_sd, on_log_mean, on_log_sd, int(rng.integers(0, 2)))
+        if rng.random() < 0.1:
+            st = np.ones_like(st)
+        nr = run_lengths.size
+        capacity = _pt_power_log_uniform(rng, 0.5, 900.0)
+        n_levels = int(_pt_pick_weighted_option(rng, (1, 2, 3, 5, 9), (0.22, 0.24, 0.24, 0.2, 0.1)))
+        min_load_frac = float(rng.uniform(0.05, 0.6))
+        level_skew = float(rng.uniform(1.0, 3.0))
+        output_levels = capacity * (min_load_frac + (1.0 - min_load_frac) * np.sort(rng.uniform(0.0, 1.0, n_levels) ** level_skew))
+        run_output = np.where(st == 1, output_levels[rng.integers(0, n_levels, nr)], 0.0)
+        s = np.repeat(run_output, run_lengths)
+        on = np.repeat(st, run_lengths).astype(np.float64)
+        ripple_amp = 0.0 if rng.random() < 0.18 else float(rng.uniform(0.0, 0.14))
+        if ripple_amp > 0.004:
+            s = s * (1.0 + ripple_amp * _pt_ar1_noise_by_timescale(rng, n, float(rng.uniform(2.0, 0.6 * P))))
+        diurnal_amp = float(rng.uniform(0.0, 0.55))
+        if diurnal_amp > 0.01:
+            time_of_day, _, _ = _pt_split_time_of_day(rng, n, P)
+            s = s * (1.0 + diurnal_amp * np.cos(2.0 * np.pi * (time_of_day - rng.uniform(0.0, 1.0))))
+        a = float(rng.uniform(0.18, 1.0))
+        if a < 0.995:
+            s = lfilter(np.array([a]), np.array([1.0, -(1.0 - a)]), s)
+            if rng.random() < 0.55:
+                s = lfilter(np.array([a]), np.array([1.0, -(1.0 - a)]), s[::-1])[::-1]
+        x = s * on
+        if rng.random() < 0.08:
+            standby_draw = capacity * float(rng.uniform(0.002, 0.04))
+            x = x - standby_draw * (1.0 - on) * (rng.random(n) < rng.uniform(0.1, 0.9))
+        x = _pt_maybe_quantize_to_grid(rng, x, 0.9, 8.0, 2000.0, 0.78, (0.68, 0.22, 0.1))
+        return np.asarray(x, dtype=np.float64)
+    if mode == 'load':
+        tod, day, nd = _pt_split_time_of_day(rng, n, P)
+        d0 = day - day[0]
+        base_load = _pt_power_log_uniform(rng, 60.0, 30000.0)
+        a1 = float(rng.uniform(0.04, 0.3))
+        a2 = float(rng.uniform(0.0, 0.18))
+        peak_phase = float(rng.uniform(0.0, 1.0))
+        diurnal_log = a1 * np.cos(2.0 * np.pi * (tod - peak_phase)) + a2 * np.cos(4.0 * np.pi * (tod - peak_phase - rng.uniform(0.0, 0.3)))
+        daily_log_effect = _pt_daily_ar1_factor(rng, nd, float(rng.uniform(0.3, 0.9)), float(rng.uniform(0.05, 0.4)))[d0]
+        slow_log_noise = float(rng.uniform(0.02, 0.18)) * _pt_ar1_noise_by_timescale(rng, n, float(rng.uniform(1.5, 12.0)) * P)
+        fast_log_noise = float(rng.uniform(0.004, 0.035)) * _pt_ar1_noise_by_timescale(rng, n, float(rng.uniform(1.5, 12.0)))
+        x = base_load * np.exp(diurnal_log + daily_log_effect + slow_log_noise + fast_log_noise)
+        if rng.random() < 0.3:
+            k = int(rng.integers(1, 4))
+            for _ in range(k):
+                dip_start = int(rng.integers(0, max(1, n - 8)))
+                ln = int(min(n - dip_start, max(4, rng.integers(4, max(6, 3 * P)))))
+                x[dip_start:dip_start + ln] *= float(rng.uniform(0.35, 0.85))
+        if rng.random() < 0.5:
+            x = x - float(np.median(x)) * float(rng.uniform(0.6, 1.5))
+        else:
+            np.maximum(x, 0.0, out=x)
+        return _pt_maybe_quantize_to_grid(rng, x, 0.8, 40.0, 10000.0, 0.75, (0.7, 0.2, 0.1))
+    tod, day, nd = _pt_split_time_of_day(rng, n, P)
+    d0 = day - day[0]
+    hw = float(rng.uniform(0.2, 0.33))
+    dd = tod - rng.uniform(0.0, 1.0)
+    dd -= np.round(dd)
+    u = dd / hw
+    daylight_shape = np.where(np.abs(u) < 1.0, np.cos(0.5 * np.pi * np.clip(u, -1.0, 1.0)), 0.0) ** 1.4
+    cl = 1.0 / (1.0 + np.exp(-(0.8 + _pt_daily_ar1_factor(rng, nd, 0.5, 1.1)[d0] + 0.8 * _pt_ar1_noise_by_timescale(rng, n, 0.5 * P))))
+    solar = float(rng.uniform(0.0, 1.5)) * daylight_shape * cl
+    wind = float(rng.uniform(0.1, 2.2)) * np.exp(0.9 * _pt_ar1_noise_by_timescale(rng, n, float(rng.uniform(2.0, 20.0)) * P))
+    demand_profile = 1.0 + float(rng.uniform(0.05, 0.3)) * np.cos(2.0 * np.pi * (tod - rng.uniform(0.0, 1.0)))
+    thermal = np.maximum(demand_profile - solar - wind, float(rng.uniform(0.02, 0.45)) * demand_profile)
+    ef = float(rng.uniform(280.0, 950.0))
+    import_share = float(rng.uniform(0.0, 0.22))
+    x = ef * (thermal + import_share * demand_profile) / (thermal + solar + wind + import_share * demand_profile)
+    x = x * float(rng.uniform(0.6, 1.25))
+    if rng.random() < 0.35:
+        x = x + float(rng.uniform(0.0, 0.08)) * ef * _pt_ar1_noise_by_timescale(rng, n, 3.0 * P)
+    np.maximum(x, 0.5, out=x)
+    x = _pt_maybe_quantize_to_grid(rng, x, 0.85, 150.0, 20000.0, 0.7, (0.72, 0.2, 0.08))
+    if rng.random() < 0.78 and n > 32:
+        fz = int(min(n - 8, 100, max(4, rng.uniform(0.2, 1.1) * P)))
+        x[n - fz:] = x[n - fz]
+    return x
+
+def _pt_interconnector_net_flow(rng, n):
+    P = _pt_sample_daily_period(rng)
+    flow_scale = _pt_power_log_uniform(rng, 25.0, 3500.0)
+    scheduled = rng.random() < 0.18
+    if _pt_FORCED_SUBMODE is not None:
+        scheduled = _pt_FORCED_SUBMODE == 'scheduled'
+    if scheduled:
+        hr = max(1, P // 24)
+        block_len = int(hr * _pt_pick_weighted_option(rng, (1, 2, 3, 4, 6, 12), (0.3, 0.22, 0.1, 0.18, 0.12, 0.08)))
+        block_len = max(1, min(block_len, max(1, n // 3)))
+        nb = int(np.ceil(n / block_len))
+        k = int(rng.integers(3, 13))
+        level_fracs = np.round(rng.uniform(-1.0, 1.0, k) * 4.0) / 4.0
+        level_fracs[0] = 0.0
+        level_fracs[1] = 1.0 if rng.random() < 0.5 else -1.0
+        levels = np.unique(level_fracs) * flow_scale
+        nl = levels.size
+        hold_prev = rng.random(nb) < float(rng.uniform(0.55, 0.95))
+        level_idx = rng.integers(0, nl, nb)
+        source_block = np.where(hold_prev, 0, np.arange(nb))
+        source_block = np.maximum.accumulate(source_block)
+        block_values = levels[level_idx[source_block]]
+        x = np.repeat(block_values, block_len)[:n]
+        if rng.random() < 0.45:
+            a = float(rng.uniform(0.25, 0.85))
+            x = lfilter(np.array([a]), np.array([1.0, -(1.0 - a)]), x)
+        x = _pt_maybe_quantize_to_grid(rng, np.asarray(x, dtype=np.float64), 0.55, 20.0, 2000.0)
+        return x
+    tod, day, nd = _pt_split_time_of_day(rng, n, P)
+    t1 = float(rng.uniform(0.28, 0.95)) * P
+    t2 = float(rng.uniform(6.0, 60.0)) * P
+    w2 = float(rng.uniform(0.0, 0.5))
+    z = _pt_twice_filtered_ar1_noise(rng, n, t1) + w2 * _pt_ar1_noise_by_timescale(rng, n, t2)
+    z = z + float(rng.uniform(0.0, 0.2)) * np.cos(2.0 * np.pi * (tod - rng.uniform(0.0, 1.0)))
+    z = z + float(rng.uniform(0.02, 0.09)) * rng.standard_normal(n)
+    if rng.random() < 0.4:
+        z = z + float(rng.uniform(-0.4, 0.4)) * (z * z - 1.0)
+    sd = float(np.std(z)) + 1e-12
+    z = z / sd
+    mu = flow_scale * float(rng.uniform(-0.9, 0.9))
+    flow_spread = flow_scale * float(rng.uniform(0.12, 0.6))
+    x = mu + flow_spread * z
+    nn = x.size
+    upper_clip_frac = float(rng.uniform(0.001, 0.05)) if rng.random() < 0.72 else float(rng.uniform(0.05, 0.4))
+    lower_clip_frac = float(rng.uniform(0.001, 0.05)) if rng.random() < 0.72 else float(rng.uniform(0.05, 0.4))
+    if rng.random() < 0.34 and nn > 8:
+        k = int(min(nn - 2, max(1, upper_clip_frac * nn)))
+        np.minimum(x, float(np.partition(x, nn - 1 - k)[nn - 1 - k]), out=x)
+    if rng.random() < 0.34 and nn > 8:
+        k = int(min(nn - 2, max(1, lower_clip_frac * nn)))
+        np.maximum(x, float(np.partition(x, k)[k]), out=x)
+    if rng.random() < 0.1:
+        if float(np.median(x)) >= 0.0:
+            np.maximum(x, 0.0, out=x)
+        else:
+            np.minimum(x, 0.0, out=x)
+    if rng.random() < 0.06:
+        outage_log_mean = float(np.log(rng.uniform(2.0, 20.0)))
+        service_log_mean = float(np.log(rng.uniform(120.0, 1600.0)))
+        run_lengths, st = _pt_alternating_on_off_runs(rng, n, outage_log_mean, 1.3, service_log_mean, 1.3, 1)
+        x = x * np.repeat(st, run_lengths).astype(np.float64)
+    return _pt_maybe_quantize_to_grid(rng, np.asarray(x, dtype=np.float64), 0.55, 150.0, 80000.0, 0.65)
+_pt_LADDER_CANDIDATE_VALUES = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 19.0, 20.0, 22.0, 23.0, 24.0, 25.0, 26.0, 29.0, 30.0, 32.0, 36.0, 40.0, 43.0, 45.0, 46.0, 50.0, 56.0, 57.0, 60.0, 64.0, 75.0, 80.0, 90.0, 98.0, 100.0, 110.0, 114.0, 125.0, 145.0, 150.0, 175.0, 200.0, 250.0, 300.0, 400.0, 500.0])
