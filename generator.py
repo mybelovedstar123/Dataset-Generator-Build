@@ -2797,3 +2797,82 @@ def b4_build(P, rng, L, cad, cal, cfg):
 
     fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.9)
     return y, fl
+
+
+# ═══════════════════════ B5 ops_deploy_transient ═══════════════════════════
+
+def b5_params(rng, B, cfg):
+    p = cfg["families"]["ops_deploy_transient"]
+    return {
+        "phi": rng.uniform(0.6, 0.995, B),
+        "n_ev": rng.integers(2, 8, B),
+        "shift_sig": rng.uniform(0.5, 3.0, B),
+        "trans_amp": rng.uniform(1.5, 4.0, B),
+        "trans_tau": logu(rng, 8.0, 300.0, B),
+        "osc": rng.random(B) < 0.45,
+        "zeta": rng.uniform(0.1, 0.6, B),
+        "osc_period": logu(rng, 10.0, 200.0, B),
+        "var_switch": rng.random(B) < 0.35,
+        "n_out": rng.integers(1, 5, B),
+        "out_len": logu(rng, 4.0, 300.0, B),
+        "out_mode": categorical(rng, p["outage_mix"], B),
+    }
+
+
+def b5_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    base = ar1(rng, n, L, P["phi"])
+
+    E = 8
+    pos = rng.integers(int(0.02 * L), L, size=(n, E)).astype(np.float64)
+    live = np.arange(E)[None, :] < P["n_ev"].reshape(n, 1)
+    delta = rng.standard_normal((n, E)) * P["shift_sig"].reshape(n, 1)
+    lvl = np.zeros((n, L))
+    trans = np.zeros((n, L))
+    for j in range(E):
+        idx = np.nonzero(live[:, j])[0]
+        if idx.size == 0:
+            continue
+        p0 = pos[idx, j:j + 1]
+        after = (t >= p0)
+        d = delta[idx, j:j + 1]
+        lvl[idx] += np.where(after, d, 0.0)
+        dt = np.maximum(t - p0, 0.0)
+        amp = P["trans_amp"][idx].reshape(-1, 1) * np.abs(d)
+        expo = amp * np.exp(-dt / P["trans_tau"][idx].reshape(-1, 1))
+        w = _cf_prims_TWO_PI / np.maximum(P["osc_period"][idx].reshape(-1, 1), 2.0)
+        zt = P["zeta"][idx].reshape(-1, 1)
+        dosc = amp * np.exp(-np.minimum(zt * w * dt, 60.0)) * np.cos(w * dt)
+        pick = np.where(P["osc"][idx].reshape(-1, 1), dosc, expo)
+        trans[idx] += np.where(after, pick * np.sign(d), 0.0)
+
+    var_mult = np.ones((n, L))
+    if P["var_switch"].any():
+        mid = pos[:, :1]
+        var_mult = np.where(P["var_switch"].reshape(n, 1) & (t >= mid),
+                            np.exp(rng.normal(0.0, 0.8, size=(n, 1))), 1.0)
+
+    y = base * var_mult + lvl + trans
+
+    # outages: hold-last / exact zero / linear backfill
+    starts = rng.integers(0, L, size=(n, 4))
+    lens = P["out_len"].reshape(n, 1) * np.exp(rng.normal(0.0, 0.5, size=(n, 4)))
+    live_o = np.arange(4)[None, :] < P["n_out"].reshape(n, 1)
+    mask = run_mask(n, L, starts, np.where(live_o, lens, 0.0))
+    held = locf(y, mask)
+    idx = np.where(mask, -1, np.arange(L)[None, :])
+    prev = np.maximum(np.maximum.accumulate(idx, axis=1), 0)
+    nxt = np.where(mask, L, np.arange(L)[None, :])
+    nxt = np.minimum.accumulate(nxt[:, ::-1], axis=1)[:, ::-1]
+    nxt = np.minimum(nxt, L - 1)
+    va = np.take_along_axis(y, prev, axis=1)
+    vb = np.take_along_axis(y, nxt, axis=1)
+    span = np.maximum(nxt - prev, 1)
+    w = (np.arange(L)[None, :] - prev) / span
+    lin = va + (vb - va) * w
+    om = P["out_mode"].reshape(n, 1)
+    y = np.where(mask, np.where(om == 0, held, np.where(om == 1, 0.0, lin)), y)
+
+    fl = new_flags(n, scale_mode=0, quant_boost=1.0)
+    return y, fl
