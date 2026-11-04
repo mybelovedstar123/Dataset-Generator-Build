@@ -2076,3 +2076,70 @@ def apply_aggregation(rng, y, flags, cad, cfg):
     blended = host.mean(axis=1, keepdims=True) + safe_std(host) * agg
     y[rows] = np.where(ok, blended, host)
     return y
+
+
+# ═══════════════════════════════ sanitiser ═════════════════════════════════
+
+def sanitise(rng, y, flags, starts, cfg):
+    """Finiteness, degeneracy, cold-start and magnitude guards, in that order.
+
+    ``starts`` gives each row's emit offset, so the constant-prefix guard is
+    applied to the window the trainer will actually see: the causal scaler begins
+    at the first emitted sample, and a constant lead-in drives its standard
+    deviation to the 1e-5 floor and clamps the standardised input at +-64.
+    """
+    n, L = y.shape
+    bad = _rows(~np.isfinite(y.sum(axis=1)))
+    if bad.size:
+        y[bad] = np.nan_to_num(y[bad], nan=0.0, posinf=MAX_PEAK, neginf=-MAX_PEAK)
+
+    # degeneracy: regenerate from a cheap fallback rather than emit a flat row
+    span = y.max(axis=1) - y.min(axis=1)
+    ref = np.maximum(np.abs(y).mean(axis=1), 1e-300)
+    dead = _rows((span <= 1e-12 * ref) | (span == 0.0))
+    if dead.size:
+        c = dead.size
+        t = np.arange(L, dtype=np.float64)[None, :]
+        phi = rng.uniform(0.5, 0.99, size=(c, 1))
+        w = np.cumsum(rng.standard_normal((c, L)) * np.sqrt(1.0 - phi ** 2),
+                      axis=1) * 0.05
+        seas = np.sin(2.0 * np.pi * t / rng.uniform(12.0, 400.0, size=(c, 1)))
+        lvl = y[dead].mean(axis=1, keepdims=True)
+        base = np.where(np.abs(lvl) > 1e-300, lvl, 1.0)
+        y[dead] = base * (1.0 + 0.05 * (w + seas))
+
+    _break_constant_prefix(rng, y, flags, starts)
+
+    peak = np.abs(y).max(axis=1, keepdims=True)
+    hot = _rows(peak[:, 0] > MAX_PEAK)
+    if hot.size:
+        # rescale rather than clip: clipping flat-tops exactly the extreme
+        # events we paid to generate
+        y[hot] = y[hot] * (MAX_PEAK / peak[hot])
+    return y
+
+
+def _break_constant_prefix(rng, y, flags, starts, window=128):
+    """No emitted window may open with ``window`` exactly constant samples.
+
+    Constant series are structurally forbidden here.  They waste token budget and
+    they are a degenerate input to the causal arcsinh scaler, so a cold start is
+    always a real onset carrying at least tick-level jitter.
+    """
+    n, L = y.shape
+    idx = np.minimum(starts[:, None] + np.arange(window)[None, :], L - 1)
+    head = np.take_along_axis(y, idx, axis=1)
+    rows = _rows(np.all(np.diff(head, axis=1) == 0.0, axis=1))
+    if rows.size == 0:
+        return
+    m = rows.size
+    std = y[rows].std(axis=1)
+    lvl = np.maximum(np.abs(y[rows]).mean(axis=1), 1e-12)
+    unit = np.where(flags["integer"][rows], 1.0,
+                    np.maximum(std, lvl * 1e-4) * rng.uniform(0.05, 0.4, m))
+    unit = np.where(unit > 0.0, unit, 1e-9)
+    sgn = np.where(flags["positive"][rows], 1.0,
+                   np.where(rng.random(m) < 0.5, 1.0, -1.0))
+    for _ in range(3):
+        pos = np.minimum(starts[rows] + rng.integers(4, window - 4, m), L - 1)
+        y[rows, pos] = y[rows, pos] + unit * sgn
