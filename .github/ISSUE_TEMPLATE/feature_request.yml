@@ -1,0 +1,24 @@
+name: Feature request
+description: Propose a new series family, observation stage or config option
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Motivation
+      description: What kind of series or behaviour is missing, and why does it matter for training?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How it could work - the process, its parameters, and the config keys it would need.
+    validations:
+      required: true
+  - type: checkboxes
+    id: reproducibility
+    attributes:
+      label: Reproducibility
+      options:
+        - label: The change can be added without altering the rows that existing seeds already produce (for example behind a new layer or config key).
