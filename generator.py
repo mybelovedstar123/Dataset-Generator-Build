@@ -7303,3 +7303,60 @@ def _validate_parameters(parameters: dict[str, float], label: str) -> None:
     ):
         if parameters[lo_name] > parameters[hi_name]:
             raise ValueError(f"{label}.{lo_name} must be <= {hi_name}")
+
+
+# ==============================================================================
+# Domain-tail families (ED5 + pool4)
+# ==============================================================================
+
+def _transport_flow_tail(rng: np.random.Generator, n: int, length: int) -> np.ndarray:
+    """Nonnegative network flow with commuting peaks, weekly state and outages."""
+    out = np.empty((n, length), dtype=np.float64)
+    t = np.arange(length, dtype=np.float64)
+    for row in range(n):
+        period = int(rng.choice([24, 48, 96, 144, 288]))
+        phase = (t + rng.uniform(0, period)) % period / period
+        morning = np.exp(-0.5 * ((phase - rng.uniform(.27, .36)) / rng.uniform(.045, .10)) ** 2)
+        evening = np.exp(-0.5 * ((phase - rng.uniform(.64, .76)) / rng.uniform(.05, .12)) ** 2)
+        daily = rng.uniform(.35, 1.1) * morning + rng.uniform(.35, 1.2) * evening
+        weekly = 1.0 + rng.uniform(.05, .35) * np.sin(2 * np.pi * t / (7 * period) + rng.uniform(0, 2*np.pi))
+        level = rng.uniform(5.0, 2500.0)
+        drift = np.exp(rng.uniform(-2e-4, 2e-4) * t)
+        rate = level * np.maximum(.03, (.12 + daily) * weekly * drift)
+        noise = _tail_smooth(rng.normal(0, rng.uniform(.01, .08), length), max(3, period // 12))
+        rate *= np.exp(noise)
+        for _ in range(int(rng.poisson(2.0))):
+            start = int(rng.integers(0, length))
+            run = int(rng.integers(max(2, period // 16), max(3, period // 2)))
+            rate[start:start + run] *= rng.uniform(.02, .55)
+        out[row] = rng.poisson(np.maximum(rate, 0.0)).astype(np.float64)
+    return out
+
+
+def _capacity_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Occupancy of a fixed-capacity resource: bounded, integer, daily cycle.
+
+    The archetype is a bike dock, a car park, a ward, a pool of server slots —
+    a count that cannot go below 0 or above a capacity C, both reached often.
+    The generative order matters: the daily cycle and a persistent AR(1)
+    disturbance are formed in the UNIT interval, then clipped, and only then
+    scaled by C and rounded. Clipping before scaling is what puts probability
+    mass exactly ON the two boundaries instead of near them, which is the
+    property a forecaster has to learn; clipping after would merely truncate a
+    continuous variable.
+
+    phi in [0.85, 0.97] keeps the disturbance persistent enough that the level
+    is informative several steps ahead — a white-noise disturbance would leave
+    the daily mean as the only predictable component.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    t = _time_index(L)
+    capacity = rng.integers(8, 45, size=(n, 1)).astype(np.float64)
+    phase = rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
+    amp = rng.uniform(0.2, 0.45, size=(n, 1))
+    mid = rng.uniform(0.35, 0.65, size=(n, 1))
+    cycle = mid + amp * np.sin(2.0 * np.pi * t / 24.0 + phase)
+    walk = _ar1_batch(rng.normal(0.0, 0.08, size=(n, L)),
+                      rng.uniform(0.85, 0.97, size=(n, 1)))
+    return np.round(np.clip(cycle + walk, 0.0, 1.0) * capacity)
