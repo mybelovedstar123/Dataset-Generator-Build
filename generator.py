@@ -8095,3 +8095,37 @@ def _cluster_job_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             series[z0:min(L, z0 + zl)] = level * float(rng.uniform(0.05, 0.4))
         out[i] = np.round(np.maximum(series, 0.0))
     return out
+
+
+# Unique idea: afternoon hockey-stick load on energy families.
+# Eval energy is temperature-driven load with a 96-step daily; the host prior
+# barely teaches that shape. A small MAD-scaled daily carrier is added only
+# to energy-tagged families so every other family stays paired with the host.
+_IDEA_NAME = "hockey_load_96"
+_IDEA_STAGE = 7701
+_IDEA_FAMS = frozenset({
+    "energy_load_price_solar", "grid_flow", "envelope_mod",
+    "spiky_price", "dispatch_price", "broadband_path_attr",
+    "storm_outage_counts",
+})
+
+
+def _apply_unique_idea(
+    family: str,
+    block: np.ndarray,
+    base_seed: int,
+    chunk_index: int,
+    fam: int,
+) -> np.ndarray:
+    if family not in _IDEA_FAMS or block.size == 0:
+        return block
+    n, L = block.shape
+    rng = np.random.default_rng(
+        np.random.SeedSequence((int(base_seed), int(chunk_index), int(fam), _IDEA_STAGE))
+    )
+    hour = np.mod(np.arange(L, dtype=np.float64), 96.0) / 96.0
+    # Peak near hour 16 (fraction 0.67 of a 96-step day).
+    shape = 1.15 - 0.50 * np.cos(2.0 * np.pi * (hour - 0.67))
+    depth = rng.uniform(0.05, 0.12, size=(n, 1))
+    scale = np.median(np.abs(block), axis=1, keepdims=True) + 1e-9
+    return np.ascontiguousarray(block + depth * scale * (shape - 1.0), dtype=np.float64)
