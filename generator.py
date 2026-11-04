@@ -4094,3 +4094,101 @@ def e5_build(P, rng, L, cad, cal, cfg):
     y = unit_std(y) + rng.standard_normal((n, L)) * P["noise"].reshape(n, 1)
     fl = new_flags(n, scale_mode=0, quant_boost=0.9)
     return y, fl
+
+
+# ═══════════════════════ E6 changepoint_composite ══════════════════════════
+
+MAX_SEG = 5
+
+
+def e6_params(rng, B, cfg):
+    p = cfg["families"]["changepoint_composite"]
+    return {
+        "n_seg": rng.integers(2, MAX_SEG + 1, B),
+        "kinds": rng.integers(0, N_ACTIVE_KINDS + 2, (B, MAX_SEG)),
+        "amps": logu(rng, 0.2, 8.0, (B, MAX_SEG)),
+        "levels": rng.normal(0.0, 1.0, (B, MAX_SEG)),
+        "join": categorical(rng, p["join_mix"], B),
+        "fade_frac": rng.uniform(0.05, 0.10, B),
+        "hazard_state": rng.uniform(p["state_hazard"][0], p["state_hazard"][1], B),
+        "trend_slope": rng.normal(0.0, 2.0, (B, MAX_SEG)),
+        "ladder_step": logu(rng, 0.2, 4.0, (B, MAX_SEG)),
+        "ladder_run": logu(rng, 20.0, 600.0, (B, MAX_SEG)),
+    }
+
+
+def e6_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+
+    # Build MAX_SEG candidate processes per row, each with its own family.
+    kinds = P["kinds"].reshape(-1)
+    cad_rep = cad.take(np.repeat(np.arange(n), MAX_SEG))
+    base_kind = np.minimum(kinds, N_ACTIVE_KINDS - 1)
+    cands = active_base(rng, n * MAX_SEG, L, base_kind, cad_rep, cfg)
+
+    # two extra menu entries beyond the shared active-base menu
+    tr = kinds == N_ACTIVE_KINDS
+    if tr.any():
+        slope = P["trend_slope"].reshape(-1)[tr].reshape(-1, 1)
+        cands[tr] = unit_std(slope * (t / L) + 0.15 * np.cumsum(
+            rng.standard_normal((int(tr.sum()), L)), axis=1) / np.sqrt(L))
+    ld = kinds == N_ACTIVE_KINDS + 1
+    if ld.any():
+        c = int(ld.sum())
+        run = P["ladder_run"].reshape(-1)[ld].reshape(c, 1)
+        dwell = np.maximum(np.exp(rng.normal(np.log(run), 0.7, size=(c, 48))), 2.0)
+        seg, _ = segment_map(dwell, L)
+        lv = np.cumsum(rng.standard_normal((c, 48)), axis=1)
+        cands[ld] = unit_std(gather_levels(lv, seg))
+
+    cands = cands.reshape(n, MAX_SEG, L) * P["amps"].reshape(n, MAX_SEG, 1)
+    cands = cands + P["levels"].reshape(n, MAX_SEG, 1)
+
+    # Break hazard: uniform in time, elevated after a high-volatility stretch.
+    # The model therefore learns break hazard conditioned on observable
+    # precursors rather than on a fixed relative position.
+    v = np.abs(np.diff(cands[:, 0, :], axis=1, prepend=cands[:, 0, :1]))
+    v = decay_convolve(v, np.full(n, 64.0))
+    v = (v - v.mean(axis=1, keepdims=True)) / np.maximum(v.std(axis=1, keepdims=True), 1e-9)
+    logw = P["hazard_state"].reshape(n, 1) * np.clip(v, -3.0, 3.0)
+    guard = np.zeros((n, L))
+    guard[:, :L // 16] = -30.0
+    guard[:, -L // 16:] = -30.0
+    gum = -np.log(-np.log(np.maximum(rng.random((n, L)), 1e-12)))
+    key = logw + gum + guard
+    cut = np.sort(np.argsort(-key, axis=1)[:, :MAX_SEG - 1], axis=1)
+
+    live = np.arange(MAX_SEG - 1)[None, :] < (P["n_seg"] - 1).reshape(n, 1)
+    cut = np.where(live, cut, L + 1)
+    seg_id = np.zeros((n, L), dtype=np.int64)
+    for j in range(MAX_SEG - 1):
+        seg_id += (t >= cut[:, j:j + 1]).astype(np.int64)
+
+    y = np.take_along_axis(cands, seg_id[:, None, :], axis=1)[:, 0, :]
+
+    join = P["join"].reshape(n, 1)
+    if (P["join"] > 0).any():
+        fade = np.maximum(P["fade_frac"].reshape(n, 1) * L, 2.0)
+        blend = y.copy()
+        for j in range(MAX_SEG - 1):
+            cj = cut[:, j:j + 1].astype(np.float64)
+            w = np.clip((t - cj) / fade + 0.5, 0.0, 1.0)
+            inside = (np.abs(t - cj) < fade) & live[:, j:j + 1]
+            lhs = cands[:, j, :]
+            rhs = cands[:, min(j + 1, MAX_SEG - 1), :]
+            blend = np.where(inside, lhs * (1.0 - w) + rhs * w, blend)
+        y = np.where(join == 1, blend, y)
+
+    if (P["join"] == 2).any():
+        # level-matched continuous joins: remove the jump at each break
+        step = np.zeros((n, L))
+        for j in range(MAX_SEG - 1):
+            cj = np.clip(cut[:, j:j + 1], 0, L - 1)
+            before = np.take_along_axis(y, np.maximum(cj - 1, 0), axis=1)
+            after = np.take_along_axis(y, cj, axis=1)
+            step += np.where((t >= cj) & live[:, j:j + 1], before - after, 0.0)
+        y = np.where(join == 2, y + step, y)
+
+    fl = new_flags(n, scale_mode=0, quant_boost=0.9)
+    return y, fl
