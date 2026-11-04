@@ -13367,3 +13367,248 @@ def _isp_rows(rng: np.random.Generator, P: np.ndarray, kind: np.ndarray, L: int,
     cut = np.where(pre, (rng.uniform(0.25, 0.85, size=(n, 1)) * L).astype(np.int64), 0)
     first = np.take_along_axis(y, cut, axis=1)
     return np.where(idx < cut, first, y)
+
+def _intraday_event_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Intraday event-count feeds that the validator left-pads: 911 / fire /
+    police dispatch and CAD volumes, crime-incident and 311 request feeds,
+    jail bookings, crisis calls, DOI / package / CVE / malware-sample
+    registration streams, TfL arrival predictions.
+
+    Fitted on the 99 series / 288 eval windows of the pool class
+    intraday_event_counts_lowcorr (freq H 48%, min 24%, 30min 14%, 5min 12%,
+    15min 2%, 10min 1%).  Window contexts are SHORT: n_hist p10/50/90 =
+    147/748/2492, so the model sees a first-value constant prefix on ~90% of
+    them (toto2_trainer pads with h[0]).  Context stats (features.py on the
+    real part, p10/50/90): level 1/7/690, integer 1/1/1, zeros 0/0/0, lag1
+    0.008/0.26/0.60, flat_run 0.004/0.11/0.58, spec_p24 0.013/0.08/0.45,
+    spec_p48 0.02/0.12/0.47, spec_p168 0.02/0.06/0.17, dlog_sd
+    0.30/0.56/1.56, max/med 1.75/5/45, n_shifts 0/0/0, no trend; target
+    mean vs the last-h context mean log-ratio p10/50/90 -0.21/0.00/+0.24 at
+    every horizon and a stationary marginal beats last-value and
+    seasonal-naive (the daily cycle is weak).  Three sub-populations:
+
+    dispatch counts (70% of rows; 170 windows): mean p10/50/90 1.4/4.5/32,
+    Fano 0.5/2.8/10, daily (max-min)/mean 0.30/0.68/1.85, day-of-week
+    amplitude 0.1/0.18/0.57, residual lag1 0.04/0.32/0.60 (short memory:
+    little power in the 1-7 day band), daily-mean AC1 -0.1/0.2/0.8, 720-step
+    level drift log-ratio p10/p90 -0.21/+0.10, min value 1 with P(1) far
+    above a Poisson's (the feed drops empty bins => y = max(1, count)).
+    Law: rate = m x daily x weekly x exp(slow + drift + fast + step);
+    m log-U[0.8,40] (log-U[0.5,8] on minute/5-min bins); daily =
+    exp(a(cos + b cos(2.+psi))), a log-U[0.2,1.5] (x U[0.2,0.7] on
+    minute/5-min bins where tiny counts hide the cycle), b U[0,0.5]; weekly
+    exp(N(0, U[0.01,0.10])) with a U[0.5,0.9] weekend on 10%; slow = AR(1)
+    on DAILY knots (tau log-U[0.3,3] d, sd U[0.02,0.08]) plus drift = AR(1)
+    on the same knots (tau log-U[10,60] d, sd U[0.03,0.25]), both linearly
+    interpolated inside the day; fast = AR(1) per sample (phi U[0.2,0.7],
+    sd U[0.05,0.3]); one permanent log-step N(0,0.35) at U[0.1,0.95] L on
+    20% of rows; gamma-Poisson with r log-U[4,80]; max(1, .) on 90% of
+    rows; 5% carry a piecewise-constant integer unit 2..12 (baton-rouge
+    lattice, blocks of mean U[2,40] samples).  Day length in samples
+    24/60/48/288/96/144 at 0.48/0.22/0.14/0.12/0.03/0.01.
+
+    registration streams (15%; 41 windows: crossref/datacite DOIs, nuget,
+    gharchive, nvd, malwarebazaar, urlhaus, hn): median 1-20, mean/med
+    1.3-30, q99/med 10-250, max/med 20-2700, >5x-median share 1-10% in
+    short batches (run mean 1.1-2), lag1 0-0.4, 24-block log-level sd
+    0.3-1.0.  Same law with m log-U[0.5,30], daily x U[0.15,0.7], weekly sd
+    U[0.03,0.2], slow sd U[0.08,0.3], fast sd U[0.05,0.35], r log-U[4,40],
+    batch bursts x(1+B) at U[0.5,8]%/sample with B log-U[2,60] and a
+    U[0.2,0.7]-geometric 6-step tail on 70%, one plateau excursion
+    (x log-U[3,30] for log-U[10,300] samples) on 12%.
+
+    arrival predictions (15%; 32 windows: tfl seconds-to-arrival): integer
+    values on [1, 1800] (13.5% below 100, then ~4.5%/100 flat to the cap),
+    median 300-1000, lag1 -0.03..0.28, dlog_sd 1.4-2.9, no flats.  Law:
+    iid mixture (w U[0.03,0.35] exponential of scale cap x U[0.03,0.12],
+    else uniform) clipped to [1, cap], cap 1800 (80%) or log-U[900,12000]
+    (nola 311 5-min: 8000), rank-matched to a Gaussian AR(1) phi U[0,0.4].
+
+    88% of rows start mid-row: a constant prefix at the first real value
+    with the real part log-U[100,3500] samples -- the validator's own
+    left-padding of a short feed.
+
+    Emitted bins: event-log feeds (911 / fire / police CAD, crime incidents,
+    DOI and CVE registrations) are binned from event timestamps and publish
+    only the bins that hold events -- an empty bin is absent, not a zero --
+    and an ingestion outage removes a short run of bins. Such a feed has no
+    zeros, and every missing bin pulls the rest of the feed one step earlier,
+    so the daily cycle drifts against the sample index: mostly through the
+    quiet night hours of small feeds, occasionally at any hour through
+    outages. In published hourly / half-hourly dispatch and incident feeds
+    the daily-harmonic phase moves 0.44 / 0.78 / 1.84 rad per week
+    (p25 / 50 / 75; a clock-aligned feed of the same cycle strength reads
+    0.09 / 0.25 / 0.43), drifting forward (median +0.3 rad / week), and
+    feeds under ~2 events per bin show no lag-24 autocorrelation at all.
+    75% of rows are redrawn on a 3L clock and reduced to their emitted bins:
+    empty bins are dropped on the rows that never publish zeros (90% of the
+    event rows), and 70% of the event rows lose runs of 1-4 bins (geometric,
+    mean 1.6) starting with probability log-U[0.002, 0.03] per bin -- a
+    forward drift of 0.15-2.2 rad per week whatever the bin width. The last
+    L emitted bins form the row; a row too sparse to fill L bins keeps its
+    last L clock bins with max(1, .). Arrival-prediction rows stay on the
+    clock. These draws follow every draw of the rows kept as they are.
+    """
+    y = _intraday_event_counts_body(rng, n, L)
+    if n <= 0:
+        return y
+    ti = np.arange(L, dtype=np.int64)[None, :]
+    pre = rng.random((n, 1)) < 0.88
+    nreal = np.exp(rng.uniform(np.log(100.0), np.log(3500.0), size=(n, 1)))
+    cut = np.where(pre, (L - nreal).astype(np.int64), 0)
+    cut = np.clip(cut, 0, max(L - 64, 0))
+
+    # emitted-bin rows: redraw on a longer clock, keep only the emitted bins
+    rows = np.flatnonzero(rng.random(n) < 0.75)
+    if rows.size:
+        k = int(rows.size)
+        L2 = 3 * L
+        raw, drops_empty, is_event = _intraday_event_counts_body(rng, k, L2, emit_empty=True)
+        gap_on = is_event & (rng.random(k) < 0.7)
+        gap_p = np.exp(rng.uniform(np.log(0.002), np.log(0.03), size=k))
+        idx = np.arange(L2, dtype=np.int64)
+        for j in range(k):
+            v = raw[j]
+            keep = np.ones(L2, dtype=bool)
+            if gap_on[j]:
+                start = rng.random(L2) < gap_p[j]
+                run = np.minimum(rng.geometric(0.6, size=L2), 4)
+                reach = np.maximum.accumulate(np.where(start, idx + run, 0))
+                keep &= reach <= idx
+            if drops_empty[j]:
+                keep &= v > 0.0
+            w = v[keep]
+            if w.size >= L:
+                y[rows[j]] = w[-L:]
+            elif drops_empty[j]:
+                y[rows[j]] = np.maximum(v[-L:], 1.0)
+            else:
+                y[rows[j]] = v[-L:]
+        del raw
+
+    first = np.take_along_axis(y, cut, axis=1)
+    return np.where(ti < cut, first, y)
+
+
+def _intraday_event_counts_native(rng: np.random.Generator, n: int, L: int):
+    """Event-feed rows keep their published law: whole counts, no empty
+    bins, and a real feed after the padded start. Flagged as native rows, so
+    the host restores them after the observation stages and the tail
+    continuation, and never pads or blends them -- otherwise a quiet run of
+    small counts reads as a hold and the feed ends in a flat line (half of
+    the rows), and the zero floor of the count prior puts zeros into feeds
+    that never publish one."""
+    y = _intraday_event_counts(rng, n, L)
+    if n > 0:
+        y = _sanitize(y)
+    return y, {"bounded": np.ones(n, dtype=bool), "integer": np.ones(n, dtype=bool)}
+
+
+_intraday_event_counts.with_metadata = _intraday_event_counts_native
+
+
+def _hourly_social_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Hourly activity counts of a small federated social instance (misskey_*
+    notes / active_users): integer counts on a low level with a strong daily
+    cycle and NO weekly cycle.
+
+    Fitted on 287 hourly misskey series (2026-09-16 pool): median level 5
+    (p10-p90 1-74), zeros 11% of hours (p90 44%), lag-1 0.49 (0.27-0.79),
+    daily spectral share 0.23 (0.05-0.53), weekly share 0.003, dlog sd 0.86,
+    max/median ~15. Level: log-uniform [0.5, 80] x a daily profile of three
+    cos harmonics (amp U[0.5,1.8], 0.2-0.6 and 0-0.3 of it) x a daily AR(1)
+    log walk (phi U[0.9,0.99], sd U[0.03,0.2]) x one level shift N(0,0.6) on
+    half the rows x a log-linear drift U[-0.5,0.5]/row on 15%. Bursts: rate
+    U[0,0.003]/h, size log-U[1.5,8], exponential decay tau U[1,6] h. Counts
+    are Gamma-Poisson (k log-U[0.8,20]); 20% of rows carry one 6-72 h outage
+    of exact zeros.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    t = np.arange(L, dtype=np.float64)[None, :]
+    mu0 = rng.uniform(np.log(0.5), np.log(80.0), size=(n, 1))
+    a1 = rng.uniform(0.5, 1.8, size=(n, 1))
+    a2 = a1 * rng.uniform(0.2, 0.6, size=(n, 1))
+    a3 = a1 * rng.uniform(0.0, 0.3, size=(n, 1))
+    ph = rng.uniform(0.0, 2.0 * np.pi, size=(n, 3))
+    w = 2.0 * np.pi / 24.0
+    # One (n, L) accumulator carries the whole log-rate
+    # mu0 + prof + walk_h + shift_h + drift_h + burst, summed in the same
+    # left-to-right order as before; every term is released the moment it
+    # is dead instead of being held to the end of the function.
+    lam = w * t + ph[:, :1]
+    np.cos(lam, out=lam)
+    lam *= a1
+    harm = 2.0 * w * t + ph[:, 1:2]
+    np.cos(harm, out=harm)
+    harm *= a2
+    lam += harm
+    del harm
+    harm = 3.0 * w * t + ph[:, 2:3]
+    np.cos(harm, out=harm)
+    harm *= a3
+    lam += harm
+    del harm
+    lam += mu0
+    days = L // 24 + 2
+    phi = rng.uniform(0.9, 0.99, size=(n, 1))
+    sd = rng.uniform(0.03, 0.2, size=(n, 1))
+    eps = rng.normal(0.0, 1.0, size=(n, days)) * sd
+    walk = np.empty((n, days), dtype=np.float64)
+    walk[:, 0] = eps[:, 0] / np.sqrt(1.0 - phi[:, 0] ** 2)
+    for d in range(1, days):
+        walk[:, d] = phi[:, 0] * walk[:, d - 1] + eps[:, d]
+    del eps
+    walk_h = np.repeat(walk, 24, axis=1)[:, :L]
+    del walk
+    lam += walk_h
+    del walk_h
+    shift_at = rng.uniform(0.2, 0.8, size=(n, 1)) * L
+    shift_on = rng.random((n, 1)) < 0.5
+    shift = np.where(shift_on, rng.normal(0.0, 0.6, size=(n, 1)), 0.0)
+    shift_h = np.where(t >= shift_at, shift, 0.0)
+    lam += shift_h
+    del shift_h
+    drift_on = rng.random((n, 1)) < 0.15
+    drift = np.where(drift_on, rng.uniform(-0.5, 0.5, size=(n, 1)), 0.0)
+    drift_h = drift * t
+    drift_h /= max(L - 1, 1)
+    lam += drift_h
+    del drift_h
+    rate = rng.uniform(0.0, 0.003, size=(n, 1))
+    # quiet == the complement of the original np.where condition, inverted in
+    # place so the impulse amplitudes can be zeroed inside their own buffer.
+    quiet = rng.random((n, L)) < rate
+    np.invert(quiet, out=quiet)
+    impulse = rng.uniform(np.log(1.5), np.log(8.0), size=(n, L))
+    np.exp(impulse, out=impulse)
+    np.log(impulse, out=impulse)
+    np.copyto(impulse, 0.0, where=quiet)
+    del quiet
+    tau = rng.uniform(1.0, 6.0, size=n)
+    decay = np.exp(-1.0 / tau)
+    # The AR(1) burst kernel recurses strictly within a row, so folding it
+    # into the accumulator a row block at a time is exact and never holds a
+    # second (n, L) array beside the impulses.
+    step = 128
+    for lo in range(0, n, step):
+        hi = min(lo + step, n)
+        lam[lo:hi] += _ar1_kernel(np.ascontiguousarray(impulse[lo:hi]), decay[lo:hi])
+    del impulse
+    np.exp(lam, out=lam)
+    np.minimum(lam, 1.0e5, out=lam)
+    k = np.exp(rng.uniform(np.log(0.8), np.log(20.0), size=(n, 1)))
+    gam = rng.gamma(k, 1.0 / k, size=(n, L))
+    np.multiply(lam, gam, out=gam)
+    del lam
+    cnt = rng.poisson(gam)
+    del gam
+    cnt = cnt.astype(np.float64)
+    out_row = rng.random((n, 1)) < 0.2
+    o_start = rng.uniform(0.0, max(L - 72, 1), size=(n, 1))
+    o_len = rng.uniform(6.0, 72.0, size=(n, 1))
+    outage = t >= o_start
+    outage &= t < (o_start + o_len)
+    outage &= out_row
+    cnt[outage] = 0.0
+    return cnt
