@@ -3543,3 +3543,76 @@ def d1_build_factory(mode):
         return y, fl
 
     return build
+
+
+# ═══════════════════ D2 level_ladder_staircase ═════════════════════════════
+
+_MANT = np.array([1.0, 2.0, 5.0])
+
+
+def d2_params(rng, B, cfg):
+    p = cfg["families"]["level_ladder_staircase"]
+    return {
+        "run_mean": logu(rng, p["run_length"][0], p["run_length"][1], B),
+        "run_sigma": rng.uniform(0.5, 1.4, B),
+        "jump_kind": categorical(rng, p["jump_mix"], B),
+        "small": logu(rng, 0.05, 0.6, B),
+        "medium": logu(rng, 0.6, 4.0, B),
+        "huge": logu(rng, 4.0, 60.0, B),
+        "snap": rng.random(B) < p["tick_snap_rate"],
+        "tick_mant": _MANT[rng.integers(0, 3, B)],
+        "tick_exp": rng.integers(-3, 3, B),
+        "noiseless": rng.random(B) < p["noiseless_rate"],
+        "monotone": rng.random(B) < p["monotone_rate"],
+        "noise": logu(rng, 1e-3, 0.3, B),
+    }
+
+
+def d2_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    M = 96
+    dwell = np.maximum(np.exp(rng.normal(np.log(P["run_mean"]).reshape(n, 1),
+                                         P["run_sigma"].reshape(n, 1), size=(n, M))), 2.0)
+    seg_id, _ = segment_map(dwell, L)
+
+    kind = P["jump_kind"].reshape(n, 1)
+    size = np.where(kind == 0, P["small"].reshape(n, 1),
+                    np.where(kind == 1, P["medium"].reshape(n, 1),
+                             P["huge"].reshape(n, 1)))
+    jumps = rng.standard_normal((n, M)) * size
+    mono = P["monotone"].reshape(n, 1)
+    jumps = np.where(mono, np.abs(jumps), jumps)
+    levels = np.cumsum(jumps, axis=1)
+
+    tick = P["tick_mant"].reshape(n, 1) * np.power(10.0, P["tick_exp"].reshape(n, 1))
+    raw_levels = levels
+    snapped = np.round(levels / tick) * tick
+    levels = np.where(P["snap"].reshape(n, 1), snapped, levels)
+
+    y = gather_levels(levels, seg_id)
+    noise = rng.standard_normal((n, L)) * P["noise"].reshape(n, 1) * size
+    y = np.where(P["noiseless"].reshape(n, 1), y, y + noise)
+
+    extended = np.zeros(n, dtype=bool)
+    if cfg.get('_complete_native_renewals', False):
+        rr, dd, first = complete_dwell_table(
+            rng, dwell, L, P['run_mean'].reshape(n, 1), P['run_sigma'].reshape(n, 1), 2.0)
+        if rr.size:
+            extended[rr] = True
+            add = rng.standard_normal((rr.size, dd.shape[1] - M)) * size[rr]
+            add = np.where(mono[rr], np.abs(add), add)
+            extra_levels = raw_levels[rr, -1:] + np.cumsum(add, axis=1)
+            extra_levels = np.where(P['snap'][rr, None],
+                                    np.round(extra_levels / tick[rr]) * tick[rr], extra_levels)
+            lev = np.concatenate((levels[rr], extra_levels), axis=1)
+            sid, _ = segment_map(dd, L)
+            fixed = gather_levels(lev, sid)
+            fixed = np.where(P['noiseless'][rr, None], fixed, fixed + noise[rr])
+            t = time_grid(L)[None, :]
+            y[rr] = np.where(t >= first[:, None], fixed, y[rr])
+
+    fl = new_flags(n, scale_mode=0, quant_boost=0.6)
+    fl["obs_boost"] = np.where(P["noiseless"], 0.4, 1.0)
+    if cfg.get('_complete_native_renewals', False):
+        fl['renewal_extended'] = extended
+    return y, fl
