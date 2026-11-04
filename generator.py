@@ -16878,3 +16878,280 @@ def _pt_occ_simulate_arrivals_departures(x0, arrivals, departures, capacity, u_a
                 x = capacity
         out[t] = x
     return out
+
+@njit(cache=False, fastmath=False)
+def _pt_occ_dwell_jump_walk(n, x0, capacity, ug, us, uj, ub, log_dwell_min, log_dwell_max, mean_reversion, burst_prob, burst_scale, unit_step_prob):
+    out = np.empty(n, dtype=np.float64)
+    x = x0
+    target_level = 0.45 * capacity
+    t = 0
+    k = 0
+    while t < n:
+        g = int(np.exp(log_dwell_min + ug[k] * (log_dwell_max - log_dwell_min)))
+        if g < 1:
+            g = 1
+        dwell_end = t + g
+        if dwell_end > n:
+            dwell_end = n
+        for i in range(t, dwell_end):
+            out[i] = x
+        t = dwell_end
+        k += 1
+        if k >= ug.shape[0]:
+            k = 0
+        s = us[k]
+        if s < unit_step_prob:
+            step_size = 1.0
+        else:
+            v = 0.6404 + (s - unit_step_prob) * 0.3596 / (1.0 - unit_step_prob + 1e-12)
+            if v < 0.8216:
+                step_size = 2.0
+            elif v < 0.8973:
+                step_size = 3.0
+            elif v < 0.9365:
+                step_size = 4.0
+            else:
+                u = (1.0 - v) / 0.0635
+                if u < 1e-06:
+                    u = 1e-06
+                step_size = np.floor(5.0 * u ** (-0.408))
+                if step_size > 58.0:
+                    step_size = 58.0
+        if ub[k] < burst_prob:
+            step_size = step_size + np.floor(burst_scale * capacity * ub[k] / (burst_prob + 1e-12))
+            if step_size > 58.0:
+                step_size = 58.0
+        down_prob = 0.5 + mean_reversion * (x - target_level) / (capacity + 1e-09)
+        if down_prob > 0.97:
+            down_prob = 0.97
+        elif down_prob < 0.03:
+            down_prob = 0.03
+        x = x - step_size if uj[k] < down_prob else x + step_size
+        if x < 0.0:
+            x = -x
+            if x > capacity:
+                x = 0.0
+        elif x > capacity:
+            x = 2.0 * capacity - x
+            if x < 0.0:
+                x = capacity
+    return out
+
+def _pt_occupancy_latent_fraction_counts(rng, n):
+    steps_per_day = _pt_occ_weighted_choice(rng, _pt_OCC_STEPS_PER_DAY, _pt_OCC_STEPS_PER_DAY_WEIGHTS)
+    capacity = _pt_occ_draw_capacity(rng, 7.0, 68.0)
+    corr_steps = _pt_occ_log_uniform(rng, 18.0, 520.0)
+    sd = float(rng.uniform(0.13, 0.31))
+    mu = float(np.clip(rng.normal(0.43, 0.14), 0.05, 0.93))
+    f = _pt_occ_ar1_noise(rng, n, corr_steps, sd)
+    if rng.random() < 0.72:
+        f = f + _pt_occ_ar1_noise(rng, n, rng.uniform(1.5, 16.0), sd * rng.uniform(0.05, 0.25))
+    if rng.random() < 0.55:
+        shock_rate = rng.uniform(0.2, 3.0) / steps_per_day
+        m = rng.random(n) < shock_rate
+        if m.any():
+            ar_coef = float(np.exp(-1.0 / corr_steps))
+            shocks = np.zeros(n)
+            k = int(m.sum())
+            shock_signs = np.where(rng.random(k) < 0.6, 1.0, -1.0)
+            shocks[m] = shock_signs * rng.uniform(0.15, 0.75, k)
+            f = f + _pt_occ_ar1_filter(shocks, ar_coef)
+    tod, is_weekend = _pt_occ_time_of_day_weekend(rng, n, steps_per_day)
+    if rng.random() < 0.75:
+        diurnal_amp = rng.uniform(0.05, 0.55) * sd
+        kind = rng.random()
+        if kind < 0.45:
+            shape = _pt_occ_circular_bump(tod, rng.uniform(0.02, 0.18), rng.uniform(0.07, 0.16))
+            shape = shape - _pt_occ_circular_bump(tod, rng.uniform(0.42, 0.58), rng.uniform(0.09, 0.18))
+        elif kind < 0.85:
+            shape = _pt_occ_circular_bump(tod, rng.uniform(0.44, 0.58), rng.uniform(0.08, 0.17))
+            shape = shape - _pt_occ_circular_bump(tod, rng.uniform(0.86, 0.99), rng.uniform(0.07, 0.15))
+        else:
+            shape = -_pt_occ_circular_bump(tod, rng.uniform(0.62, 0.78), rng.uniform(0.09, 0.2))
+        wk = np.where(is_weekend, rng.uniform(0.15, 0.8), 1.0)
+        f = f + diurnal_amp * wk * shape
+    if rng.random() < 0.5:
+        f = f + _pt_occ_ar1_noise(rng, n, rng.uniform(1.5, 6.0) * steps_per_day, rng.uniform(0.03, 0.14))
+    x = np.round(capacity * np.clip(mu + f, 0.0, 1.0))
+    if rng.random() < 0.72:
+        hold_logit_bias = float(rng.uniform(-2.6, 1.7))
+        z = _pt_occ_ar1_noise(rng, n, rng.uniform(40.0, 700.0), rng.uniform(0.6, 2.4))
+        p = 1.0 / (1.0 + np.exp(-np.clip(hold_logit_bias + z, -30.0, 30.0)))
+        x = _pt_occ_sticky_hold_varying(x, rng.random(n), p)
+    elif rng.random() < 0.4:
+        x = _pt_occ_sticky_hold(x, rng.random(n), rng.uniform(0.05, 0.5))
+    if rng.random() < 0.13:
+        L = int(min(n - 1, max(8, _pt_occ_log_uniform(rng, 24.0, 320.0))))
+        x[n - L:] = x[n - L - 1]
+    return np.ascontiguousarray(x, dtype=np.float64)
+
+def _pt_occupancy_arrival_departure_counts(rng, n):
+    steps_per_day = _pt_occ_weighted_choice(rng, _pt_OCC_STEPS_PER_DAY, _pt_OCC_STEPS_PER_DAY_WEIGHTS)
+    capacity = _pt_occ_draw_capacity(rng, 11.0, 58.0)
+    tod, is_weekend = _pt_occ_time_of_day_weekend(rng, n, steps_per_day)
+    mean_flow = _pt_occ_log_uniform(rng, 0.5, 5.0)
+    am = _pt_occ_circular_bump(tod, rng.uniform(0.3, 0.38), rng.uniform(0.035, 0.075))
+    pm = _pt_occ_circular_bump(tod, rng.uniform(0.68, 0.78), rng.uniform(0.045, 0.09))
+    midday = _pt_occ_circular_bump(tod, rng.uniform(0.48, 0.62), rng.uniform(0.11, 0.2))
+    baseline_flow = rng.uniform(0.06, 0.3)
+    wk = np.where(is_weekend, rng.uniform(0.25, 0.85), 1.0)
+    flow_profile = baseline_flow + wk * (rng.uniform(0.5, 1.0) * am + rng.uniform(0.5, 1.0) * pm)
+    flow_profile = flow_profile + rng.uniform(0.3, 1.1) * np.where(is_weekend, 1.4, 0.7) * midday
+    flow_profile = flow_profile / max(flow_profile.mean(), 1e-09)
+    flow_skew = rng.uniform(0.1, 0.65) * (1.0 if rng.random() < 0.5 else -1.0)
+    flow_skew = flow_skew * wk * (am - pm) / max(float(np.abs(am - pm).max()), 1e-09)
+    log_rate_noise = _pt_occ_ar1_noise(rng, n, rng.uniform(0.4, 3.0) * steps_per_day, rng.uniform(0.1, 0.4))
+    mod = np.exp(np.clip(log_rate_noise, -1.5, 1.5))
+    log_rate_bias = float(rng.normal(0.0, 0.32))
+    arrival_rate = 0.5 * mean_flow * flow_profile * mod * np.clip(1.0 - flow_skew, 0.05, None) * np.exp(-log_rate_bias)
+    departure_rate = 0.5 * mean_flow * flow_profile * mod * np.clip(1.0 + flow_skew, 0.05, None) * np.exp(log_rate_bias)
+    batch_prob = rng.uniform(0.0, 0.12)
+    ug = rng.random((2, n))
+    arrival_batch = 1.0 + (ug[0] < batch_prob) + (ug[0] < 0.25 * batch_prob)
+    departure_batch = 1.0 + (ug[1] < batch_prob) + (ug[1] < 0.25 * batch_prob)
+    arrivals = rng.poisson(arrival_rate).astype(np.float64) * arrival_batch
+    departures = rng.poisson(departure_rate).astype(np.float64) * departure_batch
+    reset_rate = rng.uniform(0.0, 2.5) / steps_per_day
+    is_reset = rng.random(n) < reset_rate
+    reset_level = np.zeros(n)
+    k = int(is_reset.sum())
+    if k:
+        reset_level[is_reset] = np.round(capacity * rng.uniform(0.15, 0.85, k))
+    u = rng.random((2, n))
+    x = _pt_occ_simulate_arrivals_departures(float(np.round(capacity * rng.uniform(0.2, 0.7))), arrivals, departures, capacity, u[0], u[1], float(rng.uniform(0.15, 0.95)), float(rng.uniform(0.15, 0.95)), is_reset, reset_level)
+    if rng.random() < 0.3:
+        x = _pt_occ_sticky_hold(x, rng.random(n), rng.uniform(0.05, 0.45))
+    return np.ascontiguousarray(x, dtype=np.float64)
+
+def _pt_occupancy_dwell_jump_counts(rng, n):
+    capacity = _pt_occ_draw_capacity(rng, 6.0, 50.0)
+    log_dwell_min = float(np.log(rng.uniform(1.0, 3.0)))
+    log_dwell_max = float(np.log(_pt_occ_log_uniform(rng, 24.0, 1500.0)))
+    if log_dwell_max <= log_dwell_min:
+        log_dwell_max = log_dwell_min + 0.7
+    m = int(min(n, max(24, 3 * n / max(np.exp(0.5 * (log_dwell_min + log_dwell_max)), 1.0))))
+    u4 = rng.random((4, m))
+    ug, us, uj, ub = (u4[0], u4[1], u4[2], u4[3])
+    x0 = float(np.round(capacity * np.clip(rng.normal(0.45, 0.22), 0.0, 1.0)))
+    x = _pt_occ_dwell_jump_walk(n, x0, capacity, ug, us, uj, ub, log_dwell_min, log_dwell_max, float(rng.uniform(0.02, 0.16)), float(rng.uniform(0.0, 0.035)), float(rng.uniform(0.05, 0.3)), float(rng.uniform(0.68, 0.95)))
+    n_stuck_segments = int(rng.integers(0, 3))
+    for _ in range(n_stuck_segments):
+        L = int(min(n, max(8, _pt_occ_log_uniform(rng, 10.0, 700.0))))
+        s = int(rng.integers(0, max(1, n - L + 1)))
+        r = rng.random()
+        v = 0.0 if r < 0.32 else capacity if r < 0.38 else x[s]
+        x[s:s + L] = v
+    if rng.random() < 0.34:
+        L = int(min(n, max(16, _pt_occ_log_uniform(rng, 24.0, 900.0))))
+        s = int(rng.integers(0, max(1, n - L + 1)))
+        x[s:s + L] = x[s]
+    r = rng.random()
+    if r < 0.62:
+        if rng.random() < 0.05:
+            L = int(min(n - 1, max(8, _pt_occ_log_uniform(rng, 300.0, 1300.0))))
+        else:
+            L = int(min(n - 1, max(8, _pt_occ_log_uniform(rng, 64.0, 300.0))))
+        q = rng.random()
+        if q < 0.17:
+            v = 0.0
+        elif q < 0.24:
+            v = capacity
+        else:
+            v = x[n - L - 1]
+        x[n - L:] = v
+    return np.ascontiguousarray(x, dtype=np.float64)
+_pt_INTRADAY_PERIOD_CHOICES = np.array([12, 24, 48, 96, 144, 288], dtype=np.int64)
+_pt_INTRADAY_PERIOD_WEIGHTS = np.array([0.08, 0.34, 0.1, 0.24, 0.06, 0.18])
+_pt_INTRADAY_PERIOD_WEIGHTS = _pt_INTRADAY_PERIOD_WEIGHTS / _pt_INTRADAY_PERIOD_WEIGHTS.sum()
+_pt_ROUNDING_GRID_STEPS = np.array([2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0])
+
+def _pt_draw_intraday_period(rng: np.random.Generator, n: int) -> int:
+    hi = max(4, n // 3)
+    ok = _pt_INTRADAY_PERIOD_CHOICES <= hi
+    if not ok.any():
+        return int(max(4, n // 4))
+    p = _pt_INTRADAY_PERIOD_WEIGHTS * ok
+    return int(rng.choice(_pt_INTRADAY_PERIOD_CHOICES, p=p / p.sum()))
+
+def _pt_ar1_noise_from_coef(rng: np.random.Generator, n: int, ar_coef: float, sd: float) -> np.ndarray:
+    if n <= 0:
+        return np.zeros(0, dtype=np.float64)
+    z = rng.standard_normal(n)
+    innov_sd = sd * np.sqrt(max(1.0 - ar_coef * ar_coef, 1e-12))
+    z *= innov_sd
+    z[0] = sd * rng.standard_normal()
+    return lfilter([1.0], [1.0, -ar_coef], z).astype(np.float64, copy=False)
+
+def _pt_weekday_factor_series(rng: np.random.Generator, n: int, p: int, day_sd: float, weekend_shift: float) -> np.ndarray:
+    day = np.arange(n, dtype=np.int64) // max(p, 1)
+    f = rng.normal(0.0, day_sd, size=7)
+    f[5] += weekend_shift
+    f[6] += weekend_shift
+    return np.exp(f[day % 7])
+
+def _pt_random_daily_profile(rng: np.random.Generator, p: int) -> np.ndarray:
+    phase = np.arange(p, dtype=np.float64) / p
+    u = rng.random()
+    k = 1 if u < 0.45 else 2 if u < 0.9 else 3
+    b = np.zeros(p, dtype=np.float64)
+    if k == 2:
+        peak_centers = np.array([rng.uniform(0.26, 0.38), rng.uniform(0.62, 0.8)])
+    elif k == 1:
+        peak_centers = np.array([rng.uniform(0.3, 0.7)])
+    else:
+        peak_centers = np.sort(rng.uniform(0.15, 0.9, size=3))
+    for c in peak_centers:
+        w = rng.uniform(0.03, 0.115)
+        a = rng.uniform(0.55, 1.0)
+        d = np.abs(phase - c)
+        d = np.minimum(d, 1.0 - d)
+        b += a * np.exp(-0.5 * (d / w) ** 2)
+    dw = np.abs(phase - rng.uniform(0.4, 0.62))
+    dw = np.minimum(dw, 1.0 - dw)
+    b += rng.uniform(0.35, 0.95) * np.exp(-0.5 * (dw / rng.uniform(0.13, 0.28)) ** 2)
+    hi = b.max()
+    if hi <= 1e-12:
+        b = np.ones(p, dtype=np.float64)
+    else:
+        b /= hi
+    floor = 10.0 ** rng.uniform(-2.3, -0.03)
+    gamma = rng.uniform(0.6, 1.5)
+    profile = floor + (1.0 - floor) * b ** gamma
+    profile /= profile.mean()
+    if rng.random() < 0.3:
+        profile = 1.0 + rng.uniform(0.12, 0.85) * (profile - 1.0)
+    return profile / profile.mean()
+
+def _pt_poisson_or_overdispersed_counts(rng: np.random.Generator, mu: np.ndarray) -> np.ndarray:
+    mu = np.maximum(mu, 0.0)
+    peak_mean = float(mu.max()) if mu.size else 0.0
+    if peak_mean < 200000.0 and rng.random() < 0.55:
+        return rng.poisson(mu).astype(np.float64)
+    od = rng.uniform(1.0, 3.0)
+    x = mu + od * np.sqrt(mu) * rng.standard_normal(mu.shape[0])
+    return np.maximum(np.rint(x), 0.0)
+
+def _pt_insert_zero_or_hold_gaps(rng: np.random.Generator, x: np.ndarray, apply_prob: float, tail_margin: int=64) -> np.ndarray:
+    n = x.shape[0]
+    if n < 96 or rng.random() >= apply_prob:
+        return x
+    gap_limit = n if rng.random() < 0.06 else max(96, n - tail_margin)
+    for _ in range(int(rng.integers(1, 5))):
+        ln = int(rng.integers(2, max(3, min(41, n // 20))))
+        s = int(rng.integers(1, max(2, gap_limit - ln)))
+        e = min(s + ln, gap_limit)
+        if rng.random() < 0.5:
+            x[s:e] = 0.0
+        else:
+            x[s:e] = x[s - 1]
+    return x
+
+def _pt_finalize_nonconstant_series(x: np.ndarray, n: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64).ravel()
+    if x.shape[0] != n:
+        x = np.resize(x, n)
+    np.nan_to_num(x, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.any(x != x[0]):
+        x = x.copy()
+        x[-1] = x[-1] + 1.0
+    return np.ascontiguousarray(x, dtype=np.float64)
