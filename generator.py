@@ -12907,3 +12907,235 @@ def _isp_ar1(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
     for k in range(1, L):
         x[k] += p * x[k - 1]
     return x.T
+
+
+def _isp_day_ar1(rng: np.random.Generator, n: int, nd: int,
+                 phi: np.ndarray, sd: np.ndarray) -> np.ndarray:
+    """Stationary AR(1) across days: (n, nd) with per-row phi, sd (both (n,1))."""
+    e = rng.normal(0.0, 1.0, size=(n, nd)) * sd * np.sqrt(1.0 - phi * phi)
+    e[:, :1] = rng.normal(0.0, 1.0, size=(n, 1)) * sd
+    return _isp_ar1(e, phi)
+
+
+def _isp_runs(rng: np.random.Generator, idx: np.ndarray, start: np.ndarray,
+              mean_len: np.ndarray) -> np.ndarray:
+    """Mask covering geometric-length runs (mean ``mean_len``) that begin at
+    the ``start`` samples; the run's first sample is included."""
+    ln = rng.geometric(np.clip(1.0 / mean_len, 1e-3, 1.0), size=start.shape)
+    reach = np.maximum.accumulate(np.where(start, idx + ln - 1, -1), axis=1)
+    return idx <= reach
+
+
+def _road_commute_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Road / bridge / tunnel vehicle counts: mta_bridges_tunnels_hourly_crossings,
+    npra_norway_traffic_volume_hourly, truck-toll and airport-operation feeds.
+
+    Measured on the revealed pool: integer counts, no zeros, CV 0.40-0.56, lag-1
+    acf ~0.92, day-lag acf ~0.90 and week-lag acf 0.90-0.97 -- a near-deterministic
+    commute rhythm that repeats week to week, with the variance carried by the
+    cycle itself rather than by noise.
+
+    Weekday profile = night floor + AM peak + broader PM peak (von Mises bumps,
+    AM at U[0.26, 0.36] of the day, PM at U[0.66, 0.78]); weekend = one broad
+    blend (U[0.3, 0.7]) of a broad midday hump and the weekday shape at
+    U[0.75, 1.05] of the weekday mass, Saturday above Sunday.
+    Day level carries a small AR(1) (phi U[0.3, 0.8], sd U[0.02, 0.08]) and the
+    step level a smaller iid term (sd U[0.005, 0.02]), so the weekly shape is
+    what the context teaches and what the horizon continues. 80% of rows are
+    hourly (P=24), 20% quarter-hourly (P=96). 20% of rows carry 1-2 closure dips
+    (flow to U[0.15, 0.6] for 2..12 hours). Counts are Poisson at the rate,
+    level log-U[150, 9000], so the lattice and the low-count floor are both real.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    ti = np.arange(L, dtype=np.float64)[None, :]
+    P = np.where(rng.random((n, 1)) < 0.8, 24.0, 96.0)
+    ph0 = rng.random((n, 1))
+    dow0 = rng.integers(0, 7, size=(n, 1))
+
+    day_pos = ti / P + ph0                                    # (n, L) days elapsed
+    day_idx = np.floor(day_pos).astype(np.int64)
+    frac = day_pos - day_idx                                  # position within the day
+    dow = (day_idx + dow0) % 7                                # 5, 6 = weekend
+
+    m_am = rng.uniform(0.26, 0.36, size=(n, 1))
+    m_pm = rng.uniform(0.66, 0.78, size=(n, 1))
+    k_am = rng.uniform(3.0, 10.0, size=(n, 1))
+    k_pm = rng.uniform(2.0, 7.0, size=(n, 1))
+    h_pm = rng.uniform(0.7, 1.4, size=(n, 1))
+    floor_ = rng.uniform(0.12, 0.40, size=(n, 1))
+    tw = 2.0 * np.pi
+    prof = np.exp(k_am * (np.cos(tw * (frac - m_am)) - 1.0))
+    prof += h_pm * np.exp(k_pm * (np.cos(tw * (frac - m_pm)) - 1.0))
+
+    m_we = rng.uniform(0.50, 0.60, size=(n, 1))
+    k_we = rng.uniform(2.0, 6.0, size=(n, 1))
+    we_mass = rng.uniform(0.75, 1.05, size=(n, 1))
+    we_blend = rng.uniform(0.3, 0.7, size=(n, 1))
+    sun = rng.uniform(0.75, 0.95, size=(n, 1))
+    we_prof = np.exp(k_we * (np.cos(tw * (frac - m_we)) - 1.0))
+    we_prof *= we_mass * (1.0 + h_pm) / np.maximum(we_prof.mean(axis=1, keepdims=True), 1e-9) \
+        * prof.mean(axis=1, keepdims=True) / (1.0 + h_pm)
+    we_prof = we_blend * we_prof + (1.0 - we_blend) * we_mass * prof
+    we_prof *= np.where(dow == 6, sun, 1.0)
+    prof = np.where(dow >= 5, we_prof, prof)
+    del we_prof
+    prof += floor_ * prof.max(axis=1, keepdims=True)
+    prof /= np.maximum(prof.mean(axis=1, keepdims=True), 1e-9)
+
+    nd = int(L // 24) + 3
+    phi = rng.uniform(0.3, 0.8, size=(n, 1))
+    dsd = rng.uniform(0.02, 0.08, size=(n, 1))
+    e = rng.normal(0.0, 1.0, size=(n, nd))
+    dl = np.empty((n, nd))
+    dl[:, :1] = e[:, :1]
+    for j in range(1, nd):
+        dl[:, j:j + 1] = phi * dl[:, j - 1:j] + np.sqrt(1.0 - phi * phi) * e[:, j:j + 1]
+    prof *= np.exp(dsd * np.take_along_axis(dl, np.minimum(day_idx, nd - 1), axis=1))
+    del day_idx, day_pos, frac, dow
+
+    prof *= np.exp(rng.normal(0.0, 1.0, size=(n, L)) * rng.uniform(0.005, 0.02, size=(n, 1)))
+
+    has_dip = rng.random((n, 1)) < 0.2
+    for _ in range(2):
+        s0 = rng.integers(0, L, size=(n, 1)).astype(np.float64)
+        dur = rng.uniform(2.0, 12.0, size=(n, 1)) * (P / 24.0)
+        lvl = rng.uniform(0.15, 0.6, size=(n, 1))
+        on = has_dip & (rng.random((n, 1)) < 0.7) & (ti >= s0) & (ti < s0 + dur)
+        prof = np.where(on, prof * lvl, prof)
+
+    level = np.exp(rng.uniform(np.log(150.0), np.log(9000.0), size=(n, 1)))
+    prof *= level
+    return rng.poisson(np.maximum(prof, 0.0)).astype(np.float64)
+
+def _intraday_spot_price(rng: np.random.Generator, n: int, L: int,
+                         short_start: float = 0.35) -> np.ndarray:
+    """Wholesale electricity prices at 5/15/30-min and hourly cadence: solar
+    duck-curve day-ahead prices (energy_charts_*, energinet, elering, pse, ree,
+    octopus_agile, elexon market index), offer-tier hourly spot prices
+    (simem / xm colombia, cenace) and tier-held real-time dispatch prices with
+    short multiplicative spikes (nz_emi dispatch, nyiso / caiso 5-min LBMP,
+    aemo, aeso).
+
+    Fitted on the 105 pool series of the class (last 4096 points; p10/50/90):
+    level 18/60/190, lag1 0.58/0.94/0.98, flat_run 0.008/0.043/0.28,
+    dlog_sd 0.11/0.27/0.62, max/med 1.8/4.9/21, range_rel 1.8/5.1/21,
+    neg_frac 0/0/0.034, integer_frac 0.005/0.03/0.20, shift_rate
+    0.06/0.42/0.61, trend_slope -3e-5/1e-4/6e-4 per step (late-summer rise),
+    tick 0.01, series length 690..4096 (p10 1539: nz_emi ~1540, colombia
+    ~1300, elexon ~2500, octopus ~3300).  Four archetypes by cadence P
+    (samples/day), measured as band shares of the detrended signed-log
+    spectrum (>6 d / 3-6 d / 1.5-3 d / daily line / 12 h-1 d / 3-12 h / <3 h):
+    (a) sub-hourly day-ahead, P=96 (48 series) and 40% of P=48: 0.15 / 0.06
+    / 0.07 / 0.18 / 0.23 / 0.09 / 0.02; lag1 0.96, dlog_sd 0.24; median
+    intraday profile / median 1.44 at the evening peak (18-20 h), 0.45 at the
+    midday solar trough (13-14 h; ES/NL/DK 0.02-0.3, Nordic/UK 0.65-0.9),
+    morning shoulder 1.1-1.25; daily-mean log sd 0.13/0.24/1.0 with
+    day-to-day acf 0.5; acf at one day 0.68, one week 0.68; weekend /
+    weekday 0.66-0.74; days with a negative price 0/7/22% (never below -0.2
+    x level), days with min < 0.15 median 44%, daily min / daily mean p50
+    0.24 and wildly varying day to day (sunny 0, cloudy 0.5); daily max /
+    daily mean p50 1.7, p90 2.1-2.7, max 3.2-8; residual log sd
+    0.09/0.35/0.63 after the day mean and the profile; |dlog| lag-1 acf 0.5
+    (ramps cluster the big moves); identical consecutive values 0.8/1.9/5.4%
+    in runs of 2; near-flat |dx| < 1% med share 0.2 (heavy-tailed
+    quarter-hour zigzag).  octopus / elexon 30-min rows: one strong evening
+    peak (1.74), weak trough (0.72), 12 h-1 d sideband share 0.27.
+    (b) hourly spot, P=24 (simem / xm colombia, ree, cenace): 0.49 / 0.04 /
+    0.03 / 0.18 / 0.07 / 0.09 / 0.01 -- a slow multi-week level, a clean
+    daily line and little else; prices sit on a few offer tiers (559.25,
+    564.35, 602.78 ...): near-flat share 0.61, exact repeats 27% in runs to
+    4, lag1 0.91, dlog_sd 0.11, max/med 1.5, cv 0.2, peak-hour tier x 1.45
+    for 2-3 h on some days, no negatives.  (c) 30-min dispatch, 60% of P=48
+    (nz_emi, aemo): 0.29 / 0.14 / 0.27 / 0.01 / 0.05 / 0.08 / 0.07 -- huge
+    day-to-day swings (daily-mean log sd 1.0-1.2, acf 0.35, a quasi 2-3 day
+    cycle) with the level ramping between days; within a day the price
+    alternates every 1-3 samples among 2-4 offer tiers (21 / 34 / 68: |dx| >
+    0.5 med on 14% of steps, near-flat 0.32, exact repeats 12-21%), short
+    collapses to 0.02-2 (1-2% of samples), spikes 0.4/day of 3.4x; lag1 0.91,
+    dlog_sd 0.59, dkurt 22, max/med 10, daily min / mean p50 0.11.  (d) 5-min
+    real-time, P=288 (nyiso, caiso): 0.06 / 0.10 / 0.04 / 0.13 / 0.13 / 0.18
+    / 0.30 -- lag1 0.50, near-flat base (share 0.41, exact repeats 7%) with
+    bursts, spikes 1.1/day of 3.6x (p90 10x, 2-4 samples), dkurt 345,
+    daily-mean log sd 0.15, profile 0.77-1.27, max/med 21, cv 0.68.
+
+    Law.  P in {24, 48, 96, 288} w.p. 0.10/0.34/0.45/0.11; dispatch kind
+    w.p. 0.12/0.60/0.02/1.0 given P (P=288 always the 5-min kind); rows are
+    built in chunks of 256 with day-ahead-only and dispatch-only terms drawn
+    on their row subsets.  Log daily level = slow walk (sd/d: DA U[0.005,
+    0.04] (x0.5 at P=48), hourly U[0.005,0.02], nz U[0.06,0.2], 5-min
+    U[0.003,0.015]) + log drift over the row (DA U[-0.1,0.8] (x0.3 at P=48),
+    hourly U[-0.2,0.2], nz U[-0.3,2.0], 5-min U[-0.15,0.15]), tanh-capped at
+    +-2, + stationary day AR(1) (sd: DA U[0.03,0.20], hourly U[0.005,0.02],
+    nz U[0.8,1.3], 5-min U[0.06,0.15]; phi DA U[0.6,0.9], hourly U[0.7,0.9],
+    nz U[-0.3,0.1], 5-min U[0.2,0.5]) + a quasi-cycle (nz: period U[1.8,3.5]
+    d, amplitude U[0.4,1.0] x exp(N(0,0.3)) per day; hourly: period U[6,14]
+    d, U[0.02,0.06]) + weekend log-factor (Sat U[0.7,0.95], Sun = Sat x
+    U[0.8,1.0]) + hourly holiday-like low days (3%, x U[0.5,0.9]); nz rows
+    interpolate the daily level linearly between day centres, the others
+    hold it per day; base level exp(N(ln 60, 0.9)) DA, exp(N(ln 30, 0.6))
+    dispatch, clipped to [2, 5000].  Volatility multiplier exp(tanh(day AR(1)
+    sd U[0.1,0.3] + intraday AR(1) log-vol sd U[0.15,0.45] (hourly phi 0.9)
+    + row slope U[-0.2,0.8] x (t/L - 1/2))) on residual and jitter terms,
+    its square root on spikes.  Profile (log, circular in 24 h): Gaussian
+    bumps at 6.5-9 h (width U[2.5,3.5] h; amplitude DA U[0.10,0.40], hourly
+    U[0.02,0.12], nz U[0,0.1], 5-min U[0.05,0.15]), 17-20.5 h (width
+    U[3,4] h; DA U[0.15,0.60], 30-min DA U[0.20,0.50] with morning
+    U[0.02,0.15], hourly U[0.10,0.30], nz U[0.02,0.15], 5-min U[0.15,0.35]),
+    night dip 2-5 h (width U[3,4.5] h; DA U[0.05,0.30], hourly U[0.08,0.25],
+    nz U[0.02,0.12], 5-min U[0.15,0.35]); amplitudes jittered by an AR(1)
+    across days (phi U[0.3,0.7]; log sd 0.3 DA, 0.6 at 30-min DA, 0.05
+    hourly, 0.35 dispatch), the evening peak x U[0.6,0.9] on weekends, peak
+    timing drifting U[-1,1] h over the row and jittered N(0, 0.7 h) per day.
+    Day-ahead: price = D_d exp(prof_d(tau) + r_t + w_t) x scarcity - D_d s_d
+    S(tau); solar trough S = exp(-|tau - U[12.5,14]|^k / U[3.5,5]^k), k
+    U[1.2,2], depth s_d = s_row exp(AR(1) across days, phi U[0.3,0.7], sd
+    U[0.3,0.6]) x weekend U[1,1.3], capped at 1.12 on days cleared for
+    negative prices (w.p. U[0.03,0.25] per day) and 0.99 otherwise; s_row
+    U[0.75,1.0] on solar rows (70% at P=96, 15% at P=48, 20% at P=24 with
+    U[0.3,0.8]) else U[0.03,0.4]; r_t = AR(1) log residual, hourly phi
+    U[0.7,0.95] (per-sample phi^(24/P)), sd U[0.05,0.22] (hourly U[0.02,0.08])
+    x volatility; w_t = Laplace sub-hourly zigzag, sd U[0.01,0.04] (P=96) /
+    U[0.01,0.05] (P=48) x volatility x (0.4 + 0.6 x normalised |profile
+    ramp|); scarcity days w.p. U[0,0.10] scale the evening peak by U[1.3,3]
+    over U[0.5,2.5] h (hourly: peak-hour tier x U[1.15,1.4] over U[0.5,2] h
+    on U[2,8]% of days); floors: 10% hard 0 (hourly 20%), 25% soft
+    U[0.02,0.2] level with N(0, 0.003 level) jitter (hourly 50%), the rest
+    negative-allowed down to -U[0.01,0.08] level on cleared days and
+    U[5e-4,0.01] level otherwise.  60% of hourly rows are then quantised to a
+    log grid of spacing U[0.01,0.06] (offer tiers) with micro-jitter exp(N(0,
+    U[1e-3,5e-3])) on U[60,90]% of samples.  Dispatch: log price = log D +
+    prof + tier(t) + jitter + spikes; nz tiers = sample-and-hold, at geometric
+    change points of mean dwell U[1.2,4] samples, of a uniform draw over K in
+    {2,3,4} levels spaced U[0.4,0.9] apart, blended U[0,0.4] with the
+    previous sample (ramping), plus collapses to level x U[5e-4,0.1] starting
+    w.p. U[0.002,0.012] per sample with mean length U[1.5,4]; 5-min tiers =
+    sample-and-hold of a latent AR(1) (dwell U[24,150], sd U[0.02,0.08],
+    across-tier phi U[0.3,0.8]); jitter nz N(0, U[0.01,0.03]), 5-min N(0,
+    U[0.002,0.01]) plus N(0, U[0.05,0.12]) on U[15,35]% of samples, both x
+    volatility; spikes at nz U[0.1,0.5]/day (log-magnitude U[ln 1.5, ln 3],
+    decay tau U[0.5,3] samples, 15% long U[3,8]), 5-min U[0.5,1.2]/day
+    (U[ln 2.5, ln 20], tau U[0.7,2]: most real-time spikes last one or two
+    samples), spike log-magnitude capped at ln 30; the total log
+    excursion above base is soft-capped (slope 0.3) beyond ln 10 (nz) / ln
+    18 (5-min).  Observation (all): repeat runs of the previous free value
+    (start prob / mean run: DA sub-hourly U[0,0.03] / 1/(1-U[0.2,0.5]),
+    hourly U[0.03,0.22] / 1/(1-U[0.3,0.6]), nz U[0.03,0.2] / 1/(1-U[0.3,0.7]),
+    5-min U[0.01,0.06] / 1/(1-U[0.2,0.5])); snap to the integer w.p. q_row
+    (45% of rows U[0.01,0.25], a third of those to multiples of 5); 0.01
+    tick; 35% of rows start mid-row with a constant prefix (U[0.25,0.85] L)
+    at the first real value -- the validator's left-padding of the short
+    nz_emi / colombia / elexon feeds.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    P = rng.choice(np.array([24.0, 48.0, 96.0, 288.0]), size=(n, 1),
+                   p=np.array([0.10, 0.34, 0.45, 0.11]))
+    p_rt = np.select([P == 24.0, P == 48.0, P == 96.0], [0.12, 0.60, 0.02], 1.0)
+    rt = rng.random((n, 1)) < p_rt
+    kind = np.where(rt, np.where(P == 288.0, 3, 2), np.where(P == 24.0, 1, 0))
+    out = np.empty((n, L), dtype=np.float64)
+    for a in range(0, n, 256):
+        b = min(n, a + 256)
+        out[a:b] = _isp_rows(rng, P[a:b], kind[a:b], L, short_start)
+    return out
