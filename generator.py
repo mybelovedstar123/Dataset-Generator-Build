@@ -2026,3 +2026,53 @@ def apply_scale(rng, y, flags, cfg):
     if hot.size:
         y[hot] = y[hot] * (MAX_PEAK / peak[hot])
     return y
+
+
+# ═════════════════════ structured hierarchical aggregation ═════════════════
+
+def apply_aggregation(rng, y, flags, cad, cfg):
+    """Build a fraction of rows as genuine aggregates of same-cadence siblings.
+
+    A sum of K components driven by a common latent factor has a variance that
+    grows like K^2, while independent components give K.  That signature is the
+    correct model for national demand, grid totals, portfolio series and total
+    pageviews, and it is what a blind cross-family Dirichlet mixup destroys:
+    blending a Poisson count series with a chaotic attractor at a 1e4 scale ratio
+    produces a noised copy of the larger, not a composite.  We only ever combine
+    rows that share a cadence, and we restore the host row's own level and scale.
+    """
+    n, L = y.shape
+    sel = ((rng.random(n) < cfg["aggregation"]["rate"])
+           & flags["allow_agg"] & (~flags["count"]) & (~flags["bounded"]))
+    rows = _rows(sel)
+    if rows.size == 0:
+        return y
+    order = np.argsort(cad.seconds, kind="stable")
+    rank = np.empty(n, dtype=np.int64)
+    rank[order] = np.arange(n)
+    partners = order[(rank[:, None] + np.arange(1, 7)[None, :]) % n]
+    K = rng.integers(2, 7, n)
+    beta = rng.uniform(0.3, 1.0, size=(n, 6))
+    fshare = rng.uniform(0.2, 0.9, size=(n, 1))
+
+    need = np.unique(np.concatenate([rows, partners[rows].ravel()]))
+    z = np.zeros((n, L))
+    zs = y[need]
+    zs = zs - zs.mean(axis=1, keepdims=True)
+    z[need] = zs / safe_std(zs)
+
+    acc = np.zeros((rows.size, L))
+    for j in range(6):
+        live = (j < K[rows]) & (cad.seconds[partners[rows, j]] == cad.seconds[rows])
+        if live.any():
+            acc[live] += beta[rows[live], j:j + 1] * z[partners[rows[live], j]]
+    factor = z[partners[rows, 0]]
+    agg = (fshare[rows] * factor * np.sqrt(np.maximum(K[rows], 1)[:, None])
+           + (1.0 - fshare[rows]) * acc)
+    span = np.abs(agg).max(axis=1, keepdims=True)
+    ok = agg.std(axis=1, keepdims=True) > 1e-9 * np.maximum(span, 1e-300)
+    agg = np.where(ok, agg / safe_std(agg), 0.0)
+    host = y[rows]
+    blended = host.mean(axis=1, keepdims=True) + safe_std(host) * agg
+    y[rows] = np.where(ok, blended, host)
+    return y
