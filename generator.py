@@ -2559,3 +2559,21 @@ def a5_build(P, rng, L, cad, cal, cfg):
     if cfg.get('_complete_native_renewals', False):
         fl['renewal_extended'] = extended
     return y, fl
+
+
+# ═══════════════ chronoforge: cf_fam_ops ═══════════════
+# Block B — operational telemetry / web-cloudops families.
+#
+# The web-cloudops domain is one of the two the field loses.  The diagnosis is
+# structural: these shapes are produced by *control systems*, and every family in
+# the competitive field is open-loop.  An autoscaling sawtooth, a rate-limit
+# plateau, a queue backlog, a deploy overshoot-and-settle and a counter reset are
+# all closed-loop artefacts.  A model trained only on open-loop processes treats a
+# sawtooth as a staircase plus noise and cannot anticipate the next scale-out.
+
+
+def _daily_phase(rng, n, L, p_day, min_res=3.0):
+    t = time_grid(L)[None, :]
+    pd = np.asarray(p_day).reshape(n, 1)
+    has = pd >= min_res
+    return np.where(has, t / np.where(has, pd, 1e9), 0.0) + rng.random((n, 1)), has
