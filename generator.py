@@ -7393,3 +7393,122 @@ def _overdispersed_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarra
     shape = rng.uniform(2.0, 12.0, size=(n, 1))
     rate = rng.gamma(shape, mean / shape)
     return rng.poisson(np.maximum(rate, 0.01)).astype(np.float64)
+
+
+# --- transplanted from cascade-private_jenn1_c0e187a7 -------------------------------
+# _reported_epi_counts plus 0 dependency/dependencies it needs that this tree lacked.
+# Inert at weight 0.0 (proved by an unchanged corpus digest).
+
+
+def _reported_epi_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Daily epidemic-surveillance count panels with reporting artifacts.
+
+    Fitted to the 08-09 pool's largest healthcare block (60/147 series, 41%):
+    the rki hospitalization panel (25+2), nys covid testing panel (25), ukhsa
+    (4) and cdc nssp (3) daily feeds. Measured on 12 sampled members:
+    ACF1 0.99, ACF@7 0.92, Hurst 0.98, var/mean median 45, declining window
+    trend (median -0.67 sd), hold-frac 0.32 (published values repeat over
+    reporting pauses), and zero-frac 0.28-0.43 on the many small-count panel
+    members (medians 1-3). The existing epi_decay family misses all three
+    reporting behaviours (its measured hold 0.04, zero-frac 0.02, ACF1 0.70):
+    it has the right decay skeleton but none of the surveillance-pipeline
+    texture that dominates these panels' short-horizon predictability.
+
+    Construction: NB counts (Gamma-Poisson) whose log-level is a slow AR(1)
+    (phi 0.995-0.9999) plus a mild deterministic epidemic-decay slope, times
+    a hard day-of-week factor with a weekend dip; then two explicit reporting
+    artifacts -- repeat-last-published-value runs on ~35% of rows, and
+    weekend-zero-with-Monday-catch-up on half of the small-count rows (the
+    catch-up conserves the weekend mass, as real Monday data dumps do).
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+
+    base = np.exp(rng.uniform(np.log(1.0), np.log(3000.0), size=(n, 1)))
+    phi = rng.uniform(0.995, 0.9999, size=(n, 1))
+    innov_sd = rng.uniform(0.02, 0.08, size=(n, 1))
+    walk = _ar1_batch(rng.normal(0.0, 1.0, size=(n, L)) * innov_sd, phi)
+    slope = rng.uniform(-0.002, 0.0005, size=(n, 1))
+    t = np.arange(L, dtype=np.float64)[None, :]
+    log_rate = np.log(base) + walk + slope * t
+
+    phase = rng.integers(0, 7, size=(n, 1))
+    dow = (np.arange(L)[None, :] + phase) % 7
+    weekend = dow >= 5
+    weekend_dip = rng.uniform(0.2, 0.6, size=(n, 1))
+    rate = np.exp(np.minimum(log_rate, 20.0)) * np.where(weekend, weekend_dip, 1.0)
+    rate = np.minimum(rate, 1.0e7)
+
+    # Gamma-Poisson mixture == negative binomial. Per-step dispersion is kept
+    # SMALL (near-Poisson): the measured window-level var/mean 5-200 on real
+    # panels comes from the slow level walk + epidemic trend, not from
+    # per-step noise -- large per-step dispersion would destroy the measured
+    # ACF1 0.99 persistence that dominates short-horizon predictability.
+    disp = np.exp(rng.uniform(np.log(0.002), np.log(0.08), size=(n, 1)))
+    lam = rng.gamma(1.0 / disp, rate * disp)
+    counts = rng.poisson(np.minimum(lam, 1.0e7)).astype(np.float64)
+
+    # ~55% of panels publish a 7-day rolling SUM, not raw dailies (the rki
+    # hospitalization panel -- the pool's largest single healthcare source --
+    # is 7-day incidence by construction). Adjacent rolling sums share 6/7 of
+    # their terms, which is what pushes real measured ACF1 to ~0.99 and
+    # suppresses the day-of-week cycle on exactly those members.
+    roll_rows = rng.random((n, 1)) < 0.55
+    csum = np.cumsum(counts, axis=1)
+    rolled = counts.copy()
+    rolled[:, 7:] = csum[:, 7:] - csum[:, :-7]
+    rolled[:, :7] = csum[:, :7]
+    counts = np.where(roll_rows, rolled, counts)
+
+    # Reporting stickiness: ~35% of panels republish the last value for a
+    # step (holiday pauses, batch uploads) -- forward-fill under a per-row
+    # hold probability tuned to the measured hold-frac 0.25-0.45 band.
+    hold_rows = rng.random((n, 1)) < 0.35
+    hold_p = rng.uniform(0.25, 0.45, size=(n, 1))
+    hold_mask = np.logical_and(rng.random((n, L)) < hold_p, hold_rows)
+    hold_mask[:, 0] = False
+    tidx = np.broadcast_to(np.arange(L)[None, :], (n, L))
+    src_idx = np.maximum.accumulate(np.where(hold_mask, 0, tidx), axis=1)
+    counts = np.take_along_axis(counts, src_idx, axis=1)
+
+    # Weekend-zero + Monday catch-up on small-count DAILY rows: Sat/Sun report
+    # 0, Monday reports Sat+Sun+Mon (mass-conserving, like real weekend
+    # dumps). Rolled rows are excluded -- a 7-day sum has no weekend zeros.
+    wz_rows = np.logical_and(
+        np.logical_and(base < 50.0, np.logical_not(roll_rows)),
+        rng.random((n, 1)) < 0.5,
+    )
+    catchup = np.zeros_like(counts)
+    catchup[:, 2:] += np.where(dow[:, :-2] == 5, counts[:, :-2], 0.0)
+    catchup[:, 1:] += np.where(dow[:, :-1] == 6, counts[:, :-1], 0.0)
+    counts = np.where(np.logical_and(wz_rows, weekend), 0.0, counts)
+    counts = counts + np.where(np.logical_and(wz_rows, dow == 0), catchup, 0.0)
+    return counts
+
+
+def _retail_promo_tail(rng: np.random.Generator, n: int, length: int) -> np.ndarray:
+    """Intermittent sales with weekly seasonality, promotion lift and stock-outs."""
+    out = np.empty((n, length), dtype=np.float64)
+    t = np.arange(length, dtype=np.float64)
+    for row in range(n):
+        period = int(rng.choice([7, 24, 48, 168, 336]))
+        base = rng.uniform(.2, 400.0)
+        seasonal = np.exp(rng.uniform(.08, .55) * np.sin(2*np.pi*t/period + rng.uniform(0, 2*np.pi)))
+        trend = np.exp(rng.uniform(-2.5e-4, 2.5e-4) * t)
+        rate = base * seasonal * trend
+        starts = rng.random(length) < rng.uniform(1.0, 5.0) / length
+        lift = np.ones(length)
+        for start in np.flatnonzero(starts):
+            run = int(rng.integers(2, max(3, min(period, 64))))
+            lift[start:start + run] *= rng.uniform(1.3, 4.5)
+        rate *= lift
+        if rng.random() < .7:
+            zero_prob = rng.uniform(.02, .45) * np.exp(-rate / max(base, 1e-9))
+            rate = np.where(rng.random(length) < zero_prob, 0.0, rate)
+        sales = rng.poisson(np.maximum(rate, 0.0)).astype(np.float64)
+        for _ in range(int(rng.poisson(1.5))):
+            start = int(rng.integers(0, length))
+            run = int(rng.integers(2, max(3, min(period, 48))))
+            sales[start:start + run] = np.minimum(sales[start:start + run], rng.integers(0, 3))
+        out[row] = sales
+    return out
