@@ -3268,3 +3268,74 @@ def c3_build(P, rng, L, cad, cal, cfg):
 
     fl = new_flags(n, scale_mode=0, quant_boost=0.8)
     return y, fl
+
+
+# ═══════════════════ C4 clinical_bounded_vitals ════════════════════════════
+
+VITAL_RANGES = np.array([
+    [70.0, 100.0],    # SpO2
+    [35.0, 190.0],    # heart rate
+    [34.5, 41.5],     # core temperature
+    [50.0, 200.0],    # blood pressure
+])
+
+
+def c4_params(rng, B, cfg):
+    p = cfg["families"]["clinical_bounded_vitals"]
+    idx = categorical(rng, p["range_mix"], B)
+    return {
+        "range_idx": idx,
+        "lo": VITAL_RANGES[idx, 0],
+        "hi": VITAL_RANGES[idx, 1],
+        "tau": logu(rng, 60.0, 2000.0, B),
+        "bias": rng.uniform(p["ceiling_bias"][0], p["ceiling_bias"][1], B),
+        "spread": logu(rng, 0.3, 3.0, B),
+        "ev_tau": logu(rng, p["excursion_tau"][0], p["excursion_tau"][1], B),
+        "fall": logu(rng, 1.0, 8.0, B),
+        "recover": logu(rng, 6.0, 80.0, B),
+        "depth": logu(rng, 0.02, 0.5, B),
+        "tick": np.where(rng.random(B) < 0.6, 1.0, 0.1),
+        "noise": logu(rng, 1e-3, 0.03, B),
+    }
+
+
+def c4_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    lo = P["lo"].reshape(n, 1)
+    hi = P["hi"].reshape(n, 1)
+    span = hi - lo
+
+    slow = ou(rng, n, L, P["tau"]) * P["spread"].reshape(n, 1) \
+        + P["bias"].reshape(n, 1)
+    base = lo + span * np.clip(1.0 / (1.0 + np.exp(-np.clip(slow, -30.0, 30.0))), 0.0, 1.0)
+
+    # asymmetric excursions: fast fall, slow recovery.  A symmetric predictive
+    # distribution cannot represent this, and the ceiling pinning makes the
+    # lag-m MASE denominator tiny, so a missed desaturation is catastrophic.
+    E = 8
+    cnt = rng.random((n, E)) < (L / (P["ev_tau"].reshape(n, 1) * E))
+    pos = rng.integers(0, L, size=(n, E)).astype(np.float64)
+    exc = np.zeros((n, L))
+    for j in range(E):
+        idx = np.nonzero(cnt[:, j])[0]
+        if idx.size == 0:
+            continue
+        p0 = pos[idx, j:j + 1]
+        dt = np.maximum(t - p0, 0.0)
+        tr = P["recover"][idx].reshape(-1, 1)
+        tf = np.minimum(P["fall"][idx].reshape(-1, 1), tr * 0.9)
+        shape = np.exp(-dt / tr) - np.exp(-dt / tf)
+        shape = shape / np.maximum(shape.max(axis=1, keepdims=True), 1e-9)
+        exc[idx] -= np.where(t >= p0,
+                             P["depth"][idx].reshape(-1, 1) * span[idx] * shape, 0.0)
+
+    y = base + exc + rng.standard_normal((n, L)) * P["noise"].reshape(n, 1) * span
+    y = np.clip(y, lo, hi)
+    tick = P["tick"].reshape(n, 1)
+    y = np.round(y / tick) * tick
+
+    fl = new_flags(n, scale_mode=2, bounded=True, positive=True,
+                   quant_boost=0.0, obs_boost=0.4, allow_agg=False)
+    fl["integer"] = (P["tick"] == 1.0)
+    return y, fl
