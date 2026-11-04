@@ -5644,3 +5644,36 @@ def family_allowed_in_domain(family_name: str, domain: str) -> bool:
     if tagged is not None:
         return tagged == domain
     return family_name in GENERAL_FAMILIES
+
+# ==============================================================================
+# Seasonal period tables
+# ==============================================================================
+
+
+_CHUNK = 2048
+
+
+_STARTUP_CHUNK = 256
+_RAMP_CHUNK = 1024
+
+
+_SEASONAL_PERIODS = np.array(
+    [4, 7, 12, 15, 24, 30, 48, 52, 60, 90, 96, 144, 168, 183, 240, 288,
+     336, 365, 672, 730],
+    dtype=np.float64,
+)
+_SEASONAL_PROBS = np.array(
+    [0.01, 0.23, 0.02, 0.02, 0.07, 0.01, 0.06, 0.01, 0.08, 0.01,
+     0.14, 0.07, 0.04, 0.01, 0.08, 0.08, 0.02, 0.02, 0.01, 0.01],
+    dtype=np.float64,
+)
+_SEASONAL_PROBS /= _SEASONAL_PROBS.sum()
+_SEASONAL_PROBS_CDF = _SEASONAL_PROBS.cumsum()
+_SEASONAL_PROBS_CDF /= _SEASONAL_PROBS_CDF[-1]
+
+
+_SEASONAL_PAIRS = np.array(
+    [[15, 60], [60, 240], [24, 168], [48, 336], [96, 672], [7, 365],
+     [12, 52]],
+    dtype=np.float64,
+)
