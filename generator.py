@@ -3018,3 +3018,22 @@ def _cas1_workload_response(P, rho, obs, parent, rng):
 
 
 _CAS1_WORKLOAD_ENABLED = True
+
+
+# ═══════════════ chronoforge: cf_fam_health ═══════════════
+# Block C — healthcare / epidemiological / administrative families.
+#
+# Healthcare is the worst domain for the incumbent field.  The failure is almost
+# certainly *reporting structure*, not dynamics: public-health and hospital-admin
+# feeds carry weekend factors of 0.2-0.9x, Monday catch-up spikes of 1.3-2.4x,
+# batched multi-day releases with exact zeros in between, systematic revisions of
+# the most recent points, holiday collapses with compensation, and genuinely
+# under-dispersed counts.  A +-0.12 additive log day-of-week offset — which is
+# what the field ships — is an order of magnitude too weak.
+#
+# C1 adds the dynamics half: a real renewal equation, so the 64-step forecast
+# depends on whether R_t has crossed 1.  That is the actual forecasting question
+# for those feeds and it is not representable by a piecewise-linear log trend.
+
+
+MAX_TAPS = 64
