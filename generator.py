@@ -3677,3 +3677,27 @@ def d3_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=0, quant_boost=0.7)
     fl["offset_pref"] = np.where(P["obs_ratio"] < 0.02, 1, 0).astype(np.int8)
     return y, fl
+
+
+# ═══════════════ chronoforge: cf_fam_stoch ═══════════════
+# Block E — the stochastic backbone.
+#
+# Four things here have no analogue anywhere in the competitive field:
+#
+# * **moving-average and seasonal-differenced structure** (E1).  The field's whole
+#   linear vocabulary is AR(1)/AR(2)/threshold-AR.  MA terms and ``(1 - B^m)``
+#   differencing change the 64-step conditional-mean path and the error-variance
+#   profile in ways no pure-AR family can express, and via the batched ARMA kernel
+#   they cost the same as AR(2).
+# * **true conditional heteroscedasticity with leverage** (E2).  CRPS is a
+#   distributional score, so the largest relative gains come from conditioning
+#   interval *width* on the recent context.
+# * **self-exciting clustered arrivals with a power-law kernel** (E3), including
+#   genuine long-memory clustering built from four exponentials.
+# * **spectral-mixture kernels** (E5), which give quasi-periodic structure at
+#   non-integer, mutually incommensurate periods — a direct attack on the
+#   field-wide fixed integer period grid, at O(L log L).
+
+
+MAX_SEASONAL_M = 48
+MAX_ORDER = 3 + 2 * MAX_SEASONAL_M
