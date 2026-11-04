@@ -18697,3 +18697,303 @@ def _t2_logpois_kernel(lr, lvl, u, out):
         for t in range(L):
             out[i, t] = _t2_pois1(math.exp(min(lvl[i] + lr[i, t], 40.0)), u[i, t])
     return out
+
+
+@njit(cache=False, nogil=True)
+def _t2_counter_kernel(lr, lvl, u, q, x0, rwsd, out):
+    """Cumulative counter: increments Poisson(exp(lvl + lr)) (or, where rwsd > 0, a
+    drifting signed walk), accumulated and published on a q-quantum; out may alias lr."""
+    n, L = lr.shape
+    for i in range(n):
+        c = 0.0
+        for t in range(L):
+            lam = math.exp(min(lvl[i] + lr[i, t], 40.0))
+            if rwsd[i] > 0.0:
+                uu = min(max(u[i, t], 1e-12), 1.0 - 1e-12)
+                inc = math.floor(0.2 * lam + rwsd[i] * 0.5513 * math.log(uu / (1.0 - uu)) + 0.5)
+            else:
+                inc = _t2_pois1(lam, u[i, t])
+            c += inc
+            out[i, t] = x0[i] + q[i] * math.floor(c / q[i])
+    return out
+
+
+@njit(cache=False, nogil=True)
+def _t2_level_kernel(lr, lvl, trend, s_pos, s_tau, s_mag, out):
+    """Integer level exp(lvl + lr + trend t + decaying surge); out may alias lr."""
+    n, L = lr.shape
+    for i in range(n):
+        for t in range(L):
+            v = lvl[i] + lr[i, t] + trend[i] * t
+            if t >= s_pos[i]:
+                v += s_mag[i] * math.exp(-(t - s_pos[i]) / s_tau[i])
+            out[i, t] = math.floor(math.exp(v) + 0.5)
+    return out
+
+
+def _t2_day_values(rng, n, D, sd, phi, we_lo, we_hi, p_we=1.0):
+    """(n, D) log day-level values: weekday profile with a weekend factor + day AR."""
+    wk = rng.normal(0.0, 1.0, size=(n, 7)) * rng.uniform(0.0, 0.05, size=(n, 1))
+    on = rng.random(n) < p_we
+    for d in (5, 6):
+        wk[:, d] += np.where(on, np.log(rng.uniform(we_lo, we_hi, size=n)), 0.0)
+    d0 = rng.integers(0, 7, size=(n, 1))
+    wkd = np.take_along_axis(wk, (np.arange(D)[None, :] + d0) % 7, axis=1)
+    return np.ascontiguousarray(wkd + _t2_ar1_small(rng.standard_normal((n, D)), phi) * sd[:, None])
+
+
+def _t2_web_cum(rng, m, L):
+    """Cumulative pull / item counters with bursty day-level rates; 20% signed-walk
+    table sizes (potaroo-like, non-monotone)."""
+    P = rng.choice(np.array([48.0, 24.0, 1440.0]), size=m, p=[0.6, 0.25, 0.15])
+    D = int(L / 24.0) + 4
+    dv = _t2_day_values(rng, m, D, rng.uniform(0.1, 0.9, size=m), rng.uniform(0.3, 0.9, size=m), 0.3, 1.0, 0.7)
+    prof = _t2_prof(rng, m, 2, 1.0, 0.5)
+    lr = rng.standard_normal((m, L))
+    _t2_rate_kernel(P, rng.uniform(0.0, 1.0, size=m), prof, rng.uniform(0.0, 0.6, size=m), dv, lr,
+                    rng.uniform(0.0, 0.9, size=m), rng.uniform(0.05, 0.5, size=m), lr)
+    # pull bursts (CI fan-outs): short multiplicative spikes of the rate
+    ptr, row = _t2_events(rng, m, rng.uniform(0.0, 4.0, size=m) * L / P)
+    ne = row.size
+    _t2_burst_kernel(lr, ptr, rng.integers(0, L, size=ne).astype(np.int64), rng.uniform(0.5, 4.0, size=ne),
+                     np.log(rng.uniform(1.5, 8.0, size=ne)))
+    lvl = rng.uniform(math.log(0.05), math.log(3e4), size=m)
+    rw = rng.random(m) < 0.2
+    rwsd = np.where(rw, np.sqrt(np.exp(lvl)) * rng.uniform(2.0, 20.0, size=m), 0.0)
+    q = np.where(rng.random(m) < 0.1, 1024.0, np.where(rng.random(m) < 0.15, 2.0, 1.0))
+    q = np.where(np.exp(lvl) > 50.0 * q, q, 1.0)
+    x0 = np.floor(np.exp(rng.uniform(math.log(1e5), math.log(1e10), size=m)))
+    _t2_counter_kernel(lr, lvl, rng.random((m, L)), q, x0, rwsd, lr)
+    freq = np.where(P == 48.0, "30min", np.where(P == 24.0, "H", "min"))
+    return lr, freq
+
+
+def _t2_web_daily(rng, m, L):
+    """Daily package downloads: strong weekday cycle, growth, release spikes, a year-end
+    dip, and missing days published as 0 (more frequent near the live edge)."""
+    t = np.arange(L, dtype=np.float64)[None, :]
+    dv = _t2_day_values(rng, m, L, rng.uniform(0.02, 0.12, size=m), rng.uniform(0.5, 0.95, size=m), 0.2, 0.6)
+    lvl = rng.uniform(math.log(1e5), math.log(3e8), size=(m, 1))
+    growth = rng.uniform(0.0, 1.6, size=(m, 1)) / 365.0 * (t - L)
+    doy = (t + rng.uniform(0.0, 365.25, size=(m, 1))) % 365.25
+    hol = np.where(doy < rng.uniform(6.0, 14.0, size=(m, 1)), np.log(rng.uniform(0.35, 0.8, size=(m, 1))), 0.0)
+    spk = (rng.random((m, L)) < (1.0 / rng.uniform(20.0, 150.0, size=(m, 1)))) * rng.uniform(0.1, 1.2, size=(m, L))
+    spk = np.maximum(spk, np.roll(spk, 1, axis=1) * 0.4)
+    x = np.round(np.exp(lvl + growth + dv + hol + spk + 0.02 * rng.standard_normal((m, L))))
+    # missing days -> 0; hazard ramps up over the last K days; trailing zeros on some rows
+    base = np.where(rng.random((m, 1)) < 0.8, rng.uniform(0.002, 0.02, size=(m, 1)), 0.0)
+    K = rng.uniform(20.0, 80.0, size=(m, 1))
+    ramp = np.clip((t - (L - K)) / K, 0.0, 1.0) * np.where(rng.random((m, 1)) < 0.8, rng.uniform(0.15, 0.45, size=(m, 1)), 0.0)
+    miss = rng.random((m, L)) < (base + ramp)
+    tz = np.where(rng.random(m) < 0.8, rng.integers(1, 4, size=m), 0)
+    miss |= t >= (L - tz)[:, None]
+    x[miss] = 0.0
+    return x, np.full(m, "D")
+
+
+def _t2_web_players(rng, m, L):
+    """Concurrent players polled at an effective ~5.3-min step: daily cycle, weekend
+    lift, slow decline, launch surges, 8-22% stale repeats in runs <= 3."""
+    P = np.where(rng.random(m) < 0.85, rng.uniform(270.0, 277.0, size=m), rng.uniform(262.0, 292.0, size=m))
+    D = int(L / 260.0) + 4
+    dv = _t2_day_values(rng, m, D, rng.uniform(0.02, 0.08, size=m), rng.uniform(0.6, 0.97, size=m), 1.1, 1.5, 0.9)
+    prof = _t2_prof(rng, m, 3, 1.3, 0.6)
+    lr = rng.standard_normal((m, L))
+    _t2_rate_kernel(P, rng.uniform(0.0, 1.0, size=m), prof, np.exp(rng.normal(math.log(0.62), 0.3, size=m)), dv, lr,
+                    rng.uniform(0.3, 0.8, size=m), rng.uniform(0.006, 0.016, size=m), lr)
+    trend = rng.uniform(-0.5, 0.2, size=m) / (30.0 * P)
+    surge = rng.random(m) < 0.2
+    s_pos = np.where(surge, rng.integers(0, L, size=m), L + 1).astype(np.int64)
+    s_tau = rng.uniform(1.0, 6.0, size=m) * P
+    s_mag = np.where(surge, np.log(rng.uniform(1.2, 2.0, size=m)), 0.0)
+    ptr, row = _t2_events(rng, m, rng.uniform(0.0, 0.5, size=m) * L / P)
+    ne = row.size
+    _t2_burst_kernel(lr, ptr, rng.integers(0, L, size=ne).astype(np.int64), rng.uniform(0.5, 3.0, size=ne),
+                     np.log(rng.uniform(0.6, 0.95, size=ne)))
+    lvl = rng.uniform(math.log(2e3), math.log(3e5), size=m)
+    _t2_level_kernel(lr, lvl, trend, s_pos, s_tau, s_mag, lr)
+    _t2_stale_kernel(lr, rng.random((m, L)), rng.uniform(0.12, 0.24, size=m), 3)
+    return lr, np.full(m, "5min")
+
+
+def _t2_web_frac(rng, m, L):
+    """Adoption percentage: slow logistic growth, day-level noise, weekday wobble."""
+    t = np.arange(L, dtype=np.float64)[None, :]
+    Kc = rng.uniform(30.0, 95.0, size=(m, 1))
+    w = rng.uniform(200.0, 1500.0, size=(m, 1))
+    t0 = rng.uniform(-0.3, 1.2, size=(m, 1)) * L
+    base = Kc / (1.0 + np.exp(-(t - t0) / w)) + rng.uniform(0.0, 2.0, size=(m, 1))
+    wk = 1.0 + rng.uniform(-0.04, 0.04, size=(m, 1)) * ((t + rng.integers(0, 7, size=(m, 1))) % 7 >= 5)
+    slow = np.exp(_t2_ar1_small(rng.standard_normal((m, L)), rng.uniform(0.9, 0.995, size=m))
+                  * rng.uniform(0.01, 0.06, size=(m, 1)))
+    # methodology / panel changes: 0-3 level steps of +-3-15%
+    stp = np.exp(np.cumsum((rng.random((m, L)) < rng.uniform(0.0, 0.75, size=(m, 1)) / L)
+                           * rng.normal(0.0, 0.08, size=(m, L)), axis=1))
+    noise = rng.standard_t(3.0, size=(m, L)) * (rng.uniform(0.005, 0.03, size=(m, 1)) * base)
+    x = base * wk * slow * stp + noise
+    # bad measurement days: drops toward 0 or spikes
+    bad = rng.random((m, L)) < rng.uniform(0.0, 0.012, size=(m, 1))
+    x = np.where(bad, x * np.where(rng.random((m, L)) < 0.5, rng.uniform(0.0, 0.3, size=(m, L)),
+                                   rng.uniform(1.2, 1.8, size=(m, L))), x)
+    return np.round(np.maximum(x, 0.0), 4), np.full(m, "D")
+
+
+_T2_WEB_MODES = (_t2_web_cum, _t2_web_daily, _t2_web_players, _t2_web_frac)
+_T2_WEB_P = np.array([0.50, 0.18, 0.26, 0.06])
+# (share at a source-like length, lo, hi) per mode
+_T2_WEB_LEN = ((0.6, 4096.0, 4500.0), (0.75, 450.0, 800.0), (0.6, 4096.0, 4500.0), (0.6, 4096.0, 4500.0))
+
+
+def _t2_web_core(rng, n, L):
+    mode = rng.choice(len(_T2_WEB_MODES), size=n, p=_T2_WEB_P)
+    x = np.empty((n, L))
+    freq = np.empty(n, dtype=object)
+    S = np.empty(n)
+    for k, fn in enumerate(_T2_WEB_MODES):
+        idx = np.flatnonzero(mode == k)
+        if idx.size:
+            x[idx], freq[idx] = fn(rng, idx.size, L)
+            p, lo, hi = _T2_WEB_LEN[k]
+            S[idx] = _t2_len(rng, idx.size, L, p, lo, hi)
+    S = np.clip(S, 64, L).astype(np.int64)
+    _t2_pad_inplace(x, S)
+    return _t2_fix_const(rng, x, S, 1.0), {"freq": freq, "mode": mode, "S": S}
+
+
+def _t2_web_counter(rng, n, L):
+    return _t2_web_core(rng, n, L)[0]
+
+
+# --------------------------------------------------------------------------- #
+# 4. seasonal onset in a short daily %-of-visits record (RSV-like)
+# --------------------------------------------------------------------------- #
+@njit(cache=False, nogil=True)
+def _t2_season_kernel(cen, peak, wl, wr, flat, trough, noise, ph, we_pct, we_vis, visits, u, S, out):
+    """Day t of the record (t = 0 .. S-1, right-aligned in out): pct = trough + sum of
+    asymmetric Gaussian season bumps (flat-topped), times AR noise and a weekend factor;
+    numerator Poisson over the day's visit count; published % on a 0.01 lattice."""
+    n, L = out.shape
+    K = cen.shape[1]
+    for i in range(n):
+        s = S[i]
+        st = L - s
+        for t in range(s):
+            pct = trough[i]
+            for k in range(K):
+                d = t - cen[i, k]
+                if d > 0.0:
+                    d = max(d - flat[i, k], 0.0)
+                    w = wr[i, k]
+                else:
+                    w = wl[i, k]
+                x = d / w
+                if x * x < 80.0:
+                    pct += peak[i, k] * math.exp(-0.5 * x * x)
+            pct *= math.exp(noise[i, t])
+            vis = visits[i]
+            if (t + ph[i]) % 7 >= 5:
+                pct *= we_pct[i]
+                vis = math.floor(vis * we_vis[i] + 0.5)
+            lam = min(pct, 60.0) / 100.0 * vis
+            num = _t2_pois1(lam, u[i, t])
+            out[i, st + t] = math.floor(num / max(vis, 1.0) * 1e4 + 0.5) / 100.0
+        v = out[i, st]
+        for t in range(st):
+            out[i, t] = v
+    return out
+
+
+def _t2_season_core(rng, n, L):
+    S = np.where(rng.random(n) < 0.75, rng.uniform(420.0, 720.0, size=n), rng.uniform(720.0, 1500.0, size=n))
+    S = np.where(rng.random(n) < 0.15, _t2_eval_len(rng, n, 300.0), S)
+    S = np.clip(S, 64, L).astype(np.int64)
+    W = int(S.max())
+    K = int(W / 365.25) + 3
+    # season centres on the record's own day axis; the record starts anywhere in the year
+    c0 = rng.uniform(-365.25, 0.0, size=(n, 1))
+    cen = c0 + 365.25 * np.arange(K)[None, :] + rng.normal(0.0, 15.0, size=(n, K))
+    trough = np.exp(rng.uniform(math.log(0.002), math.log(0.04), size=n))
+    peak = np.exp(rng.uniform(math.log(0.2), math.log(2.0), size=(n, 1)) + rng.normal(0.0, 0.35, size=(n, K)))
+    wl = rng.uniform(18.0, 38.0, size=(n, K))
+    wr = rng.uniform(12.0, 30.0, size=(n, K))
+    flat = rng.uniform(15.0, 75.0, size=(n, K))
+    noise = _t2_ar1_small(rng.standard_normal((n, W)), rng.uniform(0.5, 0.9, size=n)) * rng.uniform(0.05, 0.2, size=(n, 1))
+    visits = np.round(np.exp(rng.uniform(math.log(800.0), math.log(4e4), size=n)))
+    out = _t2_season_kernel(cen, peak, wl, wr, flat, trough, noise, rng.integers(0, 7, size=n),
+                            rng.uniform(0.9, 1.2, size=n), rng.uniform(0.75, 1.0, size=n), visits,
+                            rng.random((n, W)), S, np.empty((n, L)))
+    out = _t2_fix_const(rng, out, S, 0.01)
+    mid = cen + 0.5 * flat
+    last_c = np.where(mid <= S[:, None], mid, -np.inf).max(axis=1)
+    return out, {"freq": np.full(n, "D"), "S": S, "peak_from_end": S - last_c}
+
+
+def _t2_season_onset(rng, n, L):
+    return _t2_season_core(rng, n, L)[0]
+
+
+# --------------------------------------------------------------------------- #
+# 5. zero-heavy hourly counts (notes) and small hourly active-user counts
+# --------------------------------------------------------------------------- #
+def _t2_sparse_core(rng, n, L):
+    users = rng.random(n) < 0.35
+    P = np.full(n, 24.0)
+    D = int(L / 24.0) + 4
+    dsd = np.where(users, rng.uniform(0.03, 0.15, size=n), rng.uniform(0.15, 0.6, size=n))
+    dv = _t2_day_values(rng, n, D, dsd, rng.uniform(0.3, 0.9, size=n), 0.8, 1.15)
+    prof = _t2_prof(rng, n, 3, 1.1, 0.6)
+    g = np.arange(_T2_G)[None, :] / _T2_G
+    dip = -np.exp(-0.5 * ((g - 0.5) / rng.uniform(0.07, 0.18, size=(n, 1))) ** 2) + 0.3 * prof
+    dip -= dip.mean(axis=1, keepdims=True)
+    dip /= np.ptp(dip, axis=1, keepdims=True)
+    prof = np.where((users & (rng.random(n) < 0.7))[:, None], dip, prof)
+    amp = np.where(users, rng.uniform(1.4, 2.8, size=n), rng.uniform(1.0, 3.4, size=n))
+    arsd = np.where(users, rng.uniform(0.02, 0.08, size=n), rng.uniform(0.2, 0.8, size=n))
+    arphi = np.where(users, rng.uniform(0.3, 0.8, size=n), rng.uniform(0.0, 0.6, size=n))
+    lr = rng.standard_normal((n, L))
+    _t2_rate_kernel(P, rng.uniform(0.0, 1.0, size=n), prof, amp, dv, lr, arphi, arsd, lr)
+    lvl = np.where(users, rng.uniform(math.log(3.0), math.log(80.0), size=n),
+                   rng.uniform(math.log(0.4), math.log(15.0), size=n))
+    # slow decline of most instances over the record
+    lr += (rng.uniform(-0.4, 0.15, size=n) / L)[:, None] * np.arange(L)[None, :]
+    # reply storms on the notes feeds: short multiplicative bursts in the log-rate
+    ptr, row = _t2_events(rng, n, np.where(users, 0.0, L / rng.uniform(48.0, 400.0, size=n)))
+    ne = row.size
+    _t2_burst_kernel(lr, ptr, rng.integers(0, L, size=ne).astype(np.int64), rng.uniform(1.0, 10.0, size=ne),
+                     np.log(rng.uniform(1.5, 8.0, size=ne)))
+    _t2_logpois_kernel(lr, lvl, rng.random((n, L)), lr)
+    S = np.clip(_t2_len(rng, n, L, 0.7, 1400.0, 1700.0), 64, L).astype(np.int64)
+    _t2_pad_inplace(lr, S)
+    return _t2_fix_const(rng, lr, S, 1.0), {"freq": np.full(n, "H"), "mode": users.astype(np.int64), "S": S}
+
+
+def _t2_sparse_counts(rng, n, L):
+    return _t2_sparse_core(rng, n, L)[0]
+
+
+_TEACH2_FAMILIES = (
+    ("ixp_traffic", _t2_ixp_traffic),
+    ("signed_flow", _t2_signed_flow),
+    ("web_counter", _t2_web_counter),
+    ("season_onset", _t2_season_onset),
+    ("sparse_counts", _t2_sparse_counts),
+)
+# row shares within the teach2 block (renormalised by the caller)
+_TEACH2_MIX = {"ixp_traffic": 0.30, "signed_flow": 0.22, "web_counter": 0.24, "season_onset": 0.10,
+               "sparse_counts": 0.14}
+# suggested merged teaching-stream mix over teach.py's _TEACH_FAMILIES + _TEACH2_FAMILIES
+# (names do not collide): teach.py's main mix scaled to 0.63 with the overlapping ixp_cycle /
+# cum_counter / pct_feed trimmed and the healthcare families kept, teach2 at 0.37. It changes
+# only the partner content, not the partner dose Q.
+_TEACH2_MIX_MERGED = {"covid_waves": 0.20, "pct_feed": 0.08, "ixp_cycle": 0.04, "profile_cycle": 0.07,
+                      "tide_level": 0.04, "rain_burst": 0.02, "hydro_stage": 0.03, "cum_counter": 0.03,
+                      "generic_dyn": 0.06, "stair_hold": 0.06,
+                      "ixp_traffic": 0.11, "signed_flow": 0.08, "web_counter": 0.09, "season_onset": 0.04,
+                      "sparse_counts": 0.05}
+
+_TEACH_FAMILIES = _TEACH2_FAMILIES
+_TEACH_MIX = _TEACH2_MIX
+_teach_batch.__defaults__ = (4096, _TEACH_FAMILIES, None)
+
+# SeedSequence tag of that per-row decision.
+_Q = 0.296
