@@ -14670,3 +14670,222 @@ def _pt_gaussian_lowpass_noise(rng, n, sigma_steps):
     y -= y.mean()
     s = y.std()
     return y / s if s > 1e-12 else y
+
+class _pt_DayClock:
+    __slots__ = ('P', 'tod', 'day', 'dow', 'nd', 'dayf')
+
+    def __init__(self, rng, n, P):
+        start_offset = float(rng.integers(0, P))
+        tt = np.arange(n, dtype=np.float64) + start_offset
+        self.P = P
+        self.dayf = tt / P
+        self.day = np.floor(self.dayf)
+        self.tod = self.dayf - self.day
+        self.dow = (self.day + float(rng.integers(0, 7))) % 7.0
+        self.nd = int(self.day[-1]) + 2
+
+    def interp_daily(self, daily_values):
+        return np.interp(self.dayf - 0.5, np.arange(daily_values.size, dtype=np.float64), daily_values)
+
+def _pt_time_of_day_bump(tod, center, width):
+    d = tod - center
+    d -= np.round(d)
+    return np.exp(-0.5 * (d / width) ** 2)
+
+def _pt_daily_ar1_log_level(rng, nd, phi, sigma):
+    z = rng.standard_normal(nd) * sigma * np.sqrt(1.0 - phi * phi)
+    z[0] = rng.standard_normal() * sigma
+    return lfilter([1.0], [1.0, -phi], z)
+
+def _pt_pick_steps_per_day(rng):
+    return int(_pt_pick_by_cumulative_prob(rng, (96, 48, 24, 288, 144), (0.52, 0.2, 0.14, 0.09, 0.05)))
+
+def _pt_grid_net_load(rng, n):
+    P = int(_pt_pick_by_cumulative_prob(rng, (96, 48, 24), (0.72, 0.12, 0.16)))
+    ck = _pt_DayClock(rng, n, P)
+    grid_mix = _pt_pick_by_cumulative_prob(rng, ('solar', 'hydro', 'thermal'), (0.5, 0.28, 0.22))
+    if grid_mix == 'solar':
+        L0 = _pt_energy_log_uniform(rng, 60.0, 170.0)
+        level_sigma, level_phi = (rng.uniform(0.08, 0.25), rng.uniform(0.3, 0.75))
+        morning_amp, evening_amp, night_dip_amp = (rng.uniform(0.2, 0.6), rng.uniform(0.45, 1.1), rng.uniform(0.05, 0.25))
+        solar_amp = rng.uniform(0.5, 1.5)
+        wk = (rng.uniform(0.8, 0.95), rng.uniform(0.6, 0.85))
+    elif grid_mix == 'hydro':
+        L0 = _pt_energy_log_uniform(rng, 12.0, 70.0)
+        level_sigma, level_phi = (rng.uniform(0.5, 1.1), rng.uniform(0.45, 0.85))
+        morning_amp, evening_amp, night_dip_amp = (rng.uniform(0.2, 0.7), rng.uniform(0.2, 0.7), rng.uniform(0.1, 0.35))
+        solar_amp = rng.uniform(0.0, 0.45)
+        wk = (rng.uniform(0.85, 1.0), rng.uniform(0.7, 0.95))
+    else:
+        L0 = _pt_energy_log_uniform(rng, 90.0, 210.0)
+        level_sigma, level_phi = (rng.uniform(0.07, 0.18), rng.uniform(0.4, 0.8))
+        morning_amp, evening_amp, night_dip_amp = (rng.uniform(0.05, 0.2), rng.uniform(0.2, 0.45), rng.uniform(0.05, 0.15))
+        solar_amp = rng.uniform(0.1, 0.4)
+        wk = (rng.uniform(0.88, 0.98), rng.uniform(0.75, 0.92))
+    lv = _pt_daily_ar1_log_level(rng, ck.nd, level_phi, level_sigma)
+    if rng.random() < 0.35:
+        k = int(rng.integers(1, ck.nd))
+        lv[k:] += rng.normal(0.0, 0.5 * level_sigma + 0.1)
+    weekday_factor = np.ones(7)
+    weekday_factor[5], weekday_factor[6] = wk
+    daily_level = np.exp(lv - 0.5 * level_sigma * level_sigma)
+    D = ck.interp_daily(daily_level) * weekday_factor[ck.dow.astype(np.intp)]
+    morning_peak_tod = rng.uniform(6.5, 9.0) / 24.0
+    evening_peak_tod = rng.uniform(18.0, 21.0) / 24.0
+    solar_noon_tod = rng.uniform(12.0, 14.0) / 24.0
+    tod = ck.tod
+    shape = 1.0 + morning_amp * _pt_time_of_day_bump(tod, morning_peak_tod, rng.uniform(1.0, 2.2) / 24.0) + evening_amp * ck.interp_daily(np.exp(rng.normal(0.0, rng.uniform(0.1, 0.45), ck.nd))) * _pt_time_of_day_bump(tod, evening_peak_tod, rng.uniform(1.2, 2.5) / 24.0) - night_dip_amp * _pt_time_of_day_bump(tod, rng.uniform(2.0, 4.5) / 24.0, rng.uniform(1.5, 3.0) / 24.0)
+    daily_clear_sky = rng.beta(rng.uniform(1.0, 3.0), rng.uniform(0.8, 2.0), ck.nd)
+    clear_sky = ck.interp_daily(daily_clear_sky)
+    solar_gen = solar_amp * clear_sky * _pt_time_of_day_bump(tod, solar_noon_tod, rng.uniform(1.5, 2.8) / 24.0) ** rng.uniform(0.7, 1.5)
+    solar_gen *= 1.0 + 0.4 * (ck.dow >= 5)
+    demand = D * shape
+    net_load = L0 * (demand - solar_gen)
+    if rng.random() < 0.35:
+        peak_threshold = float(np.partition(demand, int(0.97 * (n - 1)))[int(0.97 * (n - 1))]) * rng.uniform(0.95, 1.1)
+        ex = np.maximum(demand - peak_threshold, 0.0) / max(peak_threshold, 1e-09)
+        net_load += L0 * rng.uniform(0.2, 1.2) * np.expm1(rng.uniform(1.5, 5.0) * np.minimum(ex, 0.6))
+    q = P // 24
+    nh = n // q + 2
+    hourly_phi = rng.uniform(0.75, 0.95)
+    hz = _pt_ar1_recursive_filter(rng.standard_normal(nh), hourly_phi) * np.sqrt(1.0 - hourly_phi * hourly_phi)
+    hourly_noise = hz[(np.arange(n) + int(rng.integers(0, q))) // q]
+    wn = rng.standard_t(rng.uniform(3.0, 6.0), n) if q > 1 else 0.0
+    net_shape = demand - solar_gen
+    g = np.abs(np.diff(net_shape, append=net_shape[-1]))
+    ramp_noise_scale = 0.25 + np.minimum(g / (g.mean() + 1e-12), 4.0)
+    net_load += L0 * (0.4 + 0.6 * D) * ramp_noise_scale * (rng.uniform(0.04, 0.12) * hourly_noise + rng.uniform(0.01, 0.035) * wn)
+    stale_mask = rng.random(n) < rng.uniform(0.0, 0.05)
+    stale_mask[0] = False
+    if stale_mask.any():
+        net_load = net_load[np.maximum.accumulate(np.where(stale_mask, 0, np.arange(n)))]
+    if rng.random() < 0.3:
+        floor = float(_pt_pick_by_cumulative_prob(rng, (0.0, 0.01, -0.01), (0.5, 0.3, 0.2)))
+        net_load = np.maximum(net_load, floor)
+    else:
+        sc = rng.uniform(3.0, 25.0)
+        negative_mask = net_load < 0.0
+        if negative_mask.any():
+            net_load[negative_mask] = -sc * (1.0 - np.exp(net_load[negative_mask] / sc))
+    if P == 96 and rng.random() < 0.15:
+        m4 = n // 4 * 4
+        hourly_means = net_load[:m4].reshape(-1, 4).mean(axis=1)
+        net_load[:m4] = np.repeat(hourly_means, 4)
+    round_mask = rng.random(n) < rng.uniform(0.01, 0.08)
+    net_load = np.where(round_mask, np.round(net_load), net_load)
+    return np.round(net_load, 2)
+
+def _pt_electricity_price(rng, n):
+    mode = _pt_pick_by_cumulative_prob(rng, ('rt', 'collapse'), (0.62, 0.38))
+    if _pt_ENERGY_FORCED_MODE is not None:
+        mode = _pt_ENERGY_FORCED_MODE
+    if mode == 'rt':
+        P = int(_pt_pick_by_cumulative_prob(rng, (288, 96, 24, 144), (0.6, 0.15, 0.15, 0.1)))
+        ck = _pt_DayClock(rng, n, P)
+        L = _pt_energy_log_uniform(rng, 18.0, 90.0)
+        slow_log_drift = _pt_gaussian_lowpass_noise(rng, n, rng.uniform(0.5, 2.0) * P) * rng.uniform(0.03, 0.12)
+        daily_profile = rng.uniform(0.1, 0.35) * _pt_time_of_day_bump(ck.tod, rng.uniform(0.25, 0.4), 0.08) + rng.uniform(0.05, 0.3) * _pt_time_of_day_bump(ck.tod, rng.uniform(0.62, 0.85), 0.1)
+        ar_phi = rng.uniform(0.97, 0.995) ** (288.0 / P)
+        ar_log_noise = _pt_ar1_recursive_filter(rng.standard_normal(n), ar_phi) * np.sqrt(1.0 - ar_phi * ar_phi) * rng.uniform(0.08, 0.2)
+        x = L * np.exp(slow_log_drift + daily_profile + ar_log_noise) * (1.0 + rng.uniform(0.003, 0.012) * rng.standard_normal(n))
+        hold_mask = rng.random(n) < rng.uniform(0.03, 0.12)
+        hold_mask[0] = False
+        x = x[np.maximum.accumulate(np.where(hold_mask, 0, np.arange(n)))]
+        spike_mask = rng.random(n) < rng.uniform(0.04, 0.12)
+        spikes = np.where(spike_mask, L * rng.exponential(rng.uniform(0.08, 0.3), n), 0.0)
+        spikes[1:] += spikes[:-1] * np.where(rng.random(n - 1) < 0.35, rng.uniform(0.3, 0.9), 0.0)
+        x = x + spikes * np.where(rng.random(n) < 0.08, -0.7, 1.0)
+        if rng.random() < 0.85:
+            m = int(rng.integers(3, 8))
+            at = int(rng.integers(0, max(1, n - m)))
+            burst = L * np.exp(rng.uniform(1.0, 3.0, m)) * (rng.random(m) < 0.7)
+            burst[int(rng.integers(0, m))] = L * rng.uniform(8.0, 30.0)
+            x[at:at + m] += burst[:n - at]
+        return np.round(x, 2)
+    P = int(_pt_pick_by_cumulative_prob(rng, (48, 24, 96), (0.6, 0.2, 0.2)))
+    ck = _pt_DayClock(rng, n, P)
+    floor = float(_pt_pick_by_cumulative_prob(rng, (0.0, 0.01, 0.02), (0.4, 0.3, 0.3)))
+    K = int(rng.integers(5, 13))
+    base_price = _pt_energy_log_uniform(rng, 8.0, 60.0)
+    tr = np.sort(base_price * np.exp(np.clip(rng.normal(0.0, 0.8, K), -2.5, 1.2)))
+    n_low_tiers = int(rng.integers(1, 3))
+    tr[:n_low_tiers] = np.array([floor, base_price * rng.uniform(0.05, 0.2)])[:n_low_tiers]
+    tr[-2:] *= np.array([rng.uniform(1.3, 2.2), rng.uniform(2.0, 5.0)])
+    tr = np.sort(tr)
+    z = _pt_gaussian_lowpass_noise(rng, n, rng.uniform(0.1, 0.8) * P) * rng.uniform(0.6, 1.0) + rng.uniform(0.0, 0.6) * _pt_time_of_day_bump(ck.tod, rng.uniform(0.3, 0.8), 0.12) + rng.uniform(0.05, 0.2) * _pt_ar1_recursive_filter(rng.standard_normal(n), 0.6)
+    cut_points = rng.normal(-0.3, 0.9, K - 1)
+    cut_points[-2:] = np.maximum(cut_points[-2:], (1.1, 1.7))
+    cut_points = np.sort(cut_points)
+    tier_idx = np.searchsorted(cut_points, z)
+    tier_drop_mask = rng.random(n) < rng.uniform(0.005, 0.04)
+    tier_idx = np.where(tier_drop_mask, np.maximum(tier_idx - rng.integers(1, 4, n), 0), tier_idx)
+    x = tr[tier_idx]
+    price_jitter = np.exp(rng.uniform(0.002, 0.03) * _pt_ar1_recursive_filter(rng.standard_normal(n), 0.8))
+    hold_mask = rng.random(n) < rng.uniform(0.1, 0.4)
+    hold_mask[0] = False
+    price_jitter = price_jitter[np.maximum.accumulate(np.where(hold_mask, 0, np.arange(n)))]
+    x = np.where(x > floor, x * price_jitter, x)
+    return np.round(np.maximum(x, floor), 2)
+_pt_NICE_LEVEL_VALUES = np.array([1, 2, 3, 4, 5, 8, 10, 12, 15, 20, 25, 30, 40, 50, 64, 75, 100, 125, 150, 200], dtype=np.float64)
+
+def _pt_discrete_levels_or_outages(rng, n):
+    mode = 'levels' if rng.random() < 0.6 else 'outage'
+    if _pt_ENERGY_FORCED_MODE is not None:
+        mode = _pt_ENERGY_FORCED_MODE
+    if mode == 'levels':
+        K = int(rng.integers(5, 24))
+        n_nice = int(round(K * rng.uniform(0.5, 0.9)))
+        nice_weights = 1.0 / (np.arange(_pt_NICE_LEVEL_VALUES.size) + 1.0) ** rng.uniform(0.3, 1.0)
+        pv = rng.choice(_pt_NICE_LEVEL_VALUES, size=min(n_nice, _pt_NICE_LEVEL_VALUES.size), replace=False, p=nice_weights / nice_weights.sum())
+        extra_levels = np.round(np.exp(rng.uniform(0.0, np.log(250.0), K - pv.size)))
+        levels = np.concatenate([pv, extra_levels])
+        levels = levels[np.argsort(levels, kind='stable')]
+        base_weights = np.exp(-rng.uniform(0.6, 1.3) * np.log(levels))
+        busy_weights = base_weights * levels ** rng.uniform(0.5, 1.2) * np.exp(rng.normal(0.0, 0.5, levels.size))
+        w0, w1 = (base_weights / base_weights.sum(), busy_weights / busy_weights.sum())
+        redraw_prob = rng.uniform(0.7, 0.97)
+        event_steps = rng.random(n) < redraw_prob
+        event_steps[0] = True
+        m = int(event_steps.sum())
+        P = int(_pt_pick_by_cumulative_prob(rng, (96, 60, 24), (0.7, 0.15, 0.15)))
+        ck = _pt_DayClock(rng, n, P)
+        busy_driver = _pt_gaussian_lowpass_noise(rng, n, rng.uniform(0.01, 0.1) * P) + rng.uniform(0.0, 1.5) * _pt_time_of_day_bump(ck.tod, rng.random(), rng.uniform(0.05, 0.15))
+        is_busy = (busy_driver > rng.normal(1.4, 0.3))[event_steps]
+        c0 = np.searchsorted(np.cumsum(w0), rng.random(m) * (1 - 1e-12))
+        c1 = np.searchsorted(np.cumsum(w1), rng.random(m) * (1 - 1e-12))
+        drawn_levels = levels[np.minimum(np.where(is_busy, c1, c0), levels.size - 1)]
+        x = drawn_levels[np.cumsum(event_steps) - 1]
+        kb = int(rng.poisson(n * rng.uniform(0.001, 0.006)))
+        if kb:
+            upper_levels = levels[levels >= np.median(levels)]
+            at = rng.integers(0, n, kb)
+            ln = rng.geometric(rng.uniform(0.2, 0.6), kb)
+            bv = upper_levels[rng.integers(0, upper_levels.size, kb)] * np.exp(rng.uniform(0.0, 1.0, kb))
+            run_pos = np.repeat(at, ln) + (np.arange(ln.sum()) - np.repeat(np.cumsum(ln) - ln, ln))
+            ok = run_pos < n
+            x[run_pos[ok]] = np.round(np.repeat(bv, ln)[ok])
+        return np.round(np.maximum(x, 1.0))
+    P = int(_pt_pick_by_cumulative_prob(rng, (96, 48, 24, 288), (0.6, 0.15, 0.15, 0.1)))
+    nd = n // P + 2
+    storm_day = rng.random(nd) < rng.uniform(0.03, 0.25)
+    daily_start_rate = np.where(storm_day, rng.uniform(5.0, 20.0), 1.0) * _pt_energy_log_uniform(rng, 0.004, 0.03)
+    step_start_rate = np.repeat(daily_start_rate, P)[rng.integers(0, P):][:n]
+    event_steps = np.flatnonzero(rng.random(n) < step_start_rate)
+    x = np.zeros(n)
+    k = event_steps.size
+    if k:
+        durations = np.minimum(rng.geometric(1.0 / rng.uniform(8.0, 80.0), k), n)
+        initial_affected = np.ceil(np.exp(rng.normal(rng.uniform(0.0, 1.5), rng.uniform(1.4, 2.4), k)))
+        total_len = int(durations.sum())
+        ev = np.repeat(np.arange(k), durations)
+        run_pos = np.arange(total_len) - np.repeat(np.cumsum(durations) - durations, durations)
+        jump_mask = rng.random(total_len) < rng.uniform(0.05, 0.25)
+        jump_mask[run_pos == 0] = False
+        lr = np.where(jump_mask, np.log(rng.uniform(0.15, 1.6, total_len)), 0.0)
+        cl = np.cumsum(lr)
+        cl -= np.repeat(cl[np.cumsum(durations) - durations] - lr[np.cumsum(durations) - durations], durations)
+        affected = np.floor(initial_affected[ev] * np.exp(cl))
+        abs_step = event_steps[ev] + run_pos
+        ok = abs_step < n
+        x = np.bincount(abs_step[ok], weights=affected[ok], minlength=n)[:n]
+    return x
