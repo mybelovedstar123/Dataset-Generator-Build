@@ -4811,3 +4811,301 @@ class BatchProducer:
                 cv.notify_all()
             for th in threads:
                 th.join(timeout=5.0)
+
+
+# ═══════════════ chronoforge: cf_config_schema ═══════════════
+# Eager, strict validation of ``config.json``.
+#
+# The config is plain and readable — there are no decoy keys and no identifier
+# obfuscation.  Obfuscation costs tuning velocity and buys nothing (every
+# obfuscated submission in this competition has been reverse-engineered anyway);
+# the moat is the priors, not the spelling.
+#
+# What we *do* enforce is strictness: unknown keys are rejected at every level,
+# probabilities must lie in [0, 1], paired ranges must be ordered, weight vectors
+# must be non-negative with a positive sum, and every family named in the registry
+# must have a weight and a cadence preference.  A typo in a swept parameter should
+# fail at construction, not silently produce a different corpus.
+
+
+from numbers import Real
+
+# spec kinds
+P = ("prob",)          # float in [0, 1]
+NUM = ("num",)         # any finite float
+POS = ("pos",)         # finite float > 0
+RANGE = ("range",)     # [lo, hi] with lo <= hi
+
+
+def W(k):
+    """Weight vector of exactly k non-negative entries."""
+    return ("weights", k)
+
+
+def INT(lo, hi):
+    return ("int", lo, hi)
+
+
+FAMILY_SCHEMA = {
+    "met_thermal": {"synoptic_ell": RANGE, "synoptic_amp": RANGE,
+                    "diurnal_amp_mix": W(3), "cloud_coupling": RANGE,
+                    "noise_ratio": RANGE, "annual_rate": P},
+    "met_pressure_smooth": {"synoptic_ell": RANGE, "noise_ratio": RANGE,
+                            "dip_rate": P, "quantise_rate": P},
+    "met_bounded_atom": {"variant_mix": W(3), "latent_ell": RANGE, "eta": RANGE,
+                         "centre_mean": NUM, "centre_sigma": POS,
+                         "upper_mix": W(5), "quantise_rate": P,
+                         "saturation_event_rate": P},
+    "met_wind_speed": {"component_ell": RANGE, "gust_rate": P,
+                       "quantise_rate": P},
+    "wet_dry_intermittent": {"dry_dwell": RANGE, "wet_dwell": RANGE,
+                             "intensity_shape": RANGE},
+    "ops_diurnal_traffic": {"taylor_exponent": RANGE, "burst_rate": P,
+                            "count_emit_rate": P, "dst_rate": P},
+    "ops_saturating_feedback": {"step_gain": RANGE, "emit_mix": W(3)},
+    "ops_counter_reset": {"reset_mix": W(3), "revision_rate": P},
+    "ops_latency_queue": {"lognormal_rate": P, "percentile_rate": P},
+    "ops_deploy_transient": {"outage_mix": W(3)},
+    "ops_rate_plateau": {"plateau_dwell": RANGE},
+    "epi_renewal": {"logr_corr_time": RANGE, "logr_sigma": POS,
+                    "serial_interval_mean": RANGE, "dispersion": RANGE,
+                    "reporting_layer_rate": P, "endemic_rate": P},
+    "admin_reporting_counts": {"batch_rate": P, "revision_rate": P,
+                               "emission_mix": W(3), "holiday_rate": P,
+                               "month_end_rate": P},
+    "physio_quasiperiodic": {"base_period": RANGE, "rsa_depth": RANGE},
+    "clinical_bounded_vitals": {"range_mix": W(4), "ceiling_bias": RANGE,
+                                "excursion_tau": RANGE},
+    "regime_dwell": {"dormant_dwell": RANGE, "active_dwell": RANGE,
+                     "pareto_mix": P},
+    "level_ladder_staircase": {"run_length": RANGE, "jump_mix": W(3),
+                               "tick_snap_rate": P, "noiseless_rate": P,
+                               "monotone_rate": P},
+    "smooth_drift_extrapolable": {"matern_nu_mix": W(3), "lengthscale": RANGE,
+                                  "obs_noise_ratio": RANGE, "damped_rate": P,
+                                  "saturating_rate": P},
+    "arma_sarima": {"seasonal_rate": P, "d_rate": P, "big_d_rate": P,
+                    "student_rate": P},
+    "garch_leverage": {"persistence": RANGE, "student_rate": P,
+                       "emit_mix": W(3), "arma_mean_rate": P},
+    "hawkes_marked": {"branching": RANGE, "power_law_rate": P,
+                      "emit_mix": W(3)},
+    "chaotic_delay": {"system_mix": W(4), "projection_rate": P,
+                      "mackey_glass_rate": P},
+    "spectral_kernel_zoo": {"product_rate": P, "envelope_rate": P,
+                            "warp_rate": P},
+    "changepoint_composite": {"join_mix": W(3), "state_hazard": RANGE},
+    "energy_load_price_solar": {"mode_mix": W(3), "negative_price_rate": P},
+    "transport_flow": {"capacity_ratio": RANGE},
+    "retail_promo_intermittent": {"slow_mover_rate": P, "stockout_rate": P,
+                                  "launch_rate": P},
+    "econ_release_staircase": {"release_mix": W(3), "nelson_siegel_rate": P,
+                               "business_day_rate": P, "month_end_rate": P},
+}
+
+_SEASON_KEYS = {"day": P, "half": P, "third": P, "week": P, "bizweek": P,
+                "month": P, "quarter": P, "free": P}
+
+SCHEMA = {
+    "schema_version": INT(1, 1),
+    "generator_name": ("str",),
+    "internal_length": INT(64, 4096),
+    "batch_schedule": {"ramp": ("intlist",), "steady": INT(1, 4096)},
+    "threads": {"max_workers": INT(1, 64), "max_inflight_batches": INT(2, 64)},
+    "family_weights": ("family_map", "nonneg"),
+    "family_coarse_pref": ("family_map", "prob"),
+    "cadence": {"fine_seconds": ("poslist",), "fine_weights": ("weightlist",),
+                "coarse_seconds": ("poslist",), "coarse_weights": ("weightlist",)},
+    "length_ladder": {
+        "fine": {"lengths": ("lenlist",), "weights": ("weightlist",)},
+        "coarse": {"lengths": ("lenlist",), "weights": ("weightlist",)},
+    },
+    "seasonality": {
+        "active_fine": dict(_SEASON_KEYS),
+        "active_coarse": dict(_SEASON_KEYS),
+        "shape_mix": W(5),
+        "phase_drift_rate": P,
+        "period_drift_rate": P,
+        "amplitude_modulation_rate": P,
+    },
+    "calendar": {
+        "monday_factor": POS, "monday_sigma": POS, "weekday_sigma": POS,
+        "weekend_factor": POS, "weekend_sigma": POS,
+        "n_fixed_holidays": INT(0, 40), "n_moving_holidays": INT(0, 20),
+        "holiday_count_lo": INT(0, 60), "holiday_count_hi": INT(0, 60),
+        "holiday_factor": POS, "holiday_sigma": POS,
+        "holiday_comp_lo": POS, "holiday_comp_hi": POS,
+    },
+    "observation": {
+        "block_aggregation_rate": P, "quantise_rate": P, "log_grid_share": P,
+        "censor_rate": P, "staleness_rate": P, "missing_zero_rate": P,
+        "outlier_rate": P, "drift_recal_rate": P, "round_rate": P,
+        "round_min_ticks": POS, "integer_tick_share": P,
+        "count_prior_rate": P, "count_integer_share": P, "count_floor_frac": P,
+        "count_levels_log10": RANGE,
+    },
+    "scale": {
+        "log10_scale_mixture": ("mixture",),
+        "zero_anchor_share": P, "large_offset_share": P, "sign_cross_share": P,
+        "large_offset_ratio": RANGE,
+    },
+    "aggregation": {"rate": P},
+    "families": ("families",),
+}
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def _num(v, path):
+    if isinstance(v, bool) or not isinstance(v, Real):
+        raise ConfigError(f"{path}: expected a number, got {v!r}")
+    f = float(v)
+    if f != f or f in (float("inf"), float("-inf")):
+        raise ConfigError(f"{path}: value must be finite")
+    return f
+
+
+def _weightlist(v, path, k):
+    if not isinstance(v, (list, tuple)) or not v:
+        raise ConfigError(f"{path}: expected a non-empty weight list")
+    if k is not None and len(v) != k:
+        raise ConfigError(f"{path}: expected {k} weights, got {len(v)}")
+    total = 0.0
+    for i, x in enumerate(v):
+        f = _num(x, f"{path}[{i}]")
+        if f < 0.0:
+            raise ConfigError(f"{path}[{i}]: weights must be non-negative")
+        total += f
+    if total <= 0.0:
+        raise ConfigError(f"{path}: weights sum to zero")
+
+
+def _check_scalar(spec, v, path):
+    kind = spec[0]
+    if kind == "prob":
+        f = _num(v, path)
+        if not 0.0 <= f <= 1.0:
+            raise ConfigError(f"{path}: probability must lie in [0, 1], got {f}")
+    elif kind == "num":
+        _num(v, path)
+    elif kind == "pos":
+        if _num(v, path) <= 0.0:
+            raise ConfigError(f"{path}: must be strictly positive")
+    elif kind == "str":
+        if not isinstance(v, str) or not v:
+            raise ConfigError(f"{path}: expected a non-empty string")
+    elif kind == "int":
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ConfigError(f"{path}: expected an integer")
+        if not spec[1] <= v <= spec[2]:
+            raise ConfigError(f"{path}: {v} outside [{spec[1]}, {spec[2]}]")
+    elif kind == "range":
+        if not isinstance(v, (list, tuple)) or len(v) != 2:
+            raise ConfigError(f"{path}: expected a [lo, hi] pair")
+        lo = _num(v[0], path + "[0]")
+        hi = _num(v[1], path + "[1]")
+        if lo > hi:
+            raise ConfigError(f"{path}: lo {lo} exceeds hi {hi}")
+    elif kind == "weights":
+        _weightlist(v, path, spec[1])
+    elif kind == "weightlist":
+        _weightlist(v, path, None)
+    elif kind == "poslist":
+        if not isinstance(v, (list, tuple)) or not v:
+            raise ConfigError(f"{path}: expected a non-empty list")
+        for i, x in enumerate(v):
+            if _num(x, f"{path}[{i}]") <= 0.0:
+                raise ConfigError(f"{path}[{i}]: must be positive")
+    elif kind == "lenlist":
+        if not isinstance(v, (list, tuple)) or not v:
+            raise ConfigError(f"{path}: expected a non-empty list")
+        for i, x in enumerate(v):
+            if isinstance(x, bool) or not isinstance(x, int):
+                raise ConfigError(f"{path}[{i}]: expected an integer length")
+            if not 64 <= x <= 4096:
+                raise ConfigError(f"{path}[{i}]: length {x} outside [64, 4096]")
+            if x % 32 != 0:
+                raise ConfigError(
+                    f"{path}[{i}]: length {x} is not a multiple of 32; the "
+                    "trainer buckets by L // 32 and discards the remainder")
+    elif kind == "intlist":
+        if not isinstance(v, (list, tuple)) or not v:
+            raise ConfigError(f"{path}: expected a non-empty list")
+        for i, x in enumerate(v):
+            if isinstance(x, bool) or not isinstance(x, int) or x < 1:
+                raise ConfigError(f"{path}[{i}]: expected a positive integer")
+    elif kind == "mixture":
+        if not isinstance(v, (list, tuple)) or not v:
+            raise ConfigError(f"{path}: expected a non-empty mixture list")
+        total = 0.0
+        for i, comp in enumerate(v):
+            if not isinstance(comp, dict):
+                raise ConfigError(f"{path}[{i}]: expected an object")
+            extra = set(comp) - {"weight", "mean", "sigma"}
+            if extra:
+                raise ConfigError(f"{path}[{i}]: unknown keys {sorted(extra)}")
+            for k in ("weight", "mean", "sigma"):
+                if k not in comp:
+                    raise ConfigError(f"{path}[{i}]: missing {k!r}")
+            w = _num(comp["weight"], f"{path}[{i}].weight")
+            _num(comp["mean"], f"{path}[{i}].mean")
+            if _num(comp["sigma"], f"{path}[{i}].sigma") <= 0.0:
+                raise ConfigError(f"{path}[{i}].sigma: must be positive")
+            if w < 0.0:
+                raise ConfigError(f"{path}[{i}].weight: must be non-negative")
+            total += w
+        if total <= 0.0:
+            raise ConfigError(f"{path}: mixture weights sum to zero")
+    else:
+        raise ConfigError(f"{path}: unhandled spec {spec!r}")
+
+
+def _check_node(spec, node, path, family_names):
+    if isinstance(spec, dict):
+        if not isinstance(node, dict):
+            raise ConfigError(f"{path}: expected an object")
+        unknown = set(node) - set(spec)
+        if unknown:
+            raise ConfigError(f"{path}: unknown keys {sorted(unknown)}")
+        missing = set(spec) - set(node)
+        if missing:
+            raise ConfigError(f"{path}: missing keys {sorted(missing)}")
+        for k, sub in spec.items():
+            _check_node(sub, node[k], f"{path}.{k}" if path else k, family_names)
+        return
+    kind = spec[0]
+    if kind == "family_map":
+        if not isinstance(node, dict):
+            raise ConfigError(f"{path}: expected an object")
+        unknown = set(node) - set(family_names)
+        if unknown:
+            raise ConfigError(f"{path}: unknown families {sorted(unknown)}")
+        missing = set(family_names) - set(node)
+        if missing:
+            raise ConfigError(f"{path}: missing families {sorted(missing)}")
+        total = 0.0
+        for k, v in node.items():
+            f = _num(v, f"{path}.{k}")
+            if spec[1] == "prob" and not 0.0 <= f <= 1.0:
+                raise ConfigError(f"{path}.{k}: must lie in [0, 1]")
+            if spec[1] == "nonneg" and f < 0.0:
+                raise ConfigError(f"{path}.{k}: must be non-negative")
+            total += f
+        if spec[1] == "nonneg" and total <= 0.0:
+            raise ConfigError(f"{path}: family weights sum to zero")
+        return
+    if kind == "families":
+        if not isinstance(node, dict):
+            raise ConfigError(f"{path}: expected an object")
+        unknown = set(node) - set(FAMILY_SCHEMA)
+        if unknown:
+            raise ConfigError(f"{path}: unknown family blocks {sorted(unknown)}")
+        missing = set(FAMILY_SCHEMA) - set(node)
+        if missing:
+            raise ConfigError(f"{path}: missing family blocks {sorted(missing)}")
+        for k, sub in FAMILY_SCHEMA.items():
+            _check_node(sub, node[k], f"{path}.{k}", family_names)
+        return
+    _check_scalar(spec, node, path)
