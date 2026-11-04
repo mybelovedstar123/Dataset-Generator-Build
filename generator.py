@@ -3339,3 +3339,70 @@ def c4_build(P, rng, L, cad, cal, cfg):
                    quant_boost=0.0, obs_boost=0.4, allow_agg=False)
     fl["integer"] = (P["tick"] == 1.0)
     return y, fl
+
+
+# ═══════════════ chronoforge: cf_fam_regime ═══════════════
+# Block D — persistence / regime core.
+#
+# This is the incumbent prior, and it is here to protect against regression on a
+# warm-started checkpoint rather than to differentiate.  We match it in *effect*
+# and improve its statistics in three specific ways:
+#
+# * dwell times are heavy-tailed (LogN mixed with a Pareto tail) instead of
+#   uniform — uniform dwell teaches a wrong hazard function;
+# * there is a third regime type, ``transitional``: a smooth monotone ramp
+#   between levels, because real regime changes are frequently gradual;
+# * the *variance* switches with the regime, not only the level.
+#
+# D2's staircase snaps 40% of its levels onto a recurring ``{1,2,5}x10^k`` tick
+# ladder, so successive levels sit on the same grid.  That is a real, learnable
+# regularity (policy rates, price ladders, config values, thermostat setpoints)
+# which an arbitrary-real staircase destroys.
+
+
+DORMANT_FLAT = 0
+DORMANT_MICRO = 1
+DORMANT_COUNTER = 2
+DORMANT_ZERO = 3
+DORMANT_TRANS = 4
+
+N_ACTIVE_KINDS = 6
+
+
+# ───────────────────────── active-regime base menu ─────────────────────────
+
+def active_base(rng, n, L, kind, cad, cfg):
+    """Unit-std active-regime carrier; each kind is built for its rows only."""
+    out = np.zeros((n, L))
+    for k in range(N_ACTIVE_KINDS):
+        m = kind == k
+        cnt = int(m.sum())
+        if cnt == 0:
+            continue
+        if k == 0:
+            sub = multi_seasonal(rng, cnt, L, cad.take(np.nonzero(m)[0]), cfg)
+        elif k == 1:
+            phi = np.stack([rng.uniform(0.1, 1.35, cnt),
+                            rng.uniform(-0.75, 0.15, cnt)], axis=1)
+            # keep the AR(2) inside the stationarity triangle
+            phi[:, 1] = np.minimum(phi[:, 1], 0.98 - np.abs(phi[:, 0]))
+            e = rng.standard_normal((cnt, L))
+            sub = np.zeros((cnt, L))
+            k_arma(np.ascontiguousarray(phi), np.full(cnt, 2, dtype=np.int64),
+                     np.zeros((cnt, 1)), np.zeros(cnt, dtype=np.int64), e, sub)
+            sub = unit_std(sub)
+        elif k == 2:
+            sub = matern_gp(rng, cnt, L, logu(rng, 8.0, 800.0, cnt),
+                            nu=float(rng.choice(np.array([0.5, 1.5, 2.5]))))
+        elif k == 3:
+            sub = unit_std(np.cumsum(rng.standard_normal((cnt, L)), axis=1))
+        elif k == 4:
+            mu = np.broadcast_to(logu(rng, 1e-3, 5e-2, (cnt, 1)), (cnt, L))
+            _, c = hawkes(rng, cnt, L, np.ascontiguousarray(mu),
+                          rng.uniform(0.2, 0.9, cnt), logu(rng, 3.0, 120.0, cnt))
+            marks = c * np.exp(rng.normal(0.0, 0.8, size=(cnt, L)))
+            sub = unit_std(decay_convolve(marks, logu(rng, 2.0, 60.0, cnt)))
+        else:
+            sub = ou(rng, cnt, L, logu(rng, 4.0, 600.0, cnt))
+        out[m] = sub
+    return out
