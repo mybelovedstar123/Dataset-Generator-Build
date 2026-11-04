@@ -7360,3 +7360,36 @@ def _capacity_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     walk = _ar1_batch(rng.normal(0.0, 0.08, size=(n, L)),
                       rng.uniform(0.85, 0.97, size=(n, 1)))
     return np.round(np.clip(cycle + walk, 0.0, 1.0) * capacity)
+
+
+# --- transplanted from count_donor -------------------------------
+# _overdispersed_counts plus 0 dependency/dependencies it needs that this tree lacked.
+# Inert at weight 0.0 (proved by an unchanged corpus digest).
+
+
+def _overdispersed_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Gamma-Poisson counts under nested daily and weekly cycles.
+
+    A Poisson draw alone has variance equal to its mean; real event counts —
+    pedestrian sensors, dispatch calls, request logs — run one to three orders
+    of magnitude over that. Drawing the rate from a Gamma first makes the
+    marginal negative-binomial, so the dispersion is a free parameter
+    (`shape` in [2, 12]) instead of being pinned to the level.
+
+    Both seasonalities are present at once and at different strengths: the daily
+    term at full amplitude, the weekly at 0.4x. Period 24 is the eval pool's
+    single largest bucket and 168 is its 7-day partner, and a family carrying
+    BOTH lets one series teach the model that two cycles can superpose — which
+    a single-period family never can.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    t = _time_index(L)
+    level = rng.uniform(2.0, 30.0, size=(n, 1))
+    amp = rng.uniform(0.3, 0.8, size=(n, 1))
+    daily = np.sin(2.0 * np.pi * t / 24.0 + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1)))
+    weekly = np.sin(2.0 * np.pi * t / 168.0 + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1)))
+    mean = np.maximum(level * (1.0 + amp * daily + 0.4 * amp * weekly), 0.5)
+    shape = rng.uniform(2.0, 12.0, size=(n, 1))
+    rate = rng.gamma(shape, mean / shape)
+    return rng.poisson(np.maximum(rate, 0.01)).astype(np.float64)
