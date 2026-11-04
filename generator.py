@@ -7800,3 +7800,298 @@ def _settle_hold(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     lvl = np.where(is_price, np.rint(last / grid) * grid, lvl)
     lvl = np.where(is_zero, 0.0, lvl)
     return np.where(t >= start, lvl, pre)
+
+
+def _web_traffic_plateau(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Bursty web traffic that freezes into an exact integer plateau tail.
+
+    Dockerhub/npm-style pull counters: diurnal Poisson prefix then a
+    noise-free constant tail at the last active level.
+    """
+    t = _time_index(L)
+    t_flat = t.ravel()
+    short = rng.random((n, 1)) < 0.65
+    T = np.where(
+        short,
+        rng.integers(64, 256, size=(n, 1)),
+        rng.integers(256, min(1536, L), size=(n, 1)),
+    )
+    T = np.minimum(T, max(L - 8, 1))
+    start = L - T
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        p_day = float(np.exp(rng.uniform(np.log(4.0), np.log(64.0))))
+        dow = np.floor((t_flat % (7.0 * p_day)) / p_day).astype(np.int64)
+        prof = np.exp((rng.random(7) - 0.5) * rng.uniform(0.3, 0.9))
+        wk = rng.choice(7, size=2, replace=False)
+        prof[wk] *= rng.uniform(0.55, 0.85)
+        prof /= prof.mean()
+        level = float(np.exp(rng.uniform(2.0, 8.0)))
+        lam = level * prof[dow]
+        fano = rng.uniform(1.5, 6.0)
+        r = np.maximum(lam / np.maximum(fano - 1.0, 1e-6), 1e-6)
+        g = rng.gamma(r, 1.0 / r)
+        pre = rng.poisson(np.maximum(lam * g, 0.0)).astype(np.float64)
+        s0 = int(start[i, 0])
+        last = float(pre[max(s0 - 1, 0)])
+        tail = np.rint(max(last, 1.0)) if rng.random() >= 0.10 else 0.0
+        pre[s0:] = tail
+        out[i] = pre
+    return out
+
+
+def _biz_day_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """permit/transfer-class admin panels: 1 step = 1 day, weekday counts at
+    e^U[ln5, ln300], weekends and ~10/yr holidays EXACTLY zero (weekends leak
+    a small residual on ~20% of series), next-business-day backlog rebound,
+    month-end filing spikes, slow log-level drift, NB overdispersion.
+
+    By-type ledgers built from filing records list only the days on which
+    something was filed: the published series has no zeros (its floor is 1),
+    closed weekends and holidays simply drop out, and sparse filing types sit
+    at 1-3 per listed day. 75% of rows are published that way from a 2L-day
+    calendar (levels reach down to e^ln0.8); when the listed days do not fill
+    L the row starts with a constant prefix, as a short feed does."""
+    span = 2 * L
+    day = np.arange(span, dtype=np.int64)
+    dow = day % 7
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        listed = rng.random() < 0.75
+        m = span if listed else L
+        wk_off = int(rng.integers(0, 7))
+        d = (dow[:m] + wk_off) % 7
+        weekend = d >= 5
+        prof = np.exp(rng.normal(0.0, rng.uniform(0.05, 0.25), size=7))
+        prof /= prof[:5].mean()
+        base = prof[d]
+        if rng.random() < 0.8:
+            wk_factor = 0.0
+        else:
+            wk_factor = float(rng.uniform(0.02, 0.2))
+        base = np.where(weekend, wk_factor, base)
+        n_hol = int(rng.poisson(m / 365.0 * rng.uniform(8.0, 14.0)))
+        if n_hol > 0:
+            hol = rng.integers(0, m, size=n_hol)
+            base[hol] = 0.0
+            nxt = hol + 1
+            nxt = nxt[nxt < m]
+            base[nxt] = base[nxt] * rng.uniform(1.1, 1.9)
+        if rng.random() < 0.6:
+            period = int(rng.integers(28, 33))
+            me = (day[:m] % period) == int(rng.integers(0, period))
+            base = np.where(me & ~weekend, base * rng.uniform(1.2, 2.4), base)
+        low = np.log(0.8) if listed else np.log(5.0)
+        level = float(np.exp(rng.uniform(low, np.log(300.0))))
+        drift = np.cumsum(rng.normal(0.0, rng.uniform(0.001, 0.012), size=m))
+        drift -= drift.mean()
+        annual = rng.uniform(0.0, 0.35) * np.sin(
+            2.0 * np.pi * day[:m] / 365.0 + rng.uniform(0.0, 2.0 * np.pi))
+        lam = level * base * np.exp(np.clip(drift + annual, -2.5, 2.5))
+        fano = rng.uniform(1.5, 12.0)
+        r = np.maximum(lam / max(fano - 1.0, 1e-6), 1e-6)
+        g = rng.gamma(r, 1.0 / r)
+        y = rng.poisson(np.maximum(lam * g, 0.0)).astype(np.float64)
+        if listed:
+            kept = y[y > 0.0]
+            if kept.size >= L:
+                y = kept[-L:]
+            elif kept.size > 0:
+                y = np.concatenate([np.full(L - kept.size, kept[0]), kept])
+            else:
+                y = y[-L:]
+        out[i] = y
+    return out
+
+
+def _weekly_web_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """npm-download-class: 1 step = 1 day, piecewise log-linear growth/decay
+    with 1-4 changepoints, deep multiplicative weekend dip, holiday-week
+    collapses, occasional release spikes, wide level range."""
+    day = np.arange(L, dtype=np.int64)
+    dow = day % 7
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        wk_off = int(rng.integers(0, 7))
+        d = (dow + wk_off) % 7
+        weekend = d >= 5
+        n_cp = int(rng.integers(1, 5))
+        cps = np.sort(rng.integers(1, L - 1, size=n_cp))
+        slopes = rng.uniform(-0.010, 0.014, size=n_cp + 1)
+        logtrend = np.zeros(L)
+        prev, lv = 0, 0.0
+        for k, cp in enumerate(list(cps) + [L]):
+            seg = np.arange(prev, cp)
+            logtrend[seg] = lv + slopes[k] * (seg - prev)
+            if len(seg):
+                lv = logtrend[seg[-1]]
+            prev = cp
+        logtrend -= logtrend.mean()
+        level = float(np.exp(rng.uniform(np.log(50.0), np.log(1e6))))
+        wk_dip = float(rng.uniform(0.30, 0.75))
+        prof = np.exp(rng.normal(0.0, 0.06, size=7))
+        prof /= prof[:5].mean()
+        base = prof[d] * np.where(weekend, wk_dip, 1.0)
+        for _ in range(int(rng.integers(1, 4))):
+            if rng.random() < 0.75:
+                s0 = int(rng.integers(0, max(L - 12, 1)))
+                ln = int(rng.integers(5, 13))
+                base[s0:s0 + ln] *= rng.uniform(0.35, 0.8)
+        for _ in range(int(rng.poisson(rng.uniform(0.3, 2.0)))):
+            s0 = int(rng.integers(0, L))
+            mag = rng.uniform(0.5, 3.0)
+            dur = int(rng.integers(2, 6))
+            e = min(s0 + dur, L)
+            base[s0:e] *= 1.0 + mag * np.exp(-np.arange(e - s0) / max(dur / 2.0, 1.0))
+        lam = level * base * np.exp(np.clip(logtrend, -6.0, 6.0))
+        noise = np.exp(rng.normal(0.0, rng.uniform(0.03, 0.15), size=L))
+        vals = lam * noise
+        if level < 500.0:
+            vals = np.floor(vals + rng.random(L))
+        out[i] = vals
+    return out
+
+
+def _dispatch_price(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """nz_emi-class dispatch/spot prices: sub-daily, mean-reverting log price
+    around a double-peaked diurnal profile, weekend softening, rare 3-40x
+    spikes decaying within hours, occasional floor-dips toward zero."""
+    t = _time_index(L).ravel()
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        p_day = float(np.exp(rng.uniform(np.log(48.0), np.log(288.0))))
+        phase = 2.0 * np.pi * (t / p_day + rng.uniform(0.0, 1.0))
+        diurnal = (rng.uniform(0.05, 0.35) * np.sin(phase)
+                   + rng.uniform(0.05, 0.30) * np.sin(2.0 * phase + rng.uniform(0, 2 * np.pi)))
+        dow = np.floor((t % (7.0 * p_day)) / p_day).astype(np.int64)
+        wk = (dow + int(rng.integers(0, 7))) % 7 >= 5
+        weekly = np.where(wk, rng.uniform(-0.25, -0.05), 0.0)
+        phi = rng.uniform(0.90, 0.99)
+        sig = rng.uniform(0.02, 0.10)
+        ar = np.empty(L)
+        x = 0.0
+        eps = rng.normal(0.0, sig, size=L)
+        for k in range(L):
+            x = phi * x + eps[k]
+            ar[k] = x
+        level = float(np.exp(rng.uniform(np.log(20.0), np.log(200.0))))
+        price = level * np.exp(diurnal + weekly + ar)
+        for _ in range(int(rng.poisson(rng.uniform(0.5, 5.0)))):
+            s0 = int(rng.integers(0, L))
+            mag = float(np.exp(rng.uniform(np.log(3.0), np.log(40.0))))
+            half = p_day * rng.uniform(0.02, 0.25)
+            dt = t[s0:] - t[s0]
+            price[s0:] *= 1.0 + (mag - 1.0) * np.exp(-dt / max(half, 1.0))
+        for _ in range(int(rng.poisson(rng.uniform(0.0, 2.0)))):
+            s0 = int(rng.integers(0, L))
+            ln = int(rng.integers(1, max(int(p_day * 0.3), 2)))
+            price[s0:s0 + ln] *= rng.uniform(0.0, 0.15)
+        out[i] = price
+    return out
+
+
+def _web_session_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """DoppelGANger-inspired web sessions (attribute → feature)."""
+    t = _time_index(L).ravel()
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        tier = int(rng.integers(0, 3))
+        level = float(np.exp(rng.uniform(*[(3.0, 6.0), (6.0, 10.0), (10.0, 15.0)][tier])))
+        weekdayness = float(rng.uniform(0.55, 0.95))
+        p_day = float(np.exp(rng.uniform(np.log(24.0), np.log(96.0))))
+        dow = np.floor((t % (7.0 * p_day)) / p_day).astype(np.int64) % 7
+        wk = {5, 6}
+        day_scale = np.where(np.isin(dow, list(wk)), 1.0 - 0.5 * weekdayness, 1.0)
+        active = np.zeros(L, dtype=bool)
+        cursor = 0
+        while cursor < L:
+            gap = int(rng.geometric(min(1.0 / max(p_day * rng.uniform(0.5, 4.0), 1.0), 0.99)))
+            cursor += gap
+            if cursor >= L:
+                break
+            burst = int(rng.geometric(min(1.0 / max(p_day * rng.uniform(0.05, 0.6), 1.0), 0.99)))
+            burst = max(burst, 1)
+            active[cursor:min(cursor + burst, L)] = True
+            cursor += burst
+        if not active.any():
+            active[int(rng.integers(0, L))] = True
+        shape = np.zeros(L, dtype=np.float64)
+        shape[active] = rng.lognormal(mean=0.0, sigma=rng.uniform(0.4, 1.1), size=int(active.sum()))
+        for start in np.where(np.diff(active.astype(np.int8), prepend=0) == 1)[0]:
+            end = start
+            while end < L and active[end]:
+                end += 1
+            seg = shape[start:end]
+            if seg.size > 1:
+                decay = np.exp(-np.arange(seg.size) / max(seg.size * rng.uniform(0.3, 1.2), 1.0))
+                shape[start:end] = seg * decay
+        m = float(np.mean(shape[active])) if active.any() else 1.0
+        if m > 0:
+            shape[active] /= m
+        out[i] = np.round(np.maximum(level * day_scale * shape, 0.0))
+    return out
+
+
+def _broadband_path_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """DoppelGANger-inspired broadband / path throughput (attribute → feature)."""
+    t = _time_index(L).ravel()
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        qual = int(rng.integers(0, 3))
+        base = float(np.exp(rng.uniform(*[(1.5, 3.0), (3.0, 4.5), (4.5, 6.5)][qual])))
+        path = np.ones(L, dtype=np.float64)
+        path += rng.normal(0.0, rng.uniform(0.005, 0.03), size=L)
+        for _ in range(int(rng.poisson(rng.uniform(0.4, 3.0)))):
+            s0 = int(rng.integers(0, L))
+            depth = float(rng.uniform(0.05, 0.55))
+            rise = float(np.exp(rng.uniform(np.log(0.5), np.log(8.0))))
+            half = float(np.exp(rng.uniform(np.log(2.0), np.log(48.0))))
+            dt = t[s0:] - t[s0]
+            dip = (1.0 - depth) * (1.0 - np.exp(-dt / rise)) * np.exp(-dt / half)
+            path[s0:] *= np.maximum(1.0 - dip, 0.02)
+        if rng.random() < 0.35:
+            z0 = int(rng.integers(0, L))
+            zl = int(rng.integers(1, max(2, L // 20)))
+            path[z0:z0 + zl] = 0.0
+        path = np.maximum(path, 0.0)
+        m = float(np.mean(path[path > 0])) if np.any(path > 0) else 1.0
+        if m > 0:
+            path = path / m
+        out[i] = base * path
+    return out
+
+
+def _cluster_job_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """DoppelGANger-inspired Google-cluster-style job demand (attribute → feature)."""
+    t = _time_index(L).ravel()
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        job = int(rng.integers(0, 3))
+        level = float(np.exp(rng.uniform(*[(1.5, 4.0), (4.0, 8.0), (6.0, 12.0)][job])))
+        alive_frac = float(rng.uniform(*[(0.15, 0.55), (0.55, 0.95), (0.35, 0.85)][job]))
+        alive_len = max(int(round(L * alive_frac)), 2)
+        shape = np.zeros(L, dtype=np.float64)
+        cursor = 0
+        while cursor < alive_len:
+            step = int(rng.integers(max(1, alive_len // 20), max(2, alive_len // 3)))
+            amp = float(np.exp(rng.normal(0.0, rng.uniform(0.2, 0.8))))
+            if job == 0:
+                amp *= float(np.exp(rng.uniform(0.0, 1.2)))
+            end = min(cursor + step, alive_len)
+            shape[cursor:end] = amp
+            cursor = end
+        if job >= 1:
+            p_day = float(np.exp(rng.uniform(np.log(24.0), np.log(96.0))))
+            phase = float(rng.uniform(0.0, 2.0 * np.pi))
+            day = 1.0 + rng.uniform(0.05, 0.35) * np.sin(2.0 * np.pi * t / p_day + phase)
+            shape[:alive_len] *= day[:alive_len]
+        active = shape > 0
+        if active.any():
+            shape[active] /= float(np.mean(shape[active]))
+        series = level * shape
+        if job == 0 and rng.random() < 0.25 and alive_len < L - 2:
+            z0 = int(rng.integers(alive_len, L))
+            zl = int(rng.integers(1, max(2, (L - alive_len) // 4)))
+            series[z0:min(L, z0 + zl)] = level * float(rng.uniform(0.05, 0.4))
+        out[i] = np.round(np.maximum(series, 0.0))
+    return out
