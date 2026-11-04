@@ -5677,3 +5677,20 @@ _SEASONAL_PAIRS = np.array(
      [12, 52]],
     dtype=np.float64,
 )
+
+
+# ==============================================================================
+# Family registry, weights, dispatch
+# ==============================================================================
+
+# --- ported from jupiter-king-ed2351 ---------------------------------
+# The members of the proven six-family block this host lacks.
+# Appended, never inserted: at weight 0.0 the corpus digest is
+# unchanged, which this script asserts against the unported host.
+_ED5: tuple[str, ...] = (
+    "transport_flow_tail",
+    "capacity_counts",
+    "overdispersed_counts",
+    "reported_epi_counts",
+    "retail_promo_tail",
+)
