@@ -4354,3 +4354,89 @@ def f2_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.7)
     fl["integer"] = P["count_emit"]
     return y, fl
+
+
+# ═══════════════════ F3 retail_promo_intermittent ══════════════════════════
+
+def f3_params(rng, B, cfg):
+    p = cfg["families"]["retail_promo_intermittent"]
+    return {
+        "base": logu(rng, 0.4, 3.0e4, B),
+        "trend": rng.normal(0.0, 0.4, B),
+        "season_amp": rng.uniform(0.0, 0.8, B),
+        "promo_period": np.array([7.0, 14.0, 30.436875, 91.310625])[
+            categorical(rng, [0.30, 0.20, 0.35, 0.15], B)],
+        "promo_lift": logu(rng, 1.3, 6.0, B),
+        "promo_len": rng.integers(1, 5, B),
+        "trough_depth": rng.uniform(0.5, 0.9, B),
+        "trough_len": rng.integers(3, 22, B),
+        "elasticity": rng.uniform(-3.0, -0.3, B),
+        "price_sig": rng.uniform(0.02, 0.25, B),
+        "slow": rng.random(B) < p["slow_mover_rate"],
+        "interval": logu(rng, 2.0, 60.0, B),
+        "size_corr": rng.uniform(0.0, 0.9, B),
+        "stockout": rng.random(B) < p["stockout_rate"],
+        "so_len": logu(rng, 5.0, 120.0, B),
+        "launch": rng.random(B) < p["launch_rate"],
+        "launch_at": rng.uniform(0.05, 0.5, B),
+        "launch_ramp": logu(rng, 20.0, 600.0, B),
+        "nb_k": logu(rng, 0.3, 60.0, B),
+    }
+
+
+def f3_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    day = cal.day_index.astype(np.float64)
+
+    season = seasonal_profile(rng, n, L, np.maximum(
+        P["promo_period"].reshape(n, 1) * cad.p_day.reshape(n, 1) * 4.0, 8.0), cfg)
+    lam = P["base"].reshape(n, 1) * np.exp(
+        P["trend"].reshape(n, 1) * t / L + P["season_amp"].reshape(n, 1) * season)
+
+    # promotions are calendar-locked: same weekday, monthly/quarterly recurrence
+    per = np.maximum(P["promo_period"].reshape(n, 1), 1.0)
+    phase = (day % per)
+    on = phase < P["promo_len"].reshape(n, 1)
+    lift = np.where(on, P["promo_lift"].reshape(n, 1), 1.0)
+    # pull-forward cannibalisation: a trough follows every promotion
+    after = (phase >= P["promo_len"].reshape(n, 1)) & \
+        (phase < (P["promo_len"] + P["trough_len"]).reshape(n, 1))
+    lift = np.where(after, P["trough_depth"].reshape(n, 1), lift)
+
+    logp = ar1(rng, n, L, np.full(n, 0.99)) * P["price_sig"].reshape(n, 1)
+    lam = lam * lift * np.exp(P["elasticity"].reshape(n, 1) * logp)
+
+    if P["launch"].any():
+        at = P["launch_at"].reshape(n, 1) * L
+        ramp = np.clip((t - at) / P["launch_ramp"].reshape(n, 1), 0.0, 1.0)
+        # a genuine ramp from zero, never a constant prefix
+        lam = np.where(P["launch"].reshape(n, 1), lam * ramp, lam)
+
+    y = nb_counts(rng, lam, P["nb_k"])
+
+    # slow movers: Croston-style intermittency with correlated interval and size
+    if P["slow"].any():
+        M = 128
+        gaps = np.maximum(np.exp(rng.normal(
+            np.log(P["interval"]).reshape(n, 1), 0.7, size=(n, M))), 1.0)
+        seg, seg_start = segment_map(gaps, L)
+        hit = (t == seg_start)
+        glen = gather_levels(gaps, seg)
+        corr = P["size_corr"].reshape(n, 1)
+        size = lam * (1.0 - corr + corr * glen / np.maximum(
+            P["interval"].reshape(n, 1), 1.0))
+        sparse = np.where(hit, nb_counts(rng, size, P["nb_k"]), 0.0)
+        y = np.where(P["slow"].reshape(n, 1), sparse, y)
+
+    if P["stockout"].any():
+        starts = rng.integers(0, L, size=(n, 3))
+        lens = P["so_len"].reshape(n, 1) * np.exp(rng.normal(0.0, 0.5, size=(n, 3)))
+        live = rng.random((n, 3)) < 0.5
+        mask = run_mask(n, L, starts, np.where(live, lens, 0.0))
+        y = np.where(mask & P["stockout"].reshape(n, 1), 0.0, y)
+
+    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.3)
+    fl["integer"] = np.ones(n, dtype=bool)
+    fl["offset_pref"] = np.full(n, 2, dtype=np.int8)
+    return y, fl
