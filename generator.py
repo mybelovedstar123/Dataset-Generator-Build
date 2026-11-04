@@ -2650,3 +2650,43 @@ def b1_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.8)
     fl["integer"] = P["count_emit"]
     return y, fl
+
+
+# ════════════════════ B2 ops_saturating_feedback ═══════════════════════════
+
+def b2_params(rng, B, cfg):
+    p = cfg["families"]["ops_saturating_feedback"]
+    q = b1_params(rng, B, cfg)
+    q.update({
+        "th_up": rng.uniform(0.6, 0.9, B),
+        "th_dn": rng.uniform(0.15, 0.45, B),
+        "gam": rng.uniform(p["step_gain"][0], p["step_gain"][1], B),
+        "k_up": rng.integers(3, 61, B),
+        "k_dn": rng.integers(3, 61, B),
+        "lag": np.round(logu(rng, 2.0, 20.0, B)).astype(np.int64),
+        "mode": categorical(rng, p["emit_mix"], B),
+        "u_scale": np.array([1.0, 100.0])[categorical(rng, [0.35, 0.65], B)],
+    })
+    return q
+
+
+def b2_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    d = b1_demand(P, rng, L, cad, cal, cfg)
+    c0 = np.maximum(d[:, :64].mean(axis=1) / 0.7, 1e-6)
+    out = np.zeros((n, L))
+    cap = np.zeros((n, L))
+    k_feedback(np.ascontiguousarray(d),
+                 np.ascontiguousarray(P["th_up"]),
+                 np.ascontiguousarray(P["th_dn"]),
+                 np.ascontiguousarray(P["k_up"]).astype(np.int64),
+                 np.ascontiguousarray(P["k_dn"]).astype(np.int64),
+                 np.ascontiguousarray(P["gam"]),
+                 np.ascontiguousarray(P["lag"]).astype(np.int64),
+                 c0, np.ascontiguousarray(P["mode"]).astype(np.int64), out, cap)
+    mode = P["mode"].reshape(n, 1)
+    y = np.where(mode == 0, out * P["u_scale"].reshape(n, 1), out)
+    fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.8)
+    fl["bounded"] = (P["mode"] == 0)
+    fl["scale_mode"] = np.where(P["mode"] == 0, 2, 1).astype(np.int8)
+    return y, fl
