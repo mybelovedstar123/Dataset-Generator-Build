@@ -6277,3 +6277,80 @@ def _row_pool(size: int) -> "_StreamPool":
         _ROW_POOL.pool = _StreamPool(size)
         _ROW_POOL.size = size
     return _ROW_POOL.pool
+
+# ==============================================================================
+# Parallel family-group workers
+# ==============================================================================
+
+def _producer_workers() -> int:
+    """Threads used to build the family groups of one chunk.
+
+    The family groups of a chunk are independent: each draws from streams keyed
+    (base_seed, chunk_index, fam, slot, tag) and writes only its own slots, so
+    the corpus does not depend on how many run at once or in what order.
+
+    What caps this is the GIL, not the core count -- only the numba kernels and
+    the bulk ufunc loops release it, so the curve saturates early and then goes
+    backwards. Measured on h6-sales against the 5.3M points/s serial baseline:
+
+        cores   1 worker   2 workers   3 workers   4 workers
+          1       1.02x      0.98x       0.95x       0.94x
+          2       1.00x      1.41x       1.25x       1.19x
+          4       1.03x      1.44x       1.50x       1.49x
+         32       1.01x      1.42x       1.45x       1.38x
+
+    Hence the steps below. A one-core lane must stay serial -- threads there
+    are a real if small loss -- and three is only worth it once the slice can
+    actually hold three runnable threads.
+
+    The affinity set, not os.cpu_count(), is what a pod lane is allowed to use:
+    on a cgroup-limited container cpu_count reports the whole host.
+    """
+    try:
+        avail = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        avail = os.cpu_count() or 1
+    avail = max(1, int(avail))
+    if avail < 2:
+        return 1
+    return 2 if avail < 4 else 3
+
+
+_PRODUCER_WORKERS = _producer_workers()
+
+
+def _run_family_groups(build, tasks: list) -> None:
+    """Build a chunk's family groups across ``_PRODUCER_WORKERS`` threads.
+
+    Groups claim work off a shared index and write only into their own slots of
+    the chunk, so the result is independent of scheduling. The first exception
+    stops the remaining claims and is re-raised on the calling thread, which
+    keeps the producer's existing error path intact.
+    """
+    nxt = [0]
+    err: list[BaseException] = []
+    lock = Lock()
+    total = len(tasks)
+
+    def worker() -> None:
+        while True:
+            with lock:
+                if err or nxt[0] >= total:
+                    return
+                i = nxt[0]
+                nxt[0] = i + 1
+            try:
+                build(*tasks[i])
+            except BaseException as exc:
+                with lock:
+                    err.append(exc)
+                return
+
+    threads = [Thread(target=worker, daemon=True, name=f"cascade-fam-{i}")
+               for i in range(min(_PRODUCER_WORKERS, total))]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    if err:
+        raise err[0]
