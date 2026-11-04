@@ -3884,3 +3884,43 @@ def e2_build(P, rng, L, cad, cal, cfg):
     fl["scale_mode"] = np.where(P["emit"] == 0, 0, 1).astype(np.int8)
     fl["positive"] = (P["emit"] > 0)
     return y, fl
+
+
+# ════════════════════════════ E3 hawkes_marked ═════════════════════════════
+
+def e3_params(rng, B, cfg):
+    p = cfg["families"]["hawkes_marked"]
+    return {
+        "mu": logu(rng, 1e-4, 2.0, B),
+        "branch": rng.uniform(p["branching"][0], p["branching"][1], B),
+        "tau": logu(rng, 2.0, 200.0, B),
+        "power_law": rng.random(B) < p["power_law_rate"],
+        "diurnal": rng.random(B) < 0.45,
+        "diurnal_amp": rng.uniform(0.2, 0.9, B),
+        "emit": categorical(rng, p["emit_mix"], B),
+        "mark_sig": rng.uniform(0.4, 1.8, B),
+        "decay_tau": logu(rng, 2.0, 120.0, B),
+    }
+
+
+def e3_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    pd = cad.p_day.reshape(n, 1)
+    has_day = pd >= 3.0
+    ph = t / np.where(has_day, pd, 1e9) + rng.random((n, 1))
+    prof = 1.0 + np.where(P["diurnal"].reshape(n, 1) & has_day,
+                          P["diurnal_amp"].reshape(n, 1) * np.sin(_cf_prims_TWO_PI * ph), 0.0)
+    mu = np.ascontiguousarray(P["mu"].reshape(n, 1) * np.maximum(prof, 0.05))
+    mu = np.ascontiguousarray(np.broadcast_to(mu, (n, L)).copy())
+
+    lam, cnt = hawkes(rng, n, L, mu, P["branch"], P["tau"], P["power_law"])
+    marks = cnt * np.exp(rng.normal(0.0, P["mark_sig"].reshape(n, 1), size=(n, L)))
+    marked = decay_convolve(marks, P["decay_tau"])
+
+    emit = P["emit"].reshape(n, 1)
+    y = np.where(emit == 0, cnt, np.where(emit == 1, lam, marked))
+    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.5)
+    fl["integer"] = (P["emit"] == 0)
+    fl["offset_pref"] = np.full(n, 2, dtype=np.int8)
+    return y, fl
