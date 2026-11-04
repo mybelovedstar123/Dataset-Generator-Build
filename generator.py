@@ -1811,3 +1811,152 @@ MAX_PEAK = 1.0e12
 
 def _rows(mask):
     return np.nonzero(mask)[0]
+
+
+# ═════════════════════════════ observation layer ═══════════════════════════
+
+def apply_observation(rng, y, flags, cfg):
+    n, L = y.shape
+    o = cfg["observation"]
+    boost = flags["obs_boost"]
+    integer = flags["integer"]
+    bounded = flags["bounded"]
+    positive = flags["positive"]
+
+    def gate(rate):
+        return rng.random(n) < np.clip(rate * boost, 0.0, 1.0)
+
+    # ── 1. block aggregation ────────────────────────────────────────────────
+    # Real feeds are frequently a rolling-window statistic of a finer signal: a
+    # max-aggregate has an extreme-value marginal, a mean-aggregate a smoothed
+    # one, and neither looks like the underlying process.  We aggregate causally
+    # at constant length so the emitted series stays a multiple of 32 samples.
+    lo_b = y.min(axis=1, keepdims=True)
+    hi_b = y.max(axis=1, keepdims=True)
+
+    sel = gate(o["block_aggregation_rate"])
+    ks = rng.integers(2, 13, n)
+    modes = rng.integers(0, 4, n)
+    modes = np.where(integer & (modes == 0), 1, modes)   # mean breaks a lattice
+    modes = np.where(bounded & (modes == 1), 2, modes)   # sum breaks a hard bound
+    if sel.any():
+        for k in range(2, 13):
+            for mode in range(4):
+                idx = _rows(sel & (ks == k) & (modes == mode))
+                if idx.size:
+                    y[idx] = rolling_agg(y[idx], k, mode)
+
+    # ── 2. quantisation to a round human tick ───────────────────────────────
+    qb = flags["quant_boost"]
+    idx = _rows((rng.random(n) < np.clip(o["quantise_rate"] * qb, 0.0, 1.0))
+                & (~integer))
+    if idx.size:
+        m = idx.size
+        sub = y[idx]
+        std = safe_std(sub)
+        tick = human_tick(std[:, 0], rng, m, 1e-3, flags["quant_rel_hi"][idx])
+        q = np.round(sub / tick) * tick
+        lg_sel = rng.random(m) < o["log_grid_share"]
+        if lg_sel.any():
+            j = _rows(lg_sel)
+            step = np.maximum(logu(rng, 0.01, 0.25, (j.size, 1)), 1e-6)
+            base = np.maximum(np.abs(sub[j]), 1e-300)
+            q[j] = np.sign(sub[j]) * np.exp(np.round(np.log(base) / step) * step)
+        y[idx] = q
+        flags["integer"][idx] = True
+
+    # ── 3. one-sided censoring at a round value ─────────────────────────────
+    idx = _rows(gate(o["censor_rate"]))
+    if idx.size:
+        m = idx.size
+        sub = y[idx]
+        std = safe_std(sub)
+        mean = sub.mean(axis=1, keepdims=True)
+        up = rng.random((m, 1)) < 0.5
+        lvl = mean + np.where(up, 1.0, -1.0) * logu(rng, 0.8, 2.6, (m, 1)) * std
+        tick = human_tick(std[:, 0], rng, m, 0.05, 0.5)
+        # an integer feed is clipped at an integer, not at an arbitrary tick
+        tick = np.where(integer[idx].reshape(m, 1), np.maximum(np.round(tick), 1.0), tick)
+        lvl = np.round(lvl / tick) * tick
+        y[idx] = np.where(up, np.minimum(sub, lvl), np.maximum(sub, lvl))
+
+    # ── 4. staleness (bursty last-observation-carried-forward) ──────────────
+    idx = _rows(gate(o["staleness_rate"]))
+    if idx.size:
+        m = idx.size
+        gap = bursty_gaps(rng, m, L, logu(rng, 1e-4, 4e-3, (m, 1)),
+                          logu(rng, 2.0, 60.0, (m, 1)))
+        y[idx] = locf(y[idx], gap)
+
+    # ── 5. missing-as-zero ──────────────────────────────────────────────────
+    idx = _rows(gate(o["missing_zero_rate"]) & (~bounded))
+    if idx.size:
+        m = idx.size
+        gap = bursty_gaps(rng, m, L, logu(rng, 1e-4, 3e-3, (m, 1)),
+                          logu(rng, 2.0, 40.0, (m, 1)))
+        sub = y[idx]
+        sub[gap] = 0.0
+        y[idx] = sub
+
+    # ── 6. isolated outliers ────────────────────────────────────────────────
+    idx = _rows(gate(o["outlier_rate"]) & (~bounded))
+    if idx.size:
+        m = idx.size
+        sub = y[idx]
+        thin = sub[:, ::8]
+        med = np.median(thin, axis=1, keepdims=True)
+        mad = np.maximum(np.median(np.abs(thin - med), axis=1, keepdims=True), 1e-12)
+        E = 5
+        pos = rng.integers(0, L, size=(m, E))
+        live = np.arange(E)[None, :] < rng.integers(1, E + 1, size=(m, 1))
+        sign = np.where(rng.random((m, 1)) < 0.5, 1.0, -1.0)
+        amp = logu(rng, 6.0, 60.0, (m, E)) * mad * sign
+        amp = np.where(integer[idx].reshape(m, 1), np.round(amp), amp)
+        rows = np.broadcast_to(np.arange(m)[:, None], (m, E))
+        np.add.at(sub, (rows[live], pos[live]), amp[live])
+        y[idx] = sub
+
+    # ── 7. instrument drift with abrupt recalibration ───────────────────────
+    idx = _rows(gate(o["drift_recal_rate"]) & (~bounded) & (~integer))
+    if idx.size:
+        m = idx.size
+        M = 8
+        seg = rng.integers(1, L, size=(m, M))
+        rows = np.broadcast_to(np.arange(m, dtype=np.int64)[:, None], (m, M))
+        mark = np.bincount((rows * L + seg).ravel(), minlength=m * L).reshape(m, L)
+        t = np.arange(L, dtype=np.float64)[None, :]
+        start = np.maximum.accumulate(np.where(mark > 0, t, 0.0), axis=1)
+        slope = rng.normal(0.0, 1.0, size=(m, 1)) * logu(rng, 1e-5, 3e-3, (m, 1))
+        sub = y[idx]
+        std = safe_std(sub)
+        bias = slope * (t - start) * std
+        mult = rng.random((m, 1)) < 0.5
+        y[idx] = np.where(mult,
+                          sub * (1.0 + np.clip(bias / std, -0.9, 3.0)),
+                          sub + bias)
+
+    # ── 8. scale-guarded rounding ───────────────────────────────────────────
+    idx = _rows(gate(o["round_rate"]) & (~integer) & (~bounded))
+    if idx.size:
+        m = idx.size
+        sub = y[idx]
+        std = safe_std(sub)
+        tick = human_tick(std[:, 0], rng, m, 1e-4, 1.0 / o["round_min_ticks"])
+        # a share of these land on the literal integer lattice, which is what a
+        # natural-unit feed (people, packets, requests) actually looks like
+        unit = (rng.random((m, 1)) < o["integer_tick_share"]) & \
+            (std >= o["round_min_ticks"])
+        tick = np.where(unit, 1.0, tick)
+        ok = (std >= (o["round_min_ticks"] * tick))
+        y[idx] = np.where(ok, np.round(sub / tick) * tick, sub)
+        flags["integer"][idx] = flags["integer"][idx] | ok[:, 0]
+
+    idx = _rows(positive)
+    if idx.size:
+        np.maximum(y[idx], 0.0, out=y[idx])
+    # A family that declared hard bounds keeps them: the artefact stages must not
+    # move probability mass off a boundary we deliberately put there.
+    idx = _rows(bounded)
+    if idx.size:
+        y[idx] = np.clip(y[idx], lo_b[idx], hi_b[idx])
+    return y
