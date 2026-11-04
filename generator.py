@@ -6354,3 +6354,70 @@ def _run_family_groups(build, tasks: list) -> None:
         th.join()
     if err:
         raise err[0]
+
+
+# ==============================================================================
+# Hoisted CDF / physical constant tables
+# ==============================================================================
+
+_ENV_PERIODS = np.array([24.0, 48.0, 96.0, 168.0])
+_ENV_PERIOD_CDF = _choice_cdf([0.35, 0.20, 0.30, 0.15])
+_RATE_PERIODS = np.array([24.0, 96.0, 168.0, 336.0])
+_RATE_PERIOD_CDF = _choice_cdf([0.35, 0.30, 0.20, 0.15])
+_HOLD_FACTORS = np.array([2, 4, 8])
+_HOLD_FACTOR_CDF = _choice_cdf([0.55, 0.30, 0.15])
+# _cycle_profile drew these per row via ``rng.choice(a, p=...)``, the last such
+# site in this file. Hoisted for the reason given above _choice_cdf: the table
+# rebuild costs an order of magnitude more than the draw, and the hoisted form
+# reproduces the value and the stream position exactly.
+_CYCLE_PERIODS = np.array([7, 24, 48, 60, 96, 144, 168, 240, 288, 336, 672])
+_CYCLE_PERIOD_CDF = _choice_cdf(
+    [0.1113, 0.2321, 0.0862, 0.1610, 0.1386, 0.0392,
+     0.0040, 0.0040, 0.2156, 0.0040, 0.0040]
+)
+
+
+_CLEAN: frozenset[str] = frozenset({
+    "held_rate",
+    "settle_hold",
+    "web_traffic_plateau",
+    "ops_counter_reset",
+    "step_level",
+    "tidal_harmonic",
+    "weekly_demand",
+    "flow_recession",
+    "epi_season_decay",
+    "weekday_ledger_counts",
+    "surveillance_counts",
+    "pull_counter_ramp",
+    "weekly_cycle_downloads",
+    "hourly_social_counts",
+    "intraday_event_counts",
+    "intraday_spot_price",
+    "road_commute_counts",
+})
+
+
+# Standard tidal constituents: period in HOURS and typical amplitude relative
+# to M2. These are physical constants, not fitted parameters — the ratios
+# between them are what generate the spring-neap beat, and they are identical
+# at every gauge on Earth. Only the amplitudes and phases are site-specific.
+_TIDE_CONSTITUENTS = np.array([
+    [12.420601, 1.00],   # M2  principal lunar semidiurnal
+    [12.000000, 0.46],   # S2  principal solar semidiurnal
+    [12.658348, 0.19],   # N2  larger lunar elliptic
+    [11.967235, 0.13],   # K2  lunisolar semidiurnal
+    [23.934470, 0.58],   # K1  lunisolar diurnal
+    [25.819342, 0.41],   # O1  principal lunar diurnal
+    [24.065890, 0.19],   # P1  principal solar diurnal
+    [26.868357, 0.08],   # Q1  larger lunar elliptic diurnal
+], dtype=np.float64)
+
+# Sampling intervals in MINUTES that real gauge feeds arrive on. The period in
+# SAMPLES depends on this, so drawing it here is what lets one family cover
+# 5-min, 15-min and hourly gauges with the same physics.
+_TIDE_DT_MINUTES = np.array([5.0, 6.0, 10.0, 15.0, 30.0, 60.0], dtype=np.float64)
+_TIDE_DT_CDF = _choice_cdf([0.35, 0.25, 0.15, 0.15, 0.05, 0.05])
+_TIDE_DIURNAL = np.array(
+    [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64
+)[None, :]
