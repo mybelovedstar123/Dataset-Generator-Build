@@ -12060,3 +12060,272 @@ def _wc_ar1(rng: np.random.Generator, n: int, m: int, phi: np.ndarray) -> np.nda
     for k in range(1, m):
         a[:, k] = p * a[:, k - 1] + q * e[:, k]
     return a
+
+
+def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Annual epidemic waves on an endemic floor after a decaying pandemic
+    excess: rki / ukhsa / cdc_nssp / rivm / wikimedia-RSV at h720.
+
+    Floor = endemic level (slow log random walk sd U[0.004,0.02]/d + slope
+    U[-0.15,0.15]/yr, soft-capped) x (1 + pandemic excess): on 70% of rows an
+    excess of ratio log-U[3,100] rises over U[20,90] d from an onset anywhere in
+    [-1500, 0.85 L] and decays with tau U[150,900] d -- a decline the model can
+    read off the context and continue, never an AR(1) that snaps back.
+    Waves: log-parabola bumps centred at phi0 + 365 k + N(0, sigma) with
+    sigma U[3,15] d (phase-locked year to year), log peak/floor a_row
+    log-U[3,150] per row, drifting U[-0.15,0.05] per year (waves shrink after
+    the pandemic years) and jittered N(0, U[0.15,0.4]) per year, rise U[20,60] d,
+    fall = rise x U[1.2,2.5]; 35% of rows add a summer wave 180 +- 25 d later
+    at U[0.15,0.6] of the winter amplitude. Weekly profile weekend U[0.6,1.0],
+    Monday U[1,1.2] on 30%. Observation: 45% NB counts (floor log-U[0.3,300],
+    r log-U[5,60]); 25% percent-of-visits rows (cdc_nssp: NB numerator over
+    visits log-U[300,30000], 0.01 tick); 30% 7-day rolling mean of the counts
+    on a 0.01 tick (rki / ukhsa smoothed incidence).
+
+    Every (n, L) intermediate is carried in a reused buffer: the latent level,
+    the wave accumulator and the observed counts are the only full-width arrays
+    alive at any point, and the per-row observation branches are evaluated on
+    their own row slices instead of on the whole block.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    t = _time_index(L)
+
+    # ── endemic floor: slow random walk + gentle slope, soft-capped at ±3 ───
+    slope = rng.uniform(-0.15, 0.15, size=(n, 1)) / _HC_YEAR
+    rw_sd = rng.uniform(0.004, 0.02, size=(n, 1))
+    log_end = rng.normal(0.0, 1.0, size=(n, L))
+    log_end *= rw_sd
+    np.cumsum(log_end, axis=1, out=log_end)
+    log_end += slope * t
+    log_end /= 3.0
+    np.tanh(log_end, out=log_end)
+    log_end *= 3.0
+
+    # ── pandemic excess: onset, rise, then a long decay to the endemic floor ─
+    has_pand = rng.random((n, 1)) < 0.7
+    t0 = rng.uniform(-1500.0, 0.85 * L, size=(n, 1))
+    ratio = np.exp(rng.uniform(np.log(3.0), np.log(100.0), size=(n, 1)))
+    tau = rng.uniform(150.0, 900.0, size=(n, 1))
+    onset = rng.uniform(20.0, 90.0, size=(n, 1))
+    dt = t - t0
+    excess = dt / onset
+    np.clip(excess, 0.0, 1.0, out=excess)
+    excess *= ratio
+    dt -= onset
+    np.maximum(dt, 0.0, out=dt)
+    np.negative(dt, out=dt)
+    dt /= tau
+    np.exp(dt, out=dt)
+    excess *= dt
+    del dt
+    np.copyto(excess, 0.0, where=~has_pand)
+    excess += 1.0
+    np.exp(log_end, out=log_end)
+    excess *= log_end
+    floor = excess
+    del excess, log_end
+
+    # ── phase-locked annual waves (+ optional summer wave) ──────────────────
+    K = int(L // _HC_YEAR) + 4
+    sig_phase = rng.uniform(3.0, 15.0, size=(n, 1))
+    phi0 = rng.uniform(-_HC_YEAR, 0.0, size=(n, 1))
+    kk = np.arange(K, dtype=np.float64)[None, :]
+    centers = phi0 + _HC_YEAR * kk + rng.normal(0.0, 1.0, size=(n, K)) * sig_phase
+    a_row = rng.uniform(np.log(3.0), np.log(150.0), size=(n, 1))
+    sig_a = rng.uniform(0.15, 0.4, size=(n, 1))
+    a_trend = rng.uniform(-0.15, 0.05, size=(n, 1)) * (kk - 4.0)
+    amp = np.clip(a_row + a_trend + rng.normal(0.0, 1.0, size=(n, K)) * sig_a,
+                  np.log(1.3), np.log(400.0))
+    rise = rng.uniform(20.0, 60.0, size=(n, K))
+    fall = rise * rng.uniform(1.2, 2.5, size=(n, K))
+    has2 = rng.random((n, 1)) < 0.35
+    c2 = centers + rng.normal(180.0, 25.0, size=(n, K))
+    amp2 = np.maximum(amp + np.log(rng.uniform(0.15, 0.6, size=(n, K))), np.log(1.2))
+    rise2 = rng.uniform(20.0, 60.0, size=(n, K))
+    fall2 = rise2 * rng.uniform(1.2, 2.5, size=(n, K))
+    root = np.sqrt(np.log(5.0) / amp)
+    root2 = np.sqrt(np.log(5.0) / amp2)
+    w_l, w_r = rise / root, fall / root
+    w2_l, w2_r = rise2 / root2, fall2 / root2
+    # Log-shape exponent per wave and side over the same support: 2 is the
+    # smooth log-parabola. Respiratory ED / admission waves climb almost
+    # log-linearly right up to a sharp turnover and start falling at once, so
+    # 75% of rows take a rise exponent U[0.8, 1.5] and a fall exponent
+    # U[0.7, 1.4].
+    sharp = rng.random((n, 1)) < 0.75
+    p_l = np.where(sharp, rng.uniform(0.8, 1.5, size=(n, K)), 2.0)
+    p_r = np.where(sharp, rng.uniform(0.7, 1.4, size=(n, K)), 2.0)
+    waves = np.zeros((n, L), dtype=np.float64)
+    bump = np.empty((n, L), dtype=np.float64)
+    left = np.empty((n, L), dtype=np.bool_)
+    no2 = ~has2
+    for k in range(K):
+        c = centers[:, k:k + 1]
+        if c.min() > L + 400.0:
+            break
+        pl = p_l[:, k:k + 1]
+        pr = p_r[:, k:k + 1]
+        for cen, wl, wr, a, off in (
+                (c, w_l[:, k:k + 1], w_r[:, k:k + 1], amp[:, k:k + 1], None),
+                (c2[:, k:k + 1], w2_l[:, k:k + 1], w2_r[:, k:k + 1],
+                 amp2[:, k:k + 1], no2)):
+            # a bump is exactly zero outside [cen - wl, cen + wr], so only the
+            # columns inside some row's support are computed
+            j0 = max(int(np.floor((cen - wl).min())), 0)
+            j1 = min(int(np.ceil((cen + wr).max())) + 1, L)
+            if j1 <= j0:
+                continue
+            b = bump[:, j0:j1]
+            s = left[:, j0:j1]
+            np.subtract(t[..., j0:j1], cen, out=b)
+            np.less(b, 0.0, out=s)
+            np.divide(b, wl, out=b, where=s)
+            np.abs(b, out=b)
+            np.power(b, pl, out=b, where=s)
+            np.invert(s, out=s)
+            np.divide(b, wr, out=b, where=s)
+            np.power(b, pr, out=b, where=s)
+            np.subtract(1.0, b, out=b)
+            np.maximum(b, 0.0, out=b)
+            b *= a
+            np.expm1(b, out=b)
+            if off is not None:
+                np.copyto(b, 0.0, where=off)
+            waves[:, j0:j1] += b
+    del bump, left
+    waves += 1.0
+    waves *= floor
+    del floor
+    level = waves
+    # total dynamic range of the latent, per row, capped at 3000x its minimum
+    lo = level.min(axis=1, keepdims=True)
+    np.minimum(level, lo * 3000.0, out=level)
+
+    # ── weekly profile ──────────────────────────────────────────────────────
+    phase = rng.integers(0, 7, size=(n, 1))
+    wk = np.exp(rng.normal(0.0, 0.03, size=(n, 5)))
+    mon = np.where(rng.random((n, 1)) < 0.3, rng.uniform(1.0, 1.2, size=(n, 1)), 1.0)
+    wk[:, :1] *= mon
+    we = rng.uniform(0.6, 1.0, size=(n, 1))
+    prof = np.concatenate([wk, we * rng.uniform(0.9, 1.1, size=(n, 1)), we], axis=1)
+    prof = prof / prof[:, :5].mean(axis=1, keepdims=True)
+    # the day-of-week factor of column j is prof[(j + phase) % 7]: rotate the
+    # seven columns once per row and apply them to the seven strided views
+    prof_rot = np.take_along_axis(
+        prof, (np.arange(7, dtype=phase.dtype)[None, :] + phase) % 7, axis=1)
+
+    # ── observation ─────────────────────────────────────────────────────────
+    kind = rng.random((n, 1))
+    is_pct = kind < 0.25
+    is_smooth = kind >= 0.7
+    base = np.exp(rng.uniform(np.log(0.3), np.log(300.0), size=(n, 1)))
+    visits = np.exp(rng.uniform(np.log(300.0), np.log(30000.0), size=(n, 1)))
+    floor_pct = np.exp(rng.uniform(np.log(0.02), np.log(5.0), size=(n, 1)))
+    lam_base = np.where(is_pct, floor_pct / 100.0 * visits, base)
+    lam = level
+    lam *= lam_base
+    for m in range(7):
+        lam[:, m::7] *= prof_rot[:, m:m + 1]
+    np.minimum(lam, 1.0e6, out=lam)
+    r = np.exp(rng.uniform(np.log(5.0), np.log(60.0), size=(n, 1)))
+    g = rng.gamma(r, 1.0 / r, size=(n, L))
+    g *= lam
+    del lam, level
+    np.maximum(g, 0.0, out=g)
+    pois = rng.poisson(g)
+    out = g
+    np.copyto(out, pois)
+    del pois, g
+    # 7-day rolling mean and percent-of-visits are needed on their own rows
+    # only, and those row sets are disjoint, so both run on row slices
+    rows = np.flatnonzero(is_smooth[:, 0])
+    if rows.size:
+        smooth = out[rows]
+        csum = np.cumsum(smooth, axis=1)
+        np.subtract(csum[:, 7:], csum[:, :-7], out=smooth[:, 7:])
+        smooth[:, 7:] /= 7.0
+        np.divide(csum[:, :7], np.arange(1, 8, dtype=np.float64)[None, :],
+                  out=smooth[:, :7])
+        del csum
+        smooth /= 0.01
+        np.rint(smooth, out=smooth)
+        smooth *= 0.01
+        out[rows] = smooth
+        del smooth
+    rows = np.flatnonzero(is_pct[:, 0])
+    if rows.size:
+        pct = out[rows]
+        pct *= 100.0
+        pct /= visits[rows]
+        pct /= 0.01
+        np.rint(pct, out=pct)
+        pct *= 0.01
+        out[rows] = pct
+        del pct
+    return _epi_feed_fade(rng, out, is_pct | is_smooth)
+
+
+def _epi_feed_fade(rng: np.random.Generator, x: np.ndarray, ticked: np.ndarray) -> np.ndarray:
+    """Right-truncated reporting at the live edge of a surveillance feed.
+
+    Real-time hospitalisation / ED feeds are scored on their newest points,
+    where late reports have not arrived yet: completeness ramps down toward
+    the edge ((s/K)^g over the last K days, s = days before the edge), and
+    discontinued feeds end in a run of exact zeros. Integer rows are thinned
+    binomially; rate / smoothed rows are scaled and re-ticked. Draws come
+    after every native draw, so unfaded rows keep their exact values. ``x`` is
+    faded in place and returned: the caller hands over its only reference.
+    """
+    n, L = x.shape
+    fade = rng.random(n) < 0.4
+    K = rng.integers(60, 361, size=n)
+    gam = rng.uniform(0.5, 2.0, size=n)
+    stop = rng.random(n) < 0.5
+    Z = rng.integers(10, 151, size=n)
+    out = x
+    for i in np.flatnonzero(fade):
+        k = int(min(K[i], L - 1))
+        s = np.arange(k, 0, -1, dtype=np.float64) - 0.5
+        keep = np.clip(s / k, 0.0, 1.0) ** gam[i]
+        seg = out[i, L - k:]
+        if ticked[i, 0]:
+            out[i, L - k:] = np.rint(seg * keep / 0.01) * 0.01
+        else:
+            cnt = np.maximum(np.rint(seg), 0.0).astype(np.int64)
+            out[i, L - k:] = rng.binomial(cnt, keep).astype(np.float64)
+        if stop[i]:
+            out[i, L - int(min(Z[i], k)):] = 0.0
+    return out
+
+
+def _epi_feed_fade(rng: np.random.Generator, x: np.ndarray, ticked: np.ndarray) -> np.ndarray:
+    """Right-truncated reporting at the live edge of a surveillance feed.
+
+    Real-time hospitalisation / ED feeds are scored on their newest points,
+    where late reports have not arrived yet: completeness ramps down toward
+    the edge ((s/K)^g over the last K days, s = days before the edge), and
+    discontinued feeds end in a run of exact zeros. Integer rows are thinned
+    binomially; rate / smoothed rows are scaled and re-ticked. Draws come
+    after every native draw, so unfaded rows keep their exact values.
+    """
+    n, L = x.shape
+    fade = rng.random(n) < 0.4
+    K = rng.integers(60, 361, size=n)
+    gam = rng.uniform(0.5, 2.0, size=n)
+    stop = rng.random(n) < 0.5
+    Z = rng.integers(10, 151, size=n)
+    out = x.copy()
+    for i in np.flatnonzero(fade):
+        k = int(min(K[i], L - 1))
+        s = np.arange(k, 0, -1, dtype=np.float64) - 0.5
+        keep = np.clip(s / k, 0.0, 1.0) ** gam[i]
+        seg = out[i, L - k:]
+        if ticked[i, 0]:
+            out[i, L - k:] = np.rint(seg * keep / 0.01) * 0.01
+        else:
+            cnt = np.maximum(np.rint(seg), 0.0).astype(np.int64)
+            out[i, L - k:] = rng.binomial(cnt, keep).astype(np.float64)
+        if stop[i]:
+            out[i, L - int(min(Z[i], k)):] = 0.0
+    return out
