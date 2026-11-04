@@ -5982,3 +5982,298 @@ def _choice_cdf(p) -> np.ndarray:
 
 
 _CHOICE_PM1 = np.array([-1.0, 1.0], dtype=np.float64)
+
+
+# --- throughput: batched stream seeding -------------------------------------
+#
+# Every row derives three isolated streams (builder / observation / postprocess)
+# and the observation stage derives four more, so a single row pays SEVEN
+# ``default_rng(SeedSequence(...))`` constructions — ~40us each, ~15% of total
+# generation time, to draw as few as one number per stream.
+#
+# The streams themselves are load-bearing (they are what makes a config edit
+# touch only the rows it feeds), so the seeds must not change. Instead the
+# construction is replaced by numpy's own algorithm, run in bulk: SeedSequence
+# mixes a 4-word pool with a fixed integer hash chain and PCG64 seeds itself
+# from ``generate_state(4, uint64)``, both of which vectorise across keys that
+# share an entropy layout. The result is the identical 128-bit PCG64 state, so
+# every stream is byte-for-byte the stream numpy would have produced
+# (verified against numpy for every key shape used here in
+# _speedup/seedseq_check.py). Keys with an unexpected layout fall back to numpy.
+_SS_U32 = 0xFFFFFFFF
+_SS_U128 = (1 << 128) - 1
+_SS_POOL_SIZE = 4
+_SS_INIT_A = 0x43B0D7E5
+_SS_MULT_A = 0x931E8875
+_SS_INIT_B = 0x8B51F9DD
+_SS_MULT_B = 0x58F38DED
+_SS_MIX_L = np.uint32(0xCA01F9DD)
+_SS_MIX_R = np.uint32(0x4973F715)
+_SS_XSHIFT = np.uint32(16)
+_PCG64_MULT = 47026247687942121848144207491837523525
+
+
+def _ss_entropy_words(value: int) -> list[int]:
+    """numpy's ``_int_to_uint32_array``: little-endian words, ``[0]`` for zero."""
+    value = int(value)
+    if value < 0:
+        raise ValueError("seed entropy must be non-negative")
+    if value == 0:
+        return [0]
+    words: list[int] = []
+    while value > 0:
+        words.append(value & _SS_U32)
+        value >>= 32
+    return words
+
+
+def _ss_hashmix(value: np.ndarray, hash_const: int):
+    value = value ^ np.uint32(hash_const)
+    hash_const = (hash_const * _SS_MULT_A) & _SS_U32
+    value = value * np.uint32(hash_const)
+    value = value ^ (value >> _SS_XSHIFT)
+    return value, hash_const
+
+
+def _ss_mix(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    result = _SS_MIX_L * x - _SS_MIX_R * y
+    return result ^ (result >> _SS_XSHIFT)
+
+
+def _pcg64_seed_words(columns: list[np.ndarray]) -> np.ndarray:
+    """``SeedSequence(entropy).generate_state(4, uint64)`` for a batch of keys.
+
+    ``columns[i]`` holds word ``i`` of every key's assembled uint32 entropy.
+    Returns an ``(n_keys, 4)`` uint64 array.
+    """
+    hash_const = _SS_INIT_A
+    n_words = len(columns)
+    zero = np.zeros_like(columns[0])
+    pool = []
+    for i in range(_SS_POOL_SIZE):
+        value, hash_const = _ss_hashmix(
+            columns[i] if i < n_words else zero, hash_const
+        )
+        pool.append(value)
+    for i_src in range(_SS_POOL_SIZE):
+        for i_dst in range(_SS_POOL_SIZE):
+            if i_src != i_dst:
+                mixed, hash_const = _ss_hashmix(pool[i_src], hash_const)
+                pool[i_dst] = _ss_mix(pool[i_dst], mixed)
+    for i_src in range(_SS_POOL_SIZE, n_words):
+        for i_dst in range(_SS_POOL_SIZE):
+            mixed, hash_const = _ss_hashmix(columns[i_src], hash_const)
+            pool[i_dst] = _ss_mix(pool[i_dst], mixed)
+
+    hash_const = _SS_INIT_B
+    packed = np.empty((pool[0].size, 8), dtype=np.uint32)
+    for i in range(8):
+        value = pool[i % _SS_POOL_SIZE] ^ np.uint32(hash_const)
+        hash_const = (hash_const * _SS_MULT_B) & _SS_U32
+        value = value * np.uint32(hash_const)
+        packed[:, i] = value ^ (value >> _SS_XSHIFT)
+    return packed.view(np.uint64)
+
+
+@njit(cache=False, fastmath=False)
+def _pcg64_seed_words_jit(seeds):
+    """Per-key form of :func:`_pcg64_seed_words` for scalar integer seeds.
+
+    Same hash chain, compiled: the vectorised form only pays for its ~50 numpy
+    dispatches across a whole chunk, and a pure-python loop is slower than the
+    numpy constructor it replaces. ``seeds`` is a uint64 vector; the returned
+    ``(k, 4)`` uint64 array holds each key's ``generate_state(4, uint64)``.
+    """
+    mask = np.uint64(0xFFFFFFFF)
+    mult_a = np.uint64(0x931E8875)
+    mult_b = np.uint64(0x58F38DED)
+    mix_l = np.uint64(0xCA01F9DD)
+    mix_r = np.uint64(0x4973F715)
+    shift = np.uint64(16)
+    thirty_two = np.uint64(32)
+    zero = np.uint64(0)
+
+    k = seeds.shape[0]
+    out = np.empty((k, 4), dtype=np.uint64)
+    entropy = np.empty(2, dtype=np.uint64)
+    pool = np.empty(4, dtype=np.uint64)
+    words = np.empty(8, dtype=np.uint64)
+
+    for key in range(k):
+        seed = seeds[key]
+        # numpy encodes an integer as little-endian uint32 words, and zero as a
+        # single zero word.
+        if seed > mask:
+            entropy[0] = seed & mask
+            entropy[1] = seed >> thirty_two
+            n_words = 2
+        else:
+            entropy[0] = seed
+            n_words = 1
+
+        hash_const = np.uint64(0x43B0D7E5)
+        for i in range(4):
+            value = (entropy[i] if i < n_words else zero) ^ hash_const
+            hash_const = (hash_const * mult_a) & mask
+            value = (value * hash_const) & mask
+            pool[i] = value ^ (value >> shift)
+        for i_src in range(4):
+            for i_dst in range(4):
+                if i_src == i_dst:
+                    continue
+                mixed = pool[i_src] ^ hash_const
+                hash_const = (hash_const * mult_a) & mask
+                mixed = (mixed * hash_const) & mask
+                mixed = mixed ^ (mixed >> shift)
+                result = (mix_l * pool[i_dst] - mix_r * mixed) & mask
+                pool[i_dst] = result ^ (result >> shift)
+        for i_src in range(4, n_words):
+            for i_dst in range(4):
+                mixed = entropy[i_src] ^ hash_const
+                hash_const = (hash_const * mult_a) & mask
+                mixed = (mixed * hash_const) & mask
+                mixed = mixed ^ (mixed >> shift)
+                result = (mix_l * pool[i_dst] - mix_r * mixed) & mask
+                pool[i_dst] = result ^ (result >> shift)
+
+        hash_const = np.uint64(0x8B51F9DD)
+        for i in range(8):
+            value = pool[i & 3] ^ hash_const
+            hash_const = (hash_const * mult_b) & mask
+            value = (value * hash_const) & mask
+            words[i] = value ^ (value >> shift)
+        for i in range(4):
+            out[key, i] = words[2 * i] | (words[2 * i + 1] << thirty_two)
+    return out
+
+
+def _ss_columns(parts: list, n_keys: int) -> list[np.ndarray] | None:
+    """Assemble entropy columns, or ``None`` if the keys are not uniform.
+
+    ``parts`` mixes python ints (shared by every key) with integer arrays (one
+    value per key). numpy encodes each component as however many little-endian
+    uint32 words its magnitude needs, so a part whose values straddle 2**32 has
+    no single column layout and the caller must fall back to numpy.
+    """
+    columns: list[np.ndarray] = []
+    for part in parts:
+        if np.ndim(part) == 0:
+            for word in _ss_entropy_words(int(part)):
+                columns.append(np.full(n_keys, word, dtype=np.uint32))
+            continue
+        values = np.asarray(part)
+        if values.min() < 0 or values.max() >= (1 << 64):
+            return None
+        values = values.astype(np.uint64)
+        # zero and any value below 2**32 occupy one word; above it, two.
+        n_words = 2 if values.max() > _SS_U32 else 1
+        if n_words == 2 and values.min() <= _SS_U32:
+            return None  # mixed widths within one component
+        for shift in range(n_words):
+            columns.append(
+                ((values >> np.uint64(32 * shift)) & np.uint64(_SS_U32))
+                .astype(np.uint32)
+            )
+    return columns
+
+
+class _StreamPool:
+    """Reusable PCG64/Generator pairs, reseeded in place per row.
+
+    Constructing a ``Generator`` is ~40us; overwriting a bit generator's state
+    is ~3us. Each slot owns a distinct pair, so streams that are live at the
+    same time (a row's observation stream and the four stage streams it
+    derives) never share a bit generator.
+    """
+
+    __slots__ = ("_bitgens", "_rngs")
+
+    def __init__(self, size: int) -> None:
+        self._bitgens = [np.random.PCG64(0) for _ in range(size)]
+        self._rngs = [np.random.Generator(b) for b in self._bitgens]
+
+    def seeded(self, slot: int, w0, w1, w2, w3) -> np.random.Generator:
+        """Reseed slot ``slot`` from one key's four uint64 state words."""
+        seed = (int(w0) << 64) | int(w1)
+        inc = ((((int(w2) << 64) | int(w3)) << 1) | 1) & _SS_U128
+        state = (inc + seed) & _SS_U128
+        state = (state * _PCG64_MULT + inc) & _SS_U128
+        self._bitgens[slot].state = {
+            "bit_generator": "PCG64",
+            "state": {"state": state, "inc": inc},
+            "has_uint32": 0,
+            "uinteger": 0,
+        }
+        return self._rngs[slot]
+
+
+def _assert_seeding_replica() -> None:
+    """Fail at import if the seeding fast path stops matching numpy.
+
+    ``_pcg64_seed_words``/``_pcg64_seed_words_jit``/``_StreamPool.seeded``
+    reimplement ``SeedSequence`` mixing and ``PCG64`` init to skip ~16% of the
+    per-row cost. That is only sound while it reproduces numpy exactly, so
+    check it against the real thing rather than trusting the pin in
+    requirements.txt. A wrong stream here would silently change every series,
+    which is far worse than refusing to load.
+    """
+    pool = _StreamPool(1)
+
+    def check(what, key, words):
+        want = np.random.default_rng(np.random.SeedSequence(key)).bit_generator.state
+        got = pool.seeded(0, *words).bit_generator.state
+        if got["state"] != want["state"]:
+            raise RuntimeError(
+                f"{what} SeedSequence replica diverged from numpy "
+                f"{np.__version__} on key {key!r}"
+            )
+
+    # Both entropy-width regimes: every component under 2**32 (one uint32 word
+    # each) and every component above it (two).
+    big = 5125841920496347586
+    for batch in (
+        [(0, 0, 0, 0, 0), (1, 2, 3, 4, 5), (123456789, 17, 4, 2, 9)],
+        [(big, big + 1, big + 2, big + 3, big + 4), (big + 5,) * 5],
+    ):
+        n_keys = len(batch)
+        parts = [
+            np.array([k[i] for k in batch], dtype=np.uint64) for i in range(5)
+        ]
+        cols = _ss_columns(parts, n_keys)
+        if cols is None:
+            raise RuntimeError("uniform-width batch was rejected by _ss_columns")
+        state_words = _pcg64_seed_words(cols)
+        for row, key in enumerate(batch):
+            check("vectorised", key, state_words[row])
+
+    # A component straddling 2**32 has no single column layout, and the caller
+    # relies on None to fall back to numpy rather than emitting a wrong stream.
+    if _ss_columns([np.array([1, big], dtype=np.uint64)], 2) is not None:
+        raise RuntimeError("_ss_columns accepted a mixed-width component")
+
+    scalar_seeds = np.array([0, 1, 2**63 - 1, 123456789], dtype=np.uint64)
+    words = _pcg64_seed_words_jit(scalar_seeds)
+    for row, seed in enumerate(scalar_seeds.tolist()):
+        check("scalar", int(seed), words[row])
+
+
+_assert_seeding_replica()
+
+
+# The observation stage's four sub-streams are derived inside a module-level
+# function, so their pool lives here. Thread-local because the pool is mutable
+# state and a caller may drain more than one generator at once.
+_STAGE_POOL = local()
+
+# Same reason, for the per-row streams the chunk loop hands to each family
+# group. A _StreamPool reseeds one bit generator in place per slot, so two
+# family groups building at once must not share one: thread-local pools give
+# each builder thread its own, keyed by the tag count in use.
+_ROW_POOL = local()
+
+
+def _row_pool(size: int) -> "_StreamPool":
+    if getattr(_ROW_POOL, "size", 0) < size:
+        _ROW_POOL.pool = _StreamPool(size)
+        _ROW_POOL.size = size
+    return _ROW_POOL.pool
