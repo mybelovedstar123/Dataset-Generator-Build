@@ -8129,3 +8129,213 @@ def _apply_unique_idea(
     depth = rng.uniform(0.05, 0.12, size=(n, 1))
     scale = np.median(np.abs(block), axis=1, keepdims=True) + 1e-9
     return np.ascontiguousarray(block + depth * scale * (shape - 1.0), dtype=np.float64)
+
+# ==============================================================================
+# Generator class and chunked production
+# ==============================================================================
+
+# ==============================================================================
+# V144: native renewal-persistence component (not a frozen suffix)
+# ==============================================================================
+
+_RENEWAL_ELIGIBLE = frozenset({
+    "held_rate", "step_level", "conditional_stability", "cs_flat", "cs_drift",
+})
+_RENEWAL_DEFAULTS: dict[str, Any] = {
+    "rate": 0.0,
+    "eligible_families": ["held_rate", "step_level", "conditional_stability"],
+    "mode_weights": [0.50, 0.25, 0.25],  # grid hold / noisy level / seasonal level
+    "quiet_median_min": 128.0,
+    "quiet_median_max": 3072.0,
+    "active_median_min": 48.0,
+    "active_median_max": 384.0,
+    "dwell_sigma": 0.85,
+    "signed_share": 0.10,
+}
+_RENEWAL_SELECT_STAGE = 0xC14401
+_RENEWAL_PATH_STAGE = 0xC14402
+_RENEWAL_NOISE_STAGE = 0xC14403
+
+
+def _parse_renewal_persistence(raw: Any) -> dict[str, Any]:
+    """Fail early on invalid or misspelled settings; absent means byte-inert."""
+    if not isinstance(raw, dict):
+        raise ValueError("renewal_persistence must be a JSON object")
+    unknown = set(raw) - set(_RENEWAL_DEFAULTS)
+    if unknown:
+        raise ValueError("unknown renewal_persistence keys: " + ", ".join(sorted(unknown)))
+    settings = dict(_RENEWAL_DEFAULTS)
+    settings.update(raw)
+    names = settings["eligible_families"]
+    if not isinstance(names, (list, tuple)) or not all(isinstance(x, str) for x in names):
+        raise ValueError("renewal_persistence.eligible_families must be a list of strings")
+    if not names or len(set(names)) != len(names) or not set(names) <= _RENEWAL_ELIGIBLE:
+        raise ValueError("renewal_persistence.eligible_families must contain unique persistence families")
+    settings["eligible_families"] = tuple(names)
+    for key in ("rate", "signed_share", "quiet_median_min", "quiet_median_max",
+                "active_median_min", "active_median_max", "dwell_sigma"):
+        try:
+            value = float(settings[key])
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"renewal_persistence.{key} must be numeric") from exc
+        if not np.isfinite(value):
+            raise ValueError(f"renewal_persistence.{key} must be finite")
+        settings[key] = value
+    for key in ("rate", "signed_share"):
+        if not 0.0 <= settings[key] <= 1.0:
+            raise ValueError(f"renewal_persistence.{key} must be in [0, 1]")
+    for prefix in ("quiet", "active"):
+        lo, hi = settings[f"{prefix}_median_min"], settings[f"{prefix}_median_max"]
+        if not 1.0 <= lo <= hi <= 1.0e6:
+            raise ValueError(f"renewal_persistence.{prefix} medians require 1 <= min <= max <= 1e6")
+    if not 0.0 < settings["dwell_sigma"] <= 2.0:
+        raise ValueError("renewal_persistence.dwell_sigma must be in (0, 2]")
+    try:
+        weights = np.asarray(settings["mode_weights"], dtype=np.float64)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("renewal_persistence.mode_weights must contain three numbers") from exc
+    if (weights.shape != (3,) or not np.isfinite(weights).all()
+            or (weights < 0.0).any() or not np.isfinite(weights.sum()) or weights.sum() <= 0.0):
+        raise ValueError("renewal_persistence.mode_weights must be three finite nonnegative weights with positive sum")
+    settings["mode_weights"] = tuple((weights / weights.sum()).tolist())
+    return settings
+
+
+def _renewal_persistence_series(
+    path_rng: np.random.Generator,
+    noise_rng: np.random.Generator,
+    length: int,
+    settings: dict[str, Any],
+    *,
+    return_metadata: bool = False,
+) -> Any:
+    """Generate a native quiet/active process with its own observation law.
+
+    The renewal clock is independent of the requested length and of forecast
+    origins. Initial residual life uses a length-biased lognormal draw (with
+    integer rounding); this avoids always starting a new regime at sample 0.
+    Quiet runs can end. Seasonal rows retain their carrier in BOTH states.
+    Noise has a separate stream, so extending length cannot move earlier events.
+    Metadata is diagnostic-only; Generator.generate yields bare arrays only.
+    """
+    if length < 0:
+        raise ValueError("length must be nonnegative")
+    if length == 0:
+        empty = np.empty(0, dtype=np.float64)
+        return (empty, {"mode": -1, "quiet": np.empty(0, dtype=bool)}) if return_metadata else empty
+
+    mode = int(np.searchsorted(np.cumsum(settings["mode_weights"]), path_rng.random(), side="right"))
+    mode = min(mode, 2)
+    signed = bool(path_rng.random() < settings["signed_share"])
+    scale = float(np.exp(path_rng.uniform(np.log(2.0), np.log(5000.0))))
+    offset = float(path_rng.uniform(-1.5, 1.5))
+    # A recurring grid is a measurement law, not an assertion of zero future
+    # uncertainty: the latent process still changes when it becomes active.
+    raw_tick = scale * float(np.exp(path_rng.uniform(np.log(0.002), np.log(0.04))))
+    power = 10.0 ** float(np.floor(np.log10(raw_tick)))
+    tick = power * float(path_rng.choice(np.array([1.0, 2.0, 5.0])))
+    q_med = float(np.exp(path_rng.uniform(np.log(settings["quiet_median_min"]),
+                                         np.log(settings["quiet_median_max"]))))
+    a_med = float(np.exp(path_rng.uniform(np.log(settings["active_median_min"]),
+                                         np.log(settings["active_median_max"]))))
+    sigma = settings["dwell_sigma"]
+    quiet = bool(path_rng.random() < q_med / (q_med + a_med))
+    median = q_med if quiet else a_med
+    interval = float(np.exp(path_rng.normal(np.log(median) + sigma * sigma, sigma)))
+    remaining = max(1, int(np.ceil(path_rng.random() * interval)))
+    phi = float(path_rng.uniform(0.25, 0.95))
+    active_sd = float(np.exp(path_rng.uniform(np.log(0.025), np.log(0.16))))
+    quiet_sd = 0.0 if mode == 0 else float(np.exp(path_rng.uniform(np.log(0.001), np.log(0.015))))
+    level_step = float(path_rng.uniform(0.06, 0.30))
+    level = float(path_rng.normal(0.0, 0.20))
+    # Explicit cadence: daily samples carry a weekly/yearly pair; sub-daily
+    # samples carry daily/weekly structure. No universal 96-sample carrier.
+    cadence = float(path_rng.choice(np.array([900.0, 1800.0, 3600.0, 86400.0]),
+                                    p=np.array([0.20, 0.10, 0.45, 0.25])))
+    day = 86400.0 / cadence
+    period = day if day >= 3.0 else 7.0
+    partner = 7.0 * day if day >= 3.0 else 365.2425
+    phase = float(path_rng.uniform(0.0, 2.0 * np.pi))
+    partner_phase = float(path_rng.uniform(0.0, 2.0 * np.pi))
+    seasonal_amp = float(path_rng.uniform(0.08, 0.35)) if mode == 2 else 0.0
+    partner_amp = float(path_rng.uniform(0.02, 0.12)) if mode == 2 else 0.0
+
+    state = np.empty(length, dtype=np.float64)
+    is_quiet = np.empty(length, dtype=bool)
+    cursor = 0
+    while cursor < length:
+        end = min(length, cursor + remaining)
+        size = end - cursor
+        if quiet:
+            state[cursor:end] = level
+        else:
+            target = float(np.clip(0.85 * level + path_rng.normal(0.0, level_step), -2.5, 2.5))
+            tau = float(np.exp(path_rng.uniform(np.log(4.0), np.log(96.0))))
+            dt = np.arange(size, dtype=np.float64)
+            state[cursor:end] = target + (level - target) * np.exp(-dt / tau)
+            level = float(state[end - 1])
+        is_quiet[cursor:end] = quiet
+        cursor = end
+        if cursor >= length:
+            break
+        quiet = not quiet
+        median = q_med if quiet else a_med
+        remaining = max(1, int(np.ceil(np.exp(path_rng.normal(np.log(median), sigma)))))
+
+    # Draw initialization BEFORE the noise vector; separate streams make this
+    # generator prefix-consistent for any emitted length, including short rows.
+    initial = float(noise_rng.standard_normal())
+    innovation = noise_rng.standard_normal(length) * np.sqrt(1.0 - phi * phi)
+    eps, _ = lfilter([1.0], [1.0, -phi], innovation, zi=np.array([phi * initial]))
+    noise_scale = np.where(is_quiet, quiet_sd, active_sd)
+    t = np.arange(length, dtype=np.float64)
+    seasonal = seasonal_amp * (np.sin(2.0 * np.pi * t / period + phase)
+                               + 0.25 * np.sin(4.0 * np.pi * t / period + 0.7 + phase))
+    seasonal += partner_amp * np.sin(2.0 * np.pi * t / partner + partner_phase)
+    latent = state + seasonal + noise_scale * eps
+    if signed:
+        values = scale * (offset + latent)
+    else:
+        values = scale * np.exp(np.clip(latent, -6.0, 6.0))
+    if mode == 0:
+        values = np.rint(values / tick) * tick
+    values = np.ascontiguousarray(values, dtype=np.float64)
+    if return_metadata:
+        return values, {"mode": mode, "quiet": is_quiet, "signed": signed,
+                        "cadence_seconds": cadence, "period": period,
+                        "quiet_median": q_med, "active_median": a_med, "tick": tick}
+    return values
+
+
+def _apply_renewal_persistence(
+    chunk: list[np.ndarray | None],
+    fam_ids: np.ndarray,
+    base_seed: int,
+    chunk_index: int,
+    settings: dict[str, Any],
+) -> np.ndarray:
+    """Replace a small, family-gated subset AFTER all existing transforms.
+
+    No earlier array is mutated, no parent RNG is consumed, and no selected row
+    feeds back into TSMixup. Raising rate selects a nested superset with exactly
+    the same native draws on common rows. This is an explicit mixture component,
+    not a claim that the old row's noise or seasonal law has been preserved.
+    """
+    selected = np.zeros(len(chunk), dtype=bool)
+    rate = settings["rate"]
+    if rate <= 0.0:
+        return selected
+    eligible = settings["eligible_families"]
+    for slot, old in enumerate(chunk):
+        fam = int(fam_ids[slot])
+        if old is None or old.size == 0 or _FAMILIES[fam] not in eligible:
+            continue
+        coords = (int(base_seed), int(chunk_index), fam, slot)
+        gate_rng = np.random.default_rng(np.random.SeedSequence((*coords, _RENEWAL_SELECT_STAGE)))
+        if gate_rng.random() >= rate:
+            continue
+        path_rng = np.random.default_rng(np.random.SeedSequence((*coords, _RENEWAL_PATH_STAGE)))
+        noise_rng = np.random.default_rng(np.random.SeedSequence((*coords, _RENEWAL_NOISE_STAGE)))
+        chunk[slot] = _renewal_persistence_series(path_rng, noise_rng, int(old.size), settings)
+        selected[slot] = True
+    return selected
