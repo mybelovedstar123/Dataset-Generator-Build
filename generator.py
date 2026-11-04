@@ -14130,3 +14130,248 @@ def _pt_normalized_harmonic_profile(rng, m, n_harmonics, decay_exponent):
         s += rng.normal(0.0, h ** (-decay_exponent)) * np.cos(_pt_WEB_TWO_PI * h * u + rng.uniform(0.0, _pt_WEB_TWO_PI))
     lo, hi = (s.min(), s.max())
     return (s - lo) / max(hi - lo, 1e-09)
+
+def _pt_random_runs_mask(rng, n, n_runs, mean_run_len, max_run_len):
+    mask = np.zeros(n, dtype=bool)
+    if n_runs <= 0:
+        return mask
+    run_starts = rng.integers(0, n, n_runs)
+    run_lengths = np.minimum(rng.geometric(1.0 / max(mean_run_len, 1.0), n_runs), max_run_len)
+    for s, ln in zip(run_starts, run_lengths):
+        mask[s:s + ln] = True
+    return mask
+
+def _pt_diurnal_activity_shape(rng, period, steady):
+    h = np.arange(period) / period
+    active_frac = rng.uniform(0.66, 0.82)
+    edge_softness = rng.uniform(0.035, 0.09)
+    c = rng.uniform(0.0, 1.0)
+    dn = np.abs((h - c + 0.5) % 1.0 - 0.5)
+    activity = 1.0 / (1.0 + np.exp(-(dn - (1.0 - active_frac) / 2.0) / edge_softness))
+    pe = (c - (1.0 - active_frac) / 2.0 - rng.uniform(0.08, 0.2)) % 1.0
+    de = np.abs((h - pe + 0.5) % 1.0 - 0.5)
+    pm = (c + (1.0 - active_frac) / 2.0 + rng.uniform(0.1, 0.3)) % 1.0
+    dm = np.abs((h - pm + 0.5) % 1.0 - 0.5)
+    evening_gain = rng.uniform(0.5, 1.5) if steady else rng.uniform(0.5, 2.5)
+    evening_width = rng.uniform(0.08, 0.2) if steady else rng.uniform(0.04, 0.16)
+    shape = activity * (1.0 + evening_gain * np.exp(-0.5 * (de / evening_width) ** 2) + rng.uniform(0.0, 0.4) * np.exp(-0.5 * (dm / rng.uniform(0.05, 0.1)) ** 2))
+    if steady:
+        floor = np.exp(rng.normal(np.log(0.015), 0.7))
+    else:
+        floor = np.exp(rng.normal(np.log(0.012), 1.2))
+    shape = floor + (1.0 - floor) * shape / shape.max()
+    return shape / shape.mean()
+
+def _pt_hourly_profile_counts(rng, n, steady):
+    steps_per_day = 24
+    t = np.arange(n)
+    phase_offset = int(rng.integers(0, steps_per_day))
+    day_profile = _pt_diurnal_activity_shape(rng, steps_per_day, steady)
+    wk = np.exp(rng.normal(0.0, 0.035 if steady else 0.08, 7))
+    wk /= wk.mean()
+    day_index = (t + phase_offset) // steps_per_day
+    seasonal_factor = day_profile[(t + phase_offset) % steps_per_day] * wk[(day_index + int(rng.integers(0, 7))) % 7]
+    if steady:
+        base_level = max(3.5, float(np.exp(rng.normal(np.log(16.0), 1.1))))
+        log_noise = _pt_interpolated_coarse_ar1(rng, n, steps_per_day, rng.uniform(0.2, 0.7), rng.uniform(0.01, 0.05)) + _pt_stationary_ar1_noise(rng, n, rng.uniform(0.7, 0.95), rng.uniform(0.04, 0.12))
+        trend_slope = rng.normal(-0.05, 0.12)
+    else:
+        base_level = np.exp(rng.normal(np.log(7.0), 1.5))
+        log_noise = _pt_interpolated_coarse_ar1(rng, n, steps_per_day, rng.uniform(0.3, 0.8), rng.uniform(0.1, 0.3)) + _pt_stationary_ar1_noise(rng, n, rng.uniform(0.75, 0.95), rng.uniform(0.25, 0.65) * min(1.0, (20.0 / base_level) ** 0.3))
+        trend_slope = rng.normal(-0.1, 0.35)
+    log_noise += trend_slope * (t / n) + _pt_interpolated_coarse_ar1(rng, n, 7 * steps_per_day, 0.9, rng.uniform(0.0, 0.3 if steady else 0.45))
+    rate = base_level * seasonal_factor * np.exp(log_noise)
+    if not steady:
+        n_bursts = rng.poisson(n / rng.uniform(60.0, 300.0))
+        if n_bursts:
+            burst_impulses = np.zeros(n)
+            np.add.at(burst_impulses, rng.integers(0, n, n_bursts), np.exp(rng.normal(np.log(1.5), 0.8, n_bursts)))
+            burst_decay = np.exp(-1.0 / rng.uniform(0.7, 4.0))
+            rate *= 1.0 + lfilter([1.0], [1.0, -burst_decay], burst_impulses)
+        k = np.exp(rng.uniform(np.log(1.0), np.log(15.0)))
+        rate = rng.gamma(k, 1.0, n) * (rate / k)
+    elif rng.random() < 0.4:
+        rate = rate * (1.0 + (rng.random(n) < 0.005) * rng.exponential(0.4, n))
+    x = rng.poisson(np.minimum(rate, 10000000.0)).astype(np.float64)
+    return x
+
+def _pt_hourly_counts_random_regime(rng, n):
+    return _pt_hourly_profile_counts(rng, n, rng.random() < 0.18)
+
+def _pt_ixp_traffic_5min(rng, n):
+    steps_per_day = 288
+    t = np.arange(n)
+    log10_level = float(np.clip(rng.normal(10.3, 1.7), 4.5, 12.5))
+    size_deficit = max(0.0, 10.0 - log10_level)
+    noise_sd = float(np.clip(np.exp(rng.normal(np.log(0.018) + 0.55 * size_deficit, 0.6)), 0.002, 0.45))
+    trough_frac = float(np.clip(np.exp(rng.normal(np.log(0.3), 0.7)), 0.05, 0.97))
+    harmonic_shape = _pt_normalized_harmonic_profile(rng, steps_per_day, int(rng.integers(2, 6)), 1.0) ** rng.uniform(0.5, 1.3)
+    day_profile = trough_frac + (1.0 - trough_frac) * harmonic_shape
+    day_profile /= day_profile.mean()
+    phase_offset = int(rng.integers(0, steps_per_day))
+    wk = np.ones(7)
+    wd = int(rng.integers(0, 7))
+    weekend_factor = rng.uniform(0.7, 1.02)
+    wk[wd] = weekend_factor
+    wk[(wd + 1) % 7] = weekend_factor * rng.uniform(0.95, 1.05)
+    day = (t + phase_offset) // steps_per_day
+    p = day_profile[(t + phase_offset) % steps_per_day]
+    profile_min = p.min()
+    seasonal_factor = profile_min + (p - profile_min) * wk[day % 7]
+    ar_noise = _pt_stationary_ar1_noise(rng, n, rng.uniform(0.3, 0.92), noise_sd)
+    g = rng.uniform(1.0, 3.0)
+    ar_noise *= np.sqrt(rng.gamma(g, 1.0 / g, n))
+    ar_noise *= np.exp(_pt_stationary_ar1_noise(rng, n, 0.99, rng.uniform(0.2, 0.7)))
+    log_dev = _pt_interpolated_coarse_ar1(rng, n, steps_per_day, rng.uniform(0.0, 0.6), rng.uniform(0.03, 0.25)) + _pt_interpolated_coarse_ar1(rng, n, steps_per_day // 8, rng.uniform(0.5, 0.9), rng.uniform(0.02, 0.12)) + ar_noise
+    n_shifts = rng.poisson(n / steps_per_day * np.exp(rng.uniform(np.log(0.01), np.log(0.2))))
+    if n_shifts:
+        shift_steps = np.zeros(n)
+        shift_at = rng.integers(1, n, n_shifts)
+        shift_sizes = rng.normal(0.0, 0.12, n_shifts)
+        np.add.at(shift_steps, shift_at, shift_sizes)
+        reverts = rng.random(n_shifts) < 0.75
+        revert_at = shift_at + rng.geometric(1.0 / (steps_per_day * rng.uniform(0.3, 4.0)), n_shifts)
+        ok = reverts & (revert_at < n)
+        np.add.at(shift_steps, revert_at[ok], -shift_sizes[ok])
+        log_dev += np.cumsum(shift_steps)
+    n_spikes = rng.poisson(n * np.exp(rng.uniform(np.log(1e-05), np.log(0.0005))) * (1.0 + 3.0 * size_deficit))
+    if n_spikes:
+        spike_impulses = np.zeros(n)
+        np.add.at(spike_impulses, rng.integers(0, n, n_spikes), rng.exponential(0.03 + 0.5 * size_deficit + 1.5 * noise_sd, n_spikes))
+        log_dev += lfilter([1.0], [1.0, -rng.uniform(0.0, 0.6)], spike_impulses)
+    x = np.exp(np.log(10.0) * log10_level + log_dev) * seasonal_factor
+    n_drop_runs = rng.poisson(n / 4096.0 * np.exp(rng.uniform(np.log(0.02), np.log(1.0))))
+    if n_drop_runs:
+        m = _pt_random_runs_mask(rng, n, int(n_drop_runs), rng.uniform(2.0, 30.0), 400)
+        x[m] *= rng.uniform(0.15, 0.75)
+    if rng.random() < 0.42:
+        m = _pt_random_runs_mask(rng, n, int(rng.poisson(n / 4096.0 * np.exp(rng.uniform(0.0, np.log(12.0)))) + 1), rng.uniform(1.0, 3.0), 12)
+        x[m] = 0.0
+    if rng.random() < 0.05:
+        ln = int(n * rng.uniform(0.05, 0.7))
+        s0 = n - ln if rng.random() < 0.5 else int(rng.integers(0, n - ln))
+        x[s0:s0 + ln] = 0.0
+    return np.round(x)
+
+def _pt_daily_download_counts(rng, n):
+    t = np.arange(n)
+    weekend_factor = rng.uniform(0.26, 0.48)
+    wk = np.array([1.0, 1.04, 1.04, 1.03, 1.0, weekend_factor, weekend_factor * rng.uniform(0.95, 1.1)])
+    wk[4] = rng.uniform(0.8, 0.95)
+    wk *= np.exp(rng.normal(0.0, 0.015, 7))
+    wk /= wk.mean()
+    weekday_offset = int(rng.integers(0, 7))
+    weekday_factor = wk[(t + weekday_offset) % 7]
+    lg = np.log(10.0) * rng.uniform(4.6, 8.0)
+    growth = rng.normal(1.1, 0.45) if rng.random() < 0.93 else rng.normal(-0.2, 0.3)
+    log_trend = growth * (t / max(n, 1)) ** rng.uniform(1.0, 3.0)
+    log_trend += np.cumsum(rng.normal(0.0, rng.uniform(0.002, 0.012), n))
+    n_shifts = rng.poisson(n / rng.uniform(80.0, 400.0))
+    if n_shifts:
+        shift_steps = np.zeros(n)
+        np.add.at(shift_steps, rng.integers(1, n, n_shifts), rng.normal(0.0, 0.18, n_shifts))
+        log_trend += np.cumsum(shift_steps)
+    holiday_doy = int(rng.integers(0, 365))
+    holiday_dist = np.abs((t - holiday_doy + 182) % 365 - 182)
+    holiday_dip = rng.uniform(0.25, 0.6) * np.exp(-0.5 * (holiday_dist / rng.uniform(3.0, 7.0)) ** 2)
+    weekday_factor = weekday_factor - holiday_dip * (weekday_factor - weekday_factor.min())
+    x = np.exp(lg + log_trend + rng.normal(0.0, rng.uniform(0.03, 0.1), n)) * weekday_factor
+    n_outliers = rng.poisson(n * rng.uniform(0.0, 0.02))
+    if n_outliers:
+        x[rng.integers(0, n, n_outliers)] *= np.exp(rng.normal(0.0, 0.3, n_outliers))
+    x = np.round(x)
+    dropout_mask = rng.random(n) < rng.uniform(0.0, 0.02) + rng.uniform(0.0, 0.12) * (t >= n - 64)
+    x[dropout_mask] = 0.0
+    return x
+
+def _pt_half_hourly_cumulative_counter(rng, n):
+    steps_per_day = 48
+    t = np.arange(n)
+    start_total = 10.0 ** rng.uniform(5.8, 9.4)
+    growth_frac = np.exp(rng.uniform(np.log(0.0003), np.log(0.04))) * n / 3254.0
+    mu = start_total * growth_frac / n
+    daily_cycle = 1.0 + rng.uniform(0.0, 0.3) * np.cos(_pt_WEB_TWO_PI * (t / steps_per_day + rng.random()))
+    weekend_factor = rng.uniform(0.15, 0.6)
+    wk = np.array([1.0, 1.0, 1.0, 1.0, 1.0, weekend_factor, weekend_factor])
+    wk /= wk.mean()
+    seasonal_factor = daily_cycle * wk[(t // steps_per_day + int(rng.integers(0, 7))) % 7]
+    seasonal_factor *= np.exp(rng.normal(-0.4, 0.4) * (t / n - 0.5))
+    rate = mu * seasonal_factor * np.exp(_pt_interpolated_coarse_ar1(rng, n, steps_per_day, rng.uniform(0.3, 0.8), rng.uniform(0.1, 0.5)) + _pt_stationary_ar1_noise(rng, n, rng.uniform(0.85, 0.99), rng.uniform(0.2, 0.7)))
+    n_bursts = rng.poisson(n * rng.uniform(0.0, 0.004))
+    if n_bursts:
+        rate[rng.integers(0, n, n_bursts)] *= np.exp(rng.exponential(1.2, n_bursts))
+    k = np.exp(rng.uniform(np.log(2.0), np.log(40.0)))
+    increments = rng.poisson(np.minimum(rng.gamma(k, 1.0, n) * (rate / k), 1000000000000.0)).astype(np.float64)
+    x = np.round(start_total) + np.cumsum(increments)
+    if rng.random() < 0.35:
+        stale_mask = _pt_random_runs_mask(rng, n, int(rng.poisson(n / rng.uniform(100.0, 800.0))), rng.uniform(1.0, 4.0), 48)
+        stale_mask[0] = False
+        last_fresh_idx = np.where(stale_mask, 0, t)
+        x = x[np.maximum.accumulate(last_fresh_idx)]
+    return x
+
+def _pt_web_daily_or_cumulative_counts(rng, n):
+    if rng.random() < 0.5:
+        return _pt_daily_download_counts(rng, n)
+    return _pt_half_hourly_cumulative_counter(rng, n)
+_pt_ENV_TWO_PI = 2.0 * np.pi
+
+def _pt_env_weighted_choice(rng, values, weights):
+    c = np.cumsum(weights)
+    return values[int(np.searchsorted(c, rng.random() * c[-1], side='right'))]
+
+def _pt_env_smooth_noise(rng, n, corr_len, beta=2.0):
+    coarse_step = max(1, int(corr_len / 6.0))
+    nc = n // coarse_step + 2
+    m = 1 << int(np.ceil(np.log2(2 * nc)))
+    f = np.fft.rfftfreq(m)
+    spectral_gain = 1.0 / np.sqrt(1.0 + (f * (corr_len / coarse_step) * _pt_ENV_TWO_PI) ** beta)
+    spectral_gain[0] = 0.0
+    spectrum = (rng.standard_normal(f.size) + 1j * rng.standard_normal(f.size)) * spectral_gain
+    y = np.fft.irfft(spectrum, n=m)[:nc]
+    if coarse_step > 1:
+        y = np.interp(np.arange(n, dtype=np.float64) / coarse_step, np.arange(nc, dtype=np.float64), y)
+    else:
+        y = y[:n]
+    s = y.std()
+    return y / s if s > 0 else y
+
+def _pt_env_diurnal_bump(cycle_phase, peak_phase, concentration):
+    g = np.exp(concentration * (np.cos(_pt_ENV_TWO_PI * (cycle_phase - peak_phase)) - 1.0))
+    lo = np.exp(-2.0 * concentration)
+    return (g - lo) / (1.0 - lo) - 0.35
+
+def _pt_env_round_to_step(x, q):
+    return np.round(x / q) * q
+
+def _pt_env_sample_and_hold(rng, x, k):
+    n = x.size
+    offset = int(rng.integers(0, k))
+    hold_idx = (np.arange(n) + offset) // k * k - offset
+    np.clip(hold_idx, 0, n - 1, out=hold_idx)
+    return x[hold_idx]
+
+def _pt_env_insert_stuck_runs(rng, x, n_runs, max_run_len):
+    n = x.size
+    for _ in range(n_runs):
+        L = int(rng.integers(3, max(4, min(max_run_len, n // 6))))
+        s = int(rng.integers(1, max(2, n - L - 1)))
+        x[s:s + L] = x[s - 1]
+    return x
+
+def _pt_env_round_temperature(rng, x):
+    u = rng.random()
+    if u < 0.45:
+        return _pt_env_round_to_step(x, 0.1)
+    if u < 0.6:
+        return _pt_env_round_to_step(x, 0.01)
+    if u < 0.72:
+        return np.round(x)
+    if u < 0.87:
+        return np.round((np.round(x * 1.8 + 32.0) - 32.0) / 1.8 * 10.0) / 10.0
+    if u < 0.95:
+        return _pt_env_round_to_step(x, 0.5)
+    return x
+
+def _pt_weather_steps_per_day(rng):
+    return float(_pt_env_weighted_choice(rng, (24.0, 48.0, 96.0, 144.0, 150.0, 288.0, 1.0), (0.5, 0.1, 0.14, 0.07, 0.04, 0.05, 0.1)))
