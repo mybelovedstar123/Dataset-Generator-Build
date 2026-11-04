@@ -5694,3 +5694,19 @@ _ED5: tuple[str, ...] = (
     "reported_epi_counts",
     "retail_promo_tail",
 )
+
+
+# --- ported from tianyiswufeng/ts-c123f85468 (v6-rain) ----------------
+# Four count/gauge laws written against the revealed eval pool, three of
+# which are dormant at zero weight in the donor itself. Each is mostly
+# flat, like held_rate, but flat in the shape of one specific heavy
+# domain: traffic -> web_cloudops, admin -> healthcare, outage -> energy,
+# rain -> nature. Appended, never inserted: family order indexes both the
+# builder tuple and the dispatch CDF, so at weight 0.0 the corpus digest
+# is unchanged -- build_pool4_gens.py --verify-inert asserts exactly that.
+_POOL4: tuple[str, ...] = (
+    "heavy_traffic_counts",
+    "sparse_admin_counts",
+    "storm_outage_counts",
+    "gauge_rain",
+)
