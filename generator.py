@@ -10149,3 +10149,281 @@ def _measurement_artifacts(
     degenerate = out[:, :calibration_len].std(axis=1) < 1e-9
     out[degenerate] = original[degenerate]
     return out
+
+
+@njit(cache=False, fastmath=False)
+def _rk4_flow_kernel_p(x0, sys_id, dt, L, burn, p0, p1, p2, w0, w1, w2):
+    m = x0.shape[1]
+    out = np.empty((m, L), dtype=np.float64)
+    s0 = x0[0].copy(); s1 = x0[1].copy(); s2 = x0[2].copy()
+    for step in range(burn + L):
+        for i in range(m):
+            a0 = s0[i]; a1 = s1[i]; a2 = s2[i]
+            kx = np.empty(4); ky = np.empty(4); kz = np.empty(4)
+            bx = a0; by = a1; bz = a2
+            for k in range(4):
+                if sys_id == 0:      # Lorenz(sigma=p0, rho=p1, beta=p2)
+                    dx = p0*(by-bx); dy = bx*(p1-bz)-by; dz = bx*by-p2*bz
+                elif sys_id == 1:    # Rossler(a=p0, b=p1, c=p2)
+                    dx = -by-bz; dy = bx+p0*by; dz = p1+bz*(bx-p2)
+                elif sys_id == 2:    # Thomas(b=p0)
+                    dx = np.sin(by)-p0*bx; dy = np.sin(bz)-p0*by; dz = np.sin(bx)-p0*bz
+                else:                # Halvorsen(a=p0)
+                    dx = -p0*bx-4*by-4*bz-by*by; dy = -p0*by-4*bz-4*bx-bz*bz; dz = -p0*bz-4*bx-4*by-bx*bx
+                kx[k] = dx; ky[k] = dy; kz[k] = dz
+                h = dt if k == 2 else dt*0.5
+                if k < 3:
+                    bx = a0+h*dx; by = a1+h*dy; bz = a2+h*dz
+            a0 += dt/6.0*(kx[0]+2*kx[1]+2*kx[2]+kx[3])
+            a1 += dt/6.0*(ky[0]+2*ky[1]+2*ky[2]+ky[3])
+            a2 += dt/6.0*(kz[0]+2*kz[1]+2*kz[2]+kz[3])
+            if a0 > 1e6: a0 = 1e6
+            elif a0 < -1e6: a0 = -1e6
+            if a1 > 1e6: a1 = 1e6
+            elif a1 < -1e6: a1 = -1e6
+            if a2 > 1e6: a2 = 1e6
+            elif a2 < -1e6: a2 = -1e6
+            s0[i] = a0; s1[i] = a1; s2[i] = a2
+            if step >= burn:
+                out[i, step-burn] = w0*a0 + w1*a1 + w2*a2
+    return out
+
+
+def _rk4_chaotic(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """4-flow bank with per-batch parameter randomization (dysts-style regimes), dt
+    jitter, and OBS_MODE observation (x-coordinate or random unit direction)."""
+    out = np.empty((n, L), dtype=np.float64)
+    done = 0
+    while done < n:
+        m = min(n - done, 32)
+        sid = int(rng.integers(0, 4))
+        if sid == 0:
+            p0 = rng.uniform(8.0, 12.0); p1 = rng.uniform(24.0, 34.0); p2 = rng.uniform(2.0, 3.5)
+            dt = 0.01
+        elif sid == 1:
+            p0 = rng.uniform(0.1, 0.3); p1 = rng.uniform(0.1, 0.3); p2 = rng.uniform(4.5, 7.5)
+            dt = 0.05
+        elif sid == 2:
+            p0 = rng.uniform(0.17, 0.24); p1 = 0.0; p2 = 0.0
+            dt = 0.10
+        else:
+            p0 = rng.uniform(1.2, 1.6); p1 = 0.0; p2 = 0.0
+            dt = 0.02
+        dt = dt * rng.uniform(0.6, 1.6)
+        if False:
+            w = rng.standard_normal(3); w = w / max(np.sqrt((w*w).sum()), 1e-9)
+            w0, w1, w2 = float(w[0]), float(w[1]), float(w[2])
+        else:
+            w0, w1, w2 = 1.0, 0.0, 0.0
+        x0 = rng.standard_normal((3, m)) * 0.5 + 1.0
+        tr = _rk4_flow_kernel_p(np.ascontiguousarray(x0), sid, dt, L, 400, p0, p1, p2, w0, w1, w2)
+        bad = (tr.std(axis=1) < 1e-9) | ~np.isfinite(tr).all(axis=1)
+        if bad.any():
+            tr[bad] = rng.standard_normal((int(bad.sum()), L))
+        mu = tr.mean(axis=1, keepdims=True)
+        sd = np.maximum(tr.std(axis=1, keepdims=True), 1e-9)
+        amp = np.exp(rng.uniform(np.log(0.5), np.log(50.0), size=(m, 1)))
+        out[done:done+m] = (tr-mu)/sd*amp + rng.standard_normal((m, 1))*amp*rng.uniform(0.0, 2.0, size=(m, 1))
+        done += m
+    return out
+
+
+def _trend_seasonal_ar(rng: np.random.Generator, n: int, L: int, *,
+                       hi_frac: float = 0.25, exc_lo: float = 0.4,
+                       exc_hi: float = 3.0, clean_frac: float = 0.4,
+                       clean_lo: float = 0.02, clean_hi: float = 0.12) -> np.ndarray:
+    t = _time_index(L)
+    level = rng.normal(0.0, 1.0, size=(n, 1))
+
+
+    _hi = rng.random((n, 1)) < hi_frac
+    exc = np.where(_hi, rng.normal(0.0, exc_hi, size=(n, 1)),
+                   rng.normal(0.0, exc_lo, size=(n, 1)))
+    tn = t / max(L - 1, 1)
+    series = level + exc * tn + _seasonal(rng, n, L)
+    phi = rng.uniform(0.0, 0.85, size=n)
+    clean = rng.random((n, 1)) < clean_frac
+    sigma = np.where(
+        clean,
+        rng.uniform(clean_lo, clean_hi, size=(n, 1)),
+        rng.uniform(0.1, 0.6, size=(n, 1)),
+    )
+    innov = rng.normal(0.0, 1.0, size=(n, L)) * sigma
+    return series + _ar1_batch(innov, phi)
+
+
+def _regime_shift(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+
+
+    level = np.cumsum(_sparse_jumps(rng, n, L, rate=3.0 / L, scale=2.0), axis=1)
+    log_vol = np.cumsum(_sparse_jumps(rng, n, L, rate=3.0 / L, scale=0.5), axis=1)
+    vol = np.exp(np.clip(log_vol, -3.0, 3.0)) * rng.uniform(0.1, 0.5, size=(n, 1))
+    noise = rng.normal(0.0, 1.0, size=(n, L)) * vol
+    seas = _seasonal(rng, n, L, k_max=2) * rng.uniform(0.0, 1.0, size=(n, 1))
+
+
+    slope = rng.normal(0.0, 1.0 / L, size=(n, 1)) + np.cumsum(
+        _sparse_jumps(rng, n, L, rate=2.0 / L, scale=4.0 / L), axis=1
+    )
+    piecewise_trend = np.cumsum(slope, axis=1)
+    return level + piecewise_trend + seas + noise
+
+
+def _multiplicative(rng: np.random.Generator, n: int, L: int, *,
+                    hi_frac: float = 0.25, exc_lo: float = 0.3, exc_hi: float = 2.0) -> np.ndarray:
+    t = _time_index(L)
+
+    _hg = rng.random((n, 1)) < hi_frac
+    gexc = np.where(_hg, rng.normal(0.0, exc_hi, size=(n, 1)),
+                    rng.normal(0.0, exc_lo, size=(n, 1)))
+    tn = t / max(L - 1, 1)
+    base_level = np.exp(gexc * tn + rng.normal(0.0, 0.3, size=(n, 1)))
+    amp = rng.uniform(0.1, 0.6, size=(n, 1))
+    seasonal_shape = _seasonal(rng, n, L, k_max=1)
+    seasonal_shape = _prefix_standardize(seasonal_shape, center=False)
+    seas = 1.0 + amp * seasonal_shape
+    noise = 1.0 + rng.normal(0.0, 1.0, size=(n, L)) * rng.uniform(0.02, 0.15, size=(n, 1))
+    scale = rng.uniform(1.0, 50.0, size=(n, 1))
+    return scale * base_level * np.clip(seas, 0.05, None) * np.clip(noise, 0.05, None)
+
+
+def _ar2(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+
+
+    p1 = rng.uniform(0.3, 0.98, size=n)
+    p2 = rng.uniform(-0.6, 0.6, size=n)
+    a2 = p2
+    a1 = p1 * (1.0 - p2)
+    sigma = rng.uniform(0.2, 0.8, size=(n, 1))
+    burn = 512
+    innov = rng.normal(0.0, 1.0, size=(n, L + burn)) * sigma
+
+
+    return _ar2_batch(innov, a1, a2)[:, burn:]
+
+
+def _integrated(
+    rng: np.random.Generator,
+    n: int,
+    L: int,
+    *,
+    heavy_frac: float = 0.25,
+    sv_frac: float = 0.30,
+) -> np.ndarray:
+
+
+    order2 = rng.random(n) < 0.35
+    drift = rng.normal(0.0, 0.02, size=(n, 1))
+    sigma = rng.uniform(0.2, 1.0, size=(n, 1))
+    eps = rng.normal(0.0, 1.0, size=(n, L))
+    heavy = np.nonzero(rng.random(n) < heavy_frac)[0]
+    if heavy.size:
+        df = rng.uniform(3.0, 12.0, size=(heavy.size, 1))
+        eps[heavy] = rng.standard_t(df, size=(heavy.size, L)) / np.sqrt(
+            df / (df - 2.0)
+        )
+
+    stochastic = np.nonzero(rng.random(n) < sv_frac)[0]
+    if stochastic.size:
+        phi = 0.995
+        burn = 256
+        vol_innov = (
+            rng.standard_normal((stochastic.size, L + burn))
+            * np.sqrt(1.0 - phi * phi)
+        )
+        log_vol = lfilter(
+            [1.0],
+            [1.0, -phi],
+            vol_innov,
+            axis=1,
+        )[:, burn:]
+        log_vol *= rng.uniform(0.10, 0.55, size=(stochastic.size, 1))
+        eps[stochastic] *= np.exp(np.clip(log_vol, -2.0, 2.0))
+
+    steps = eps * sigma + drift
+    walk = np.cumsum(steps, axis=1)
+    walk2 = np.cumsum(walk, axis=1)
+    o2 = order2[:, None]
+
+
+    return np.where(o2, walk2 / max(L, 1), walk)
+
+
+@njit(cache=False, fastmath=False)
+def _threshold_ar_recurse(
+    innov, phi_hi, phi_lo, const_hi, const_lo
+):
+    # Bit-identical rewrite of the original per-timestep numpy loop
+    # (same operation order: (const + (phi * prev)) + innov, then clip),
+    # moved into numba because per-row isolated streams call this builder
+    # with n == 1 and the numpy loop's ~13 ms per-CALL cost is independent
+    # of n. fastmath=False keeps IEEE ordering, so no FMA contraction.
+    n, total = innov.shape
+    x = np.empty((n, total), dtype=np.float64)
+    for i in range(n):
+        prev = innov[i, 0]
+        x[i, 0] = prev
+        for t in range(1, total):
+            if prev >= 0.0:
+                v = const_hi[i] + phi_hi[i] * prev
+            else:
+                v = const_lo[i] + phi_lo[i] * prev
+            v = v + innov[i, t]
+            if v < -1e6:
+                v = -1e6
+            if v > 1e6:
+                v = 1e6
+            x[i, t] = v
+            prev = v
+    return x
+
+
+def _threshold_ar(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+
+
+    phi_hi = rng.uniform(0.3, 0.9, size=n)
+    phi_lo = rng.uniform(-0.9, 0.3, size=n)
+    const_hi = rng.normal(0.0, 0.3, size=n)
+    const_lo = rng.normal(0.0, 0.3, size=n)
+    sigma = rng.uniform(0.2, 0.7, size=(n, 1))
+    burn = 256
+    total = L + burn
+    innov = rng.normal(0.0, 1.0, size=(n, total)) * sigma
+    x = _threshold_ar_recurse(innov, phi_hi, phi_lo, const_hi, const_lo)
+    return x[:, burn:]
+
+
+def _chaotic(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+
+
+    use_sine = rng.random(n) < 0.5
+    r_log = rng.uniform(3.6, 4.0, size=n)
+    r_sin = rng.uniform(0.85, 1.0, size=n)
+    x0 = rng.uniform(0.05, 0.95, size=n)
+    cur = x0.copy()
+    for _ in range(64):
+        nxt_log = r_log * cur * (1.0 - cur)
+        nxt_sin = r_sin * np.sin(np.pi * cur)
+        cur = np.clip(np.where(use_sine, nxt_sin, nxt_log), 0.0, 1.0)
+    x = np.empty((n, L), dtype=np.float64)
+    x[:, 0] = cur
+    for t in range(1, L):
+        nxt_log = r_log * cur * (1.0 - cur)
+        nxt_sin = r_sin * np.sin(np.pi * cur)
+        cur = np.where(use_sine, nxt_sin, nxt_log)
+        cur = np.clip(cur, 0.0, 1.0)
+        x[:, t] = cur
+    return _prefix_standardize(x)
+
+
+def _spectral_gp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+
+
+    embed = 2 * L
+    f = np.fft.rfftfreq(embed)[None, :]
+    lengthscale = np.exp(rng.uniform(np.log(8.0), np.log(256.0), size=(n, 1)))
+    envelope = np.exp(-0.5 * (2.0 * np.pi * lengthscale * f) ** 2)
+    z = rng.standard_normal((n, f.shape[1])) + 1j * rng.standard_normal((n, f.shape[1]))
+    z[:, 0] = 0.0
+    x = np.fft.irfft(z * np.sqrt(envelope), n=embed, axis=1)[:, :L]
+    return _prefix_standardize(x)
