@@ -132,3 +132,183 @@ def _self_test() -> None:
 
 
 _self_test()
+
+
+# ═══════════════ chronoforge: cf_spectral ═══════════════
+# FFT-based Gaussian-process synthesis.
+#
+# Every stationary GP in the corpus is drawn by sampling complex white noise in
+# the frequency domain, shaping it by ``sqrt(S(f))`` and taking one batched
+# inverse real FFT on a ``2L`` grid (the 2x embedding removes circular
+# wrap-around; we crop back to ``L``).  Cost is O(L log L) per row and the whole
+# batch goes through a single ``irfft`` call.
+#
+# No Cholesky, no ``multivariate_normal``, no BLAS GEMM: that is deliberate.  It
+# is asymptotically cheaper than the O(L^3) factorisation route *and* it removes
+# the threaded-BLAS reduction-order hazard, which matters because the producer is
+# multi-threaded and the corpus digest must be byte-identical at any thread count.
+
+
+try:
+    from scipy.special import gammaincinv as _gammaincinv
+    HAVE_SCIPY_SPECIAL = True
+except Exception:  # pragma: no cover
+    HAVE_SCIPY_SPECIAL = False
+    _gammaincinv = None
+
+TWO_PI = 2.0 * np.pi
+
+
+@lru_cache(maxsize=16)
+def freq_grid(L: int) -> np.ndarray:
+    """rfft frequency grid (cycles/sample) for the 2L circulant embedding."""
+    f = np.fft.rfftfreq(2 * L, d=1.0)
+    f.flags.writeable = False
+    return f
+
+
+@lru_cache(maxsize=16)
+def time_grid(L: int) -> np.ndarray:
+    t = np.arange(L, dtype=np.float64)
+    t.flags.writeable = False
+    return t
+
+
+# ───────────────────────────── PSD primitives ──────────────────────────────
+# All return a (n, nf) array up to an arbitrary positive constant; the sampler
+# normalises each realised row to unit standard deviation anyway, so only the
+# *shape* of S(f) matters.
+
+def psd_matern(f: np.ndarray, ell: np.ndarray, nu: float) -> np.ndarray:
+    """Matern-nu spectral density in 1-D.
+
+    The half-integer orders we actually use give integer exponents, so they are
+    evaluated by reciprocal multiplication rather than ``np.power`` — the same
+    numbers, several times cheaper on a (n, L+1) grid.
+    """
+    w = TWO_PI * f[None, :] * ell
+    d = 1.0 + (w * w) / (2.0 * nu)
+    if nu == 0.5:
+        return 1.0 / d
+    if nu == 1.5:
+        return 1.0 / (d * d)
+    if nu == 2.5:
+        return 1.0 / (d * d * d)
+    return d ** (-(nu + 0.5))
+
+
+def psd_rbf(f: np.ndarray, ell: np.ndarray) -> np.ndarray:
+    a = 2.0 * np.pi ** 2 * (ell ** 2) * (f[None, :] ** 2)
+    return np.exp(-np.minimum(a, 700.0))
+
+
+def psd_rq(f: np.ndarray, ell: np.ndarray, alpha: np.ndarray, J: int = 8) -> np.ndarray:
+    """Rational-quadratic as a Gamma scale-mixture of RBF densities."""
+    q = (np.arange(J, dtype=np.float64) + 0.5) / J
+    if HAVE_SCIPY_SPECIAL:
+        g = _gammaincinv(np.maximum(alpha, 1e-3), q[None, :])
+    else:  # Wilson-Hilferty approximation of the Gamma quantile
+        a = np.maximum(alpha, 1e-3)
+        zq = np.sqrt(2.0) * _erfinv_approx(2.0 * q - 1.0)[None, :]
+        g = a * (1.0 - 1.0 / (9.0 * a) + zq / np.sqrt(9.0 * a)) ** 3
+    g = np.maximum(g, 1e-6)
+    out = np.zeros((ell.shape[0], f.shape[0]))
+    for j in range(J):
+        ell_j = ell[:, 0] * np.sqrt(alpha[:, 0] / g[:, j])
+        out += psd_rbf(f, ell_j[:, None])
+    return out / J
+
+
+def _erfinv_approx(x: np.ndarray) -> np.ndarray:
+    a = 0.147
+    ln = np.log(np.maximum(1.0 - x * x, 1e-12))
+    term = 2.0 / (np.pi * a) + ln / 2.0
+    return np.sign(x) * np.sqrt(np.sqrt(term ** 2 - ln / a) - term)
+
+
+def psd_periodic(f: np.ndarray, f0: np.ndarray, n_harm: int,
+                 decay: np.ndarray, width: np.ndarray) -> np.ndarray:
+    """Comb of Gaussian peaks at harmonics of f0.
+
+    ``width`` broadens the peaks, which is exactly the PSD-domain effect of
+    multiplying the periodic kernel by an RBF envelope (locally periodic).
+    """
+    out = np.zeros((f0.shape[0], f.shape[0]))
+    for k in range(1, n_harm + 1):
+        centre = f0 * k
+        amp = np.exp(-decay * (k - 1))
+        out += amp * np.exp(-0.5 * ((f[None, :] - centre) / width) ** 2)
+    return out
+
+
+def psd_spectral_mixture(f: np.ndarray, centres: np.ndarray, widths: np.ndarray,
+                         weights: np.ndarray) -> np.ndarray:
+    """Sum of Q Gaussian peaks at arbitrary (non-integer-period) centres."""
+    out = np.zeros((centres.shape[0], f.shape[0]))
+    Q = centres.shape[1]
+    for q in range(Q):
+        c = centres[:, q:q + 1]
+        w = np.maximum(widths[:, q:q + 1], 1e-9)
+        out += weights[:, q:q + 1] * np.exp(-0.5 * ((f[None, :] - c) / w) ** 2)
+    return out
+
+
+def psd_pink(f: np.ndarray, beta: np.ndarray, f_break: np.ndarray) -> np.ndarray:
+    """1/f^beta with a low-frequency spectral break (flat below ``f_break``)."""
+    ff = np.maximum(f[None, :], 1e-12)
+    return 1.0 / (f_break ** beta + ff ** beta)
+
+
+# ─────────────────────────────── the sampler ───────────────────────────────
+
+def gp_from_psd(rng: np.random.Generator, psd: np.ndarray, L: int) -> np.ndarray:
+    """Draw a stationary Gaussian field with spectral density ``psd``.
+
+    ``psd`` has shape (n, L + 1) on the 2L rfft grid.  Rows are returned with
+    zero mean and unit standard deviation.
+    """
+    n, nf = psd.shape
+    amp = np.sqrt(np.maximum(psd, 0.0))
+    re = rng.standard_normal((n, nf))
+    im = rng.standard_normal((n, nf))
+    np.multiply(re, amp, out=re)
+    np.multiply(im, amp, out=im)
+    im[:, 0] = 0.0
+    im[:, -1] = 0.0
+    spec = np.empty((n, nf), dtype=np.complex128)
+    spec.real = re
+    spec.imag = im
+    x = np.ascontiguousarray(np.fft.irfft(spec, n=2 * L, axis=1)[:, :L])
+    x -= x.mean(axis=1, keepdims=True)
+    s = x.std(axis=1, keepdims=True)
+    np.maximum(s, 1e-300, out=s)
+    x /= s
+    return x
+
+
+def matern_gp(rng: np.random.Generator, n: int, L: int, ell: np.ndarray,
+              nu: float = 1.5) -> np.ndarray:
+    """Convenience: unit-variance Matern-nu field with per-row lengthscale."""
+    f = freq_grid(L)
+    ell = np.asarray(ell, dtype=np.float64).reshape(n, 1)
+    return gp_from_psd(rng, psd_matern(f, ell, nu), L)
+
+
+def pink_gp(rng: np.random.Generator, n: int, L: int, beta: np.ndarray,
+            f_break: np.ndarray | float = 1.0 / 4096.0) -> np.ndarray:
+    f = freq_grid(L)
+    beta = np.asarray(beta, dtype=np.float64).reshape(n, 1)
+    fb = np.full((n, 1), f_break) if np.isscalar(f_break) else np.asarray(f_break).reshape(n, 1)
+    return gp_from_psd(rng, psd_pink(f, beta, fb), L)
+
+
+def psd_convolve(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """PSD convolution == kernel product.  Both inputs (n, nf), same n."""
+    n, nf = a.shape
+    m = 1
+    while m < 2 * nf:
+        m <<= 1
+    fa = np.fft.rfft(a, n=m, axis=1)
+    fb = np.fft.rfft(b, n=m, axis=1)
+    c = np.fft.irfft(fa * fb, n=m, axis=1)[:, :nf]
+    return np.maximum(c, 0.0)
