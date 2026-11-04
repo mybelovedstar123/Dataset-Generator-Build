@@ -608,3 +608,230 @@ def k_counter_reset_cal(inc, reset, out):
             if acc > 1.0e14:
                 acc = 1.0e14
             out[i, t] = acc
+
+
+# ─────────────────────────── epidemic renewal ──────────────────────────────
+
+@_kernel
+def k_renewal(w, nw, rt, imports, gam, u, z, i0, out):
+    """I_t ~ NB( R_t * sum_s w_s I_{t-s} + imports_t , k ).
+
+    ``gam[i, t]`` is a pre-drawn Gamma(k_i, 1) variate divided by k_i by the
+    caller, so ``lam * gam`` is the gamma-mixed Poisson mean (i.e. negative
+    binomial with dispersion k_i).
+    """
+    n, L = rt.shape
+    W = w.shape[1]
+    for i in range(n):
+        taps = nw[i]
+        if taps > W:
+            taps = W
+        for t in range(L):
+            conv = 0.0
+            for s in range(taps):
+                k = t - 1 - s
+                if k >= 0:
+                    conv += w[i, s] * out[i, k]
+                else:
+                    conv += w[i, s] * i0[i]
+            lam = rt[i, t] * conv + imports[i, t]
+            if lam < 0.0:
+                lam = 0.0
+            if lam > 1.0e9:
+                lam = 1.0e9
+            out[i, t] = _pois(lam * gam[i, t], u[i, t], z[i, t])
+
+
+# ─────────────────────── chaotic / delay-differential ──────────────────────
+
+@_kernel
+def k_rk4_3d(system, par, dt, state0, sub, out):
+    """RK4 integration of Lorenz / Rossler / Chua / Hindmarsh-Rose.
+
+    ``out`` has shape (n, L, 3).  ``sub`` is the number of RK4 sub-steps taken
+    per emitted sample.
+    """
+    n = out.shape[0]
+    L = out.shape[1]
+    k1 = np.zeros(3, dtype=np.float64)
+    k2 = np.zeros(3, dtype=np.float64)
+    k3 = np.zeros(3, dtype=np.float64)
+    k4 = np.zeros(3, dtype=np.float64)
+    tmp = np.zeros(3, dtype=np.float64)
+    st = np.zeros(3, dtype=np.float64)
+    for i in range(n):
+        st[0] = state0[i, 0]
+        st[1] = state0[i, 1]
+        st[2] = state0[i, 2]
+        sysid = system[i]
+        h = dt[i]
+        ns = sub[i]
+        a = par[i, 0]
+        b = par[i, 1]
+        c = par[i, 2]
+        d = par[i, 3]
+        for t in range(L):
+            for _ in range(ns):
+                _deriv3(sysid, st, a, b, c, d, k1)
+                for j in range(3):
+                    tmp[j] = st[j] + 0.5 * h * k1[j]
+                _deriv3(sysid, tmp, a, b, c, d, k2)
+                for j in range(3):
+                    tmp[j] = st[j] + 0.5 * h * k2[j]
+                _deriv3(sysid, tmp, a, b, c, d, k3)
+                for j in range(3):
+                    tmp[j] = st[j] + h * k3[j]
+                _deriv3(sysid, tmp, a, b, c, d, k4)
+                for j in range(3):
+                    st[j] = st[j] + (h / 6.0) * (k1[j] + 2.0 * k2[j] + 2.0 * k3[j] + k4[j])
+                    if st[j] > 1.0e6:
+                        st[j] = 1.0e6
+                    elif st[j] < -1.0e6:
+                        st[j] = -1.0e6
+            out[i, t, 0] = st[0]
+            out[i, t, 1] = st[1]
+            out[i, t, 2] = st[2]
+
+
+@_inline
+def _deriv3(sysid, s, a, b, c, d, o):
+    x = s[0]
+    y = s[1]
+    z = s[2]
+    if sysid == 0:  # Lorenz
+        o[0] = a * (y - x)
+        o[1] = x * (b - z) - y
+        o[2] = x * y - c * z
+    elif sysid == 1:  # Rossler
+        o[0] = -y - z
+        o[1] = x + a * y
+        o[2] = b + z * (x - c)
+    elif sysid == 2:  # Chua (cubic nonlinearity)
+        g = -a * x + b * x * x * x
+        o[0] = c * (y - x - g)
+        o[1] = x - y + z
+        o[2] = -d * y
+    else:  # Hindmarsh-Rose bursting neuron
+        o[0] = y - a * x * x * x + b * x * x - z + d
+        o[1] = 1.0 - c * x * x - y
+        o[2] = 0.006 * (4.0 * (x + 1.6) - z)
+
+
+@_kernel
+def k_mackey_glass(beta, gamma_, nexp, delay, hist, out):
+    """Mackey-Glass delay differential equation, 4 sub-steps per sample.
+
+    ``hist[i, :]`` is a pre-filled circular history buffer (length >= delay+2).
+    """
+    n, L = out.shape
+    B = hist.shape[1]
+    sub = 4
+    h = 1.0 / sub
+    for i in range(n):
+        D = delay[i]
+        if D < 1:
+            D = 1
+        if D > B - 2:
+            D = B - 2
+        pos = B - 1
+        x = hist[i, pos]
+        for t in range(L):
+            for _ in range(sub):
+                idx = pos - D
+                while idx < 0:
+                    idx += B
+                xd = hist[i, idx]
+                den = 1.0 + math.pow(abs(xd), nexp[i])
+                f = beta[i] * xd / den - gamma_[i] * x
+                xm = x + 0.5 * h * f
+                idx2 = idx + 1
+                if idx2 >= B:
+                    idx2 -= B
+                xd2 = hist[i, idx2]
+                den2 = 1.0 + math.pow(abs(xd2), nexp[i])
+                f2 = beta[i] * xd2 / den2 - gamma_[i] * xm
+                x = x + h * f2
+                if x > 1.0e6:
+                    x = 1.0e6
+                elif x < -1.0e6:
+                    x = -1.0e6
+                pos += 1
+                if pos >= B:
+                    pos = 0
+                hist[i, pos] = x
+            out[i, t] = x
+
+
+# ───────────────────────── quasi-periodic physiology ───────────────────────
+
+@_kernel
+def k_template(phase, tmpl, tid, out):
+    """Linear-interpolated lookup of a per-row waveform template at ``phase``."""
+    n, L = phase.shape
+    S = tmpl.shape[1]
+    for i in range(n):
+        r = tid[i]
+        for t in range(L):
+            ph = phase[i, t]
+            ph = ph - math.floor(ph)
+            x = ph * S
+            j = int(x)
+            if j >= S:
+                j = S - 1
+            fr = x - j
+            j2 = j + 1
+            if j2 >= S:
+                j2 = 0
+            out[i, t] = tmpl[r, j] * (1.0 - fr) + tmpl[r, j2] * fr
+
+
+# ─────────────────────────────── warm-up ───────────────────────────────────
+
+_WARM_LOCK = threading.Lock()
+_WARMED = False
+
+
+def warmup() -> None:
+    """Force numba compilation before the streaming loop starts."""
+    global _WARMED
+    if _WARMED or not HAVE_NUMBA:
+        _WARMED = True
+        return
+    with _WARM_LOCK:
+        if _WARMED:
+            return
+        n, L = 2, 3
+        f = np.zeros((n, L))
+        i32 = np.zeros(n, dtype=np.int64)
+        one = np.ones(n)
+
+        out = np.zeros((n, L))
+        k_poisson(np.ones((n, L)), np.full((n, L), 0.5), f.copy(), out)
+        k_arma(np.zeros((n, 2)), np.ones(n, dtype=np.int64), np.zeros((n, 2)),
+               np.ones(n, dtype=np.int64), np.ones((n, L)), np.zeros((n, L)))
+        k_seasonal_int(np.ones((n, L)), np.ones(n, dtype=np.int64), np.zeros((n, L)))
+        k_setar(f.copy()[:, 0].copy(), one * 0, one * 0.5, one * 0, one * 0.5,
+                np.ones((n, L)), np.zeros((n, L)))
+        k_ar1_tv(one * 0.5, np.zeros((n, L)), np.ones((n, L)), np.zeros((n, L)))
+        k_garch(one * 0.01, one * 0.05, one * 0.05, one * 0.85, np.ones((n, L)),
+                np.zeros((n, L)), np.zeros((n, L)))
+        k_hawkes(np.ones((n, L)) * 0.1, np.full((n, 4), 0.5), np.full((n, 4), 0.05),
+                 np.full((n, L), 0.5), np.zeros((n, L)), np.zeros((n, L)),
+                 np.zeros((n, L)))
+        k_feedback(np.ones((n, L)), one * 0.8, one * 0.3,
+                   np.full(n, 3, dtype=np.int64), np.full(n, 5, dtype=np.int64),
+                   one * 0.3, np.full(n, 2, dtype=np.int64), one,
+                   i32.copy(), np.zeros((n, L)), np.zeros((n, L)))
+        k_counter_reset_cal(np.ones((n, L)), np.zeros((n, L), dtype=np.int8),
+                            np.zeros((n, L)))
+        k_renewal(np.full((n, 2), 0.5), np.full(n, 2, dtype=np.int64),
+                  np.ones((n, L)), np.zeros((n, L)), np.ones((n, L)),
+                  np.full((n, L), 0.5), np.zeros((n, L)), one, np.zeros((n, L)))
+        k_rk4_3d(i32.copy(), np.full((n, 4), 1.0), one * 0.01,
+                 np.ones((n, 3)), np.full(n, 1, dtype=np.int64), np.zeros((n, L, 3)))
+        k_mackey_glass(one * 0.2, one * 0.1, one * 10.0,
+                       np.full(n, 4, dtype=np.int64), np.ones((n, 16)),
+                       np.zeros((n, L)))
+        k_template(np.linspace(0, 1, n * L).reshape(n, L), np.ones((2, 8)),
+                   i32.copy(), np.zeros((n, L)))
+        _WARMED = True
