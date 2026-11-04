@@ -17408,3 +17408,121 @@ def _pt_hold_random_segments(rng, x, max_segments, min_seg_len, max_seg_len, ext
         np.maximum(out, 0.0, out=out)
     return out
 _pt_FAMILY_BUILDERS = {'hourly_diurnal_counts': _pt_hourly_counts_random_regime, 'ixp_traffic_5min': _pt_ixp_traffic_5min, 'daily_pageviews_or_download_total': _pt_web_daily_or_cumulative_counts, 'weather_station_readings': _pt_weather_station_series, 'hydrology_flow_stage': _pt_hydro_rain_runoff_series, 'tide_gauge_levels': _pt_tide_gauge_series, 'rainfall_or_air_pollutant': _pt_rainfall_or_air_pollutant, 'electricity_net_demand': _pt_grid_net_load, 'electricity_spot_price': _pt_electricity_price, 'discrete_levels_or_outages': _pt_discrete_levels_or_outages, 'energy_solar_wind_unit_load_flow': _pt_energy_solar_wind_unit_flow, 'flu_season_percent_positive': _pt_flu_season_positivity_pct, 'business_day_ledger_counts': _pt_business_day_counts, 'diurnal_harmonic_counts': _pt_diurnal_activity_counts, 'financial_price_series': _pt_market_price_series, 'x': _pt_dock_and_parking_availability, 'road_traffic_counts_or_speed': _pt_traffic_volume_or_speed, 'arrival_counts_or_occupancy': _pt_diurnal_counts_or_occupancy, 'seasonal_test_positivity': _pt_seasonal_positivity_percent, 'multi_harmonic_ar': _pt_harmonics_plus_ar_noise, 'markov_switching_ar': _pt_markov_switching_ou_series, 'gp_kernel_mixture': lambda rng, n: _pt_random_kernel_gp_draw(rng, n), 'poisson_gp_intensity_counts': _pt_poisson_exp_gp_counts, 'bounded_integer_walk': _pt_dock_occupancy_walk, 'arma_arima': _pt_random_arima_series, 'piecewise_linear_trend': _pt_piecewise_linear_trend, 'random_dwell_steps': _pt_random_dwell_steps, 'sparse_jump_decay': _pt_sparse_decaying_jumps, 'weekday_poisson_counts': _pt_weekday_business_counts, 'garch_price_path': _pt_garch_price_path, 'periodic_profile': _pt_periodic_profile_series, 'smooth_log_level': _pt_smooth_log_level_series, 'integer_staircase': _pt_integer_staircase_series, 'solar_pv_output': _pt_solar_pv_series, 'unit_dispatch_load_or_carbon_intensity': _pt_power_unit_load_carbon_intensity, 'scheduled_or_clipped_flow': _pt_interconnector_net_flow, 'count_ladder_or_spot_price': _pt_count_ladder_or_spot_price, 'sparse_pulse_response': _pt_sparse_pulse_response_series, 'integrated_ar_drift': _pt_integrated_ar_mixture_series, 'two_timescale_ar_sensor': _pt_two_timescale_weather_series, 'markov_intermittent_amounts': _pt_markov_intermittent_precip_series, 'dock_occupancy_latent_fill': _pt_occupancy_latent_fraction_counts, 'dock_occupancy_arrival_queue': _pt_occupancy_arrival_departure_counts, 'dock_occupancy_jump_walk': _pt_occupancy_dwell_jump_counts, 'intraday_peak_profile_counts': _pt_daily_profile_counts_with_drift, 'long_cycle_seasonal_level': _pt_long_period_seasonal_levels, 'lognormal_ar_with_spikes': _pt_lognormal_ar_with_spikes, 'cumulative_download_counter': _pt_cumulative_download_counter, 'rki_epidemic_weekly_sums': _pt_epidemic_weekly_sums}
+
+class _pt_Generator(DataGenerator):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        if _pt_PARTNER_CONFIG is not None:
+            self._cfg = dict(_pt_PARTNER_CONFIG)
+        else:
+            config_path = Path(config_dir) / 'config.json'
+            self._cfg = json.loads(config_path.read_text(encoding='utf-8')) if config_path.is_file() else {}
+        self._base_seed = int(seed)
+        w = self._cfg.get('family_weights') or dict(_pt_DEFAULT_FAMILY_WEIGHTS)
+        families = [k for k in w if k in _pt_FAMILY_BUILDERS and float(w[k]) > 0]
+        weights = np.array([float(w[k]) for k in families], dtype=np.float64)
+        self._family_keys = families
+        self._family_probs = weights / weights.sum()
+        self._pad_prob = float(self._cfg.get('left_pad_prob', 0.85))
+        self._round_prob = float(self._cfg.get('generic_round_prob', _pt_DEFAULT_ROUND_PROB))
+        self._target_len = int(self._cfg.get('row_length', _pt_MAX_SERIES_LENGTH))
+        ex = self._cfg.get('augmentation') or {}
+        self._vol_warp_prob = float(ex.get('vol_warp_prob', 0.0))
+        self._vol_warp_strength = float(ex.get('vol_warp_strength', 0.0))
+        self._level_shift_prob = float(ex.get('level_shift_prob', 0.0))
+        self._level_shift_rate = float(ex.get('level_shift_rate', 0.0))
+        self._level_shift_scale = float(ex.get('level_shift_scale', 0.0))
+        self._tail_hold_prob = float(ex.get('tail_hold_prob', 0.0))
+        self._tail_hold_max_len = int(ex.get('tail_hold_max_len', 720))
+        fl = self._cfg.get('flat_tail') or {}
+        self._flat_tail_prob = float(fl.get('apply_prob', 0.0))
+        self._flat_tail_min_len = int(fl.get('min_tail_len', 256))
+        self._flat_tail_max_frac = float(fl.get('max_tail_frac', 0.85))
+        self._flat_tail_extreme_prob = float(fl.get('zero_or_max_prob', 0.0))
+        hg = self._cfg.get('hold_gate') or {}
+        self._hold_gate_min_repeat_frac = float(hg.get('min_repeat_frac', 0.0))
+        self._hold_gate_bypass_prob = float(hg.get('gate_bypass_prob', 1.0))
+        sg = self._cfg.get('segment_holds') or {}
+        self._segment_hold_prob = float(sg.get('apply_prob', 0.0))
+        self._segment_max_count = int(sg.get('max_segments', 3))
+        self._segment_min_len = int(sg.get('min_segment_len', 64))
+        self._segment_max_len = int(sg.get('max_segment_len', 1500))
+        self._segment_extreme_prob = float(sg.get('zero_or_max_prob', 0.25))
+        self._raw = frozenset(self._cfg.get('raw_families') or ())
+
+    @property
+    def name(self) -> str:
+        return str(self._cfg.get('name', 'x'))
+
+    def _randomize_scale(self, rng: np.random.Generator, x: np.ndarray, fam: str) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        if not np.all(np.isfinite(x)):
+            x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        if fam in _pt_NATIVE_SCALE_FAMILIES:
+            return x
+        if fam not in ('poisson_gp_intensity_counts', 'bounded_integer_walk', 'weekday_poisson_counts'):
+            sd = float(x.std())
+            if sd > 1e-12:
+                x = x / sd
+            x = x * float(np.exp(rng.uniform(np.log(0.05), np.log(500.0))))
+            x = x + float(rng.normal(0.0, abs(x).mean() + 1e-06))
+            if rng.random() < self._round_prob:
+                x = np.round(x)
+        return x
+
+    def _pad(self, rng: np.random.Generator, x: np.ndarray) -> np.ndarray:
+        n = x.size
+        if n >= self._target_len:
+            return x[:self._target_len]
+        out = np.empty(self._target_len, dtype=np.float64)
+        out[:self._target_len - n] = x[0]
+        out[self._target_len - n:] = x
+        return out
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        seed = self._base_seed
+        for i in range(int(n_series)):
+            rng = np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(i,)))
+            fam = self._family_keys[rng.choice(len(self._family_keys), p=self._family_probs)]
+            self._last_fam = fam
+            n = _pt_sample_series_length(rng)
+            x = _pt_FAMILY_BUILDERS[fam](rng, n)
+            x = np.nan_to_num(np.asarray(x, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+            is_raw = fam in self._raw
+            keep_native = fam in _pt_NATIVE_SCALE_FAMILIES or is_raw
+            was_integer = keep_native and bool(np.all(x == np.round(x)))
+            was_nonneg = keep_native and bool(x.min() >= 0.0)
+            if rng.random() < self._vol_warp_prob and (not keep_native):
+                x = _pt_warp_increments_stochastic_vol(rng, x, self._vol_warp_strength)
+            if rng.random() < self._level_shift_prob and (not keep_native):
+                x = _pt_add_heavy_tailed_level_shifts(rng, x, self._level_shift_rate, self._level_shift_scale)
+            if not is_raw:
+                x = self._randomize_scale(rng, x, fam)
+            if was_integer:
+                x = np.round(x)
+            repeat_frac = float(np.mean(np.diff(x) == 0.0)) if x.size > 1 else 1.0
+            hold_allowed = (repeat_frac >= self._hold_gate_min_repeat_frac) | (rng.random() < self._hold_gate_bypass_prob)
+            if rng.random() < self._tail_hold_prob and (not is_raw) and hold_allowed:
+                x = _pt_apply_tail_hold(rng, x, self._tail_hold_max_len)
+                if was_integer:
+                    x = np.round(x)
+                if was_nonneg:
+                    np.maximum(x, 0.0, out=x)
+            if rng.random() < self._segment_hold_prob and (not is_raw):
+                x = _pt_hold_random_segments(rng, x, self._segment_max_count, self._segment_min_len, self._segment_max_len, self._segment_extreme_prob)
+                if was_integer:
+                    x = np.round(x)
+            if rng.random() < self._flat_tail_prob and (not is_raw) and hold_allowed:
+                x = _pt_hold_flat_tail(rng, x, self._flat_tail_min_len, self._flat_tail_max_frac, self._flat_tail_extreme_prob)
+            if rng.random() < self._pad_prob:
+                x = self._pad(rng, x)
+            else:
+                x = x[:self._target_len]
+            x = np.nan_to_num(np.asarray(x, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+            zf = float((x == 0.0).mean())
+            if zf > 0.35 and (not keep_native):
+                abs_max = float(np.abs(x).max())
+                offset = max(1.0, abs_max * float(rng.uniform(0.15, 0.8)))
+                x = x + (np.round(offset) if float(np.all(x == np.round(x))) else offset)
+            np.clip(x, -3e+37, 3e+37, out=x)
+            yield x
