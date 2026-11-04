@@ -15754,3 +15754,297 @@ def _pt_loglevel_smooth_gp(rng, n):
         x = np.exp(log_level) * (1.0 + s * scale_mult * e)
         x = np.abs(x)
     return _pt_add_decaying_spikes(rng, x, True)
+
+def _pt_loglevel_pulse_train(rng, n):
+    timescale = _pt_loglevel_log_uniform(rng, 50.0, 2.0 * n)
+    baseline = np.exp(_pt_loglevel_log_uniform(rng, 0.05, 0.5) * _pt_ar_smoothed_unit_noise(rng, n, timescale, 2))
+    pulse_rate = _pt_loglevel_log_uniform(rng, 0.001, 0.05)
+    pulse_mask = rng.random(n) < pulse_rate
+    k = int(pulse_mask.sum())
+    pulses = np.zeros(n)
+    if k:
+        pulses[pulse_mask] = rng.pareto(_pt_loglevel_log_uniform(rng, 1.5, 3.5), size=k) * _pt_loglevel_log_uniform(rng, 0.5, 20.0)
+    decay_coef = float(rng.uniform(0.0, 0.93))
+    decayed_pulses = lfilter([1.0], [1.0, -decay_coef], pulses) if decay_coef > 0 else pulses
+    s = _pt_loglevel_log_uniform(rng, 0.015, 0.25)
+    e = _pt_ar1_student_t_noise(rng, n)
+    _, scale_mult = _pt_random_level_and_scale_shifts(rng, n)
+    x = (baseline + decayed_pulses) * np.exp(s * scale_mult * e)
+    if rng.random() < 0.35:
+        envelope = np.exp(_pt_loglevel_log_uniform(rng, 0.2, 0.9) * _pt_ar_smoothed_unit_noise(rng, n, _pt_loglevel_log_uniform(rng, 5.0, 200.0), 1))
+        x = x * envelope
+    return x
+
+def _pt_loglevel_asymmetric_bumps(rng, n):
+    t = np.arange(n, dtype=np.float64)
+    m = int(rng.choice([1, 2, 3, 4], p=[0.45, 0.3, 0.17, 0.08]))
+    y = np.full(n, _pt_loglevel_log_uniform(rng, 0.005, 0.2))
+    bump_centers = np.sort(rng.uniform(0.08, 0.92, size=m)) * n
+    for c in bump_centers:
+        left_width = n * _pt_loglevel_log_uniform(rng, 0.01, 0.15)
+        right_width = left_width * _pt_loglevel_log_uniform(rng, 0.8, 4.0)
+        a = _pt_loglevel_log_uniform(rng, 0.2, 1.0)
+        u = t - c
+        if rng.random() < 0.5:
+            w = np.where(u < 0, left_width, right_width)
+            y += a * np.exp(-0.5 * (u / w) ** 2)
+        else:
+            w = np.where(u < 0, left_width, right_width) * 0.5
+            z = np.exp(-np.abs(u) / w)
+            y += a * 4.0 * z / (1.0 + z) ** 2
+    s = _pt_loglevel_log_uniform(rng, 0.001, 0.25)
+    e = _pt_ar1_student_t_noise(rng, n)
+    x = y * np.exp(s * e)
+    if rng.random() < 0.4:
+        x = _pt_add_decaying_spikes(rng, x, True)
+    return x
+
+def _pt_loglevel_exp_smooth_gp(rng, n):
+    timescale = _pt_loglevel_log_uniform(rng, 20.0, 0.5 * n)
+    smooth_path = _pt_ar_smoothed_unit_noise(rng, n, timescale, 1)
+    snr = _pt_loglevel_log_uniform(rng, 1.0, 12.0)
+    e = _pt_ar1_student_t_noise(rng, n)
+    level_shift, vol_scale = _pt_random_level_and_scale_shifts(rng, n)
+    z = smooth_path + level_shift * 1.5 + 1.0 / snr * vol_scale * e
+    if rng.random() < 0.3:
+        x = z
+        if rng.random() < 0.5:
+            x = x + rng.uniform(0.0, 3.0)
+        return _pt_add_decaying_spikes(rng, x, False)
+    cv = _pt_loglevel_log_uniform(rng, 0.05, 0.5)
+    x = np.exp(cv * z)
+    return _pt_add_decaying_spikes(rng, x, True)
+
+def _pt_loglevel_envelope_stochastic_vol(rng, n):
+    lv = _pt_ar_smoothed_unit_noise(rng, n, _pt_loglevel_log_uniform(rng, 10.0, 400.0), 1)
+    h = _pt_loglevel_log_uniform(rng, 0.3, 1.2) * lv
+    e = _pt_ar1_student_t_noise(rng, n)
+    envelope = 1.0 + _pt_loglevel_log_uniform(rng, 0.1, 0.6) * _pt_ar_smoothed_unit_noise(rng, n, _pt_loglevel_log_uniform(rng, 20.0, 30.0 + 0.3 * n), 2)
+    noise_scale = _pt_loglevel_log_uniform(rng, 0.02, 0.3)
+    x = np.abs(envelope * (1.0 + noise_scale * np.exp(h) * e))
+    return x
+
+def _pt_smooth_log_level_series(rng, n):
+    n = int(n)
+    k = int(rng.choice(5, p=_pt_LOGLEVEL_KIND_PROBS))
+    if k == 0:
+        x = _pt_loglevel_smooth_gp(rng, n)
+    elif k == 1:
+        x = _pt_loglevel_pulse_train(rng, n)
+    elif k == 2:
+        x = _pt_loglevel_asymmetric_bumps(rng, n)
+    elif k == 3:
+        x = _pt_loglevel_exp_smooth_gp(rng, n)
+    else:
+        x = _pt_loglevel_envelope_stochastic_vol(rng, n)
+    if x.min() >= 0 and rng.random() < 0.15:
+        x = x + np.median(x) * _pt_loglevel_log_uniform(rng, 0.5, 20.0)
+    lg = float(np.clip(rng.normal(1.2, 1.7), -2.0, 6.0))
+    median_abs = np.median(np.abs(x))
+    if not np.isfinite(median_abs) or median_abs <= 0:
+        median_abs = np.abs(x).mean() + 1.0
+    x = x * (10.0 ** lg / median_abs)
+    if lg > 2.3 and rng.random() < 0.35:
+        r = np.round(x)
+        if np.mean(np.diff(r) == 0) < 0.03:
+            x = r
+    elif rng.random() < 0.5:
+        q = 10.0 ** (np.floor(lg) - 3)
+        r = np.round(x / q) * q
+        if np.mean(np.diff(r) == 0) < 0.03:
+            x = r
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.ascontiguousarray(x, dtype=np.float64)
+
+def _pt_sample_staircase_grid(rng):
+    u = rng.random()
+    if u < 0.3:
+        return (float(rng.integers(1, 11) if rng.random() < 0.8 else 0), 1.0, True, False)
+    if u < 0.72:
+        base_level = float(np.floor(np.exp(rng.uniform(np.log(10.0), np.log(30000.0)))))
+        r = rng.random()
+        if r < 0.4:
+            q = 1.0
+        else:
+            q = float(max(1.0, np.round(base_level * np.exp(rng.uniform(np.log(0.01), np.log(0.15))))))
+        return (base_level, q, True, False)
+    if u < 0.83:
+        v = float(np.floor(np.exp(rng.uniform(0.0, np.log(5000.0)))))
+        return (0.0, max(v, 1.0), True, False)
+    base_level = float(np.exp(rng.uniform(np.log(0.01), np.log(400.0))))
+    q = base_level * float(np.exp(rng.uniform(np.log(0.01), np.log(0.25))))
+    return (base_level, q, False, True)
+
+def _pt_staircase_level_sequence(rng, n_levels, base_level, q, integer_valued, allow_negative, toggle_mode):
+    lv = np.empty(n_levels)
+    k = 0
+    level = base_level
+    lv[0] = level
+    jump_prob = rng.uniform(0.0, 0.35)
+    revisit_prob = rng.uniform(0.05, 0.45)
+    outage_prob = 0.2 if rng.random() < 0.2 else 0.01
+    max_step = int(rng.integers(1, 4))
+    for i in range(1, n_levels):
+        r = rng.random()
+        if toggle_mode:
+            if r < 0.8 or i < 2:
+                level = q if lv[i - 1] == 0.0 else 0.0
+            else:
+                level = float(np.floor(q * rng.uniform(0.2, 1.5)))
+        elif r < revisit_prob and i >= 2:
+            j = int(rng.integers(0, i - 1))
+            level = lv[j]
+        elif r < revisit_prob + outage_prob * (1.0 - revisit_prob) and base_level >= 0.0 and (lv[i - 1] != 0.0):
+            level = 0.0
+        elif rng.random() < jump_prob:
+            jump_factor = float(np.exp(rng.uniform(-2.5, 2.5)))
+            ref_level = base_level if lv[i - 1] == 0.0 else lv[i - 1]
+            if abs(ref_level) * jump_factor > 40000.0:
+                jump_factor = 1.0 / jump_factor
+            level = ref_level * jump_factor
+            if integer_valued:
+                level = float(np.round(level))
+            else:
+                level = base_level + np.round((level - base_level) / q) * q
+        else:
+            step_delta = int(rng.integers(1, max_step + 1))
+            if rng.random() < 0.5:
+                step_delta = -step_delta
+            prev_level = lv[i - 1]
+            if prev_level == 0.0 and base_level > 0.0 and (not integer_valued):
+                level = base_level + k * q
+            else:
+                k = int(np.round((prev_level - base_level) / q)) + step_delta
+                level = base_level + k * q
+            if level < 0.0 and (not allow_negative):
+                k = k - 2 * step_delta
+                level = base_level + k * q
+                if level < 0.0:
+                    level = 0.0
+        if level == lv[i - 1]:
+            level = lv[i - 1] + q
+        lv[i] = level
+    if not integer_valued and rng.random() < 0.2:
+        lv = lv + rng.normal(0.0, 0.15 * q, n_levels) * (lv != 0.0)
+    if allow_negative and rng.random() < 0.09:
+        lv = -lv + 0.0
+    return lv
+
+def _pt_staircase_segment_lengths(rng, n, n_levels):
+    shape = rng.uniform(0.45, 1.3)
+    w = rng.gamma(shape, 1.0, n_levels) + 0.001
+    long_final_segment = rng.random() < 0.78
+    if long_final_segment:
+        w[-1] += w.sum() * rng.uniform(0.0, 0.8)
+    else:
+        w[-1] *= rng.uniform(0.02, 0.5)
+    w = w / w.sum()
+    L = np.maximum(1, np.floor(w * n).astype(np.int64))
+    L[np.argmax(L)] += n - int(L.sum())
+    if L.min() < 1:
+        for _ in range(n_levels):
+            too_short = L < 1
+            if not too_short.any():
+                break
+            deficit = int((1 - L[too_short]).sum())
+            L[too_short] = 1
+            L[np.argmax(L)] -= deficit
+    if long_final_segment and n >= 1100 and (L[-1] < 720):
+        deficit = 720 - int(L[-1])
+        spare = L[:-1] - 1
+        total_spare = int(spare.sum())
+        if total_spare >= deficit:
+            reduction = np.floor(spare * (deficit / total_spare)).astype(np.int64)
+            leftover = deficit - int(reduction.sum())
+            donor_order = np.argsort(-spare)
+            for j in donor_order:
+                if leftover <= 0:
+                    break
+                if spare[j] - reduction[j] > 0:
+                    reduction[j] += 1
+                    leftover -= 1
+            L[:-1] -= reduction
+            L[-1] += deficit
+    return L
+
+def _pt_integer_staircase_series(rng, n) -> np.ndarray:
+    n = int(n)
+    base_level, q, integer_valued, allow_negative = _pt_sample_staircase_grid(rng)
+    toggle_mode = integer_valued and base_level == 0.0 and (q > 1.0) and (rng.random() < 0.9)
+    max_steps = int(np.ceil(0.005 * (n - 1))) - 1
+    if rng.random() < 0.17 or max_steps == 0:
+        n_steps = 0
+    else:
+        n_steps = 1 + int(rng.geometric(rng.uniform(0.09, 0.4)) - 1)
+        n_steps = min(n_steps, 16, max_steps)
+    if n_steps == 0:
+        if toggle_mode:
+            const_level = q if rng.random() < 0.7 else 0.0
+        else:
+            const_level = base_level
+        return np.full(n, float(const_level))
+    n_flickers = 0
+    if n_steps >= 4 and rng.random() < 0.18:
+        n_flickers = int(rng.integers(2, min(n_steps - 2, 6) + 1))
+    n_levels = n_steps + 1 - (n_flickers + 1 if n_flickers else 0)
+    lv = _pt_staircase_level_sequence(rng, n_levels, base_level, q, integer_valued, allow_negative, toggle_mode)
+    L = _pt_staircase_segment_lengths(rng, n, n_levels)
+    if n_flickers and n_levels >= 2:
+        fl = rng.integers(1, 4, n_flickers).astype(np.int64)
+        L0 = int(L[0])
+        head_len = max(1, int(L0 * rng.uniform(0.02, 0.6)))
+        tail_len = L0 - head_len - int(fl.sum())
+        if tail_len >= 1:
+            alt_level = lv[1]
+            flicker_levels = np.where(np.arange(n_flickers) % 2 == 0, alt_level, lv[0])
+            expanded_levels = np.concatenate([[lv[0]], flicker_levels, [lv[0]], lv[1:]])
+            expanded_lengths = np.concatenate([[head_len], fl, [tail_len], L[1:]]).astype(np.int64)
+            run_starts = np.concatenate([[True], expanded_levels[1:] != expanded_levels[:-1]])
+            run_index = np.cumsum(run_starts) - 1
+            L = np.bincount(run_index, weights=expanded_lengths).astype(np.int64)
+            lv = expanded_levels[run_starts]
+    max_steps = max(max_steps, 0)
+    x = np.repeat(lv, L)
+    if not np.all(np.isfinite(x)):
+        x = np.where(np.isfinite(x), x, 0.0)
+    return x.astype(np.float64)
+_pt_DAILY_PERIOD_CHOICES = np.array([96, 288, 48, 24, 144, 60, 240], dtype=np.int64)
+_pt_DAILY_PERIOD_WEIGHTS = np.array([0.47, 0.235, 0.171, 0.052, 0.048, 0.016, 0.008])
+_pt_DAILY_PERIOD_WEIGHTS = _pt_DAILY_PERIOD_WEIGHTS / _pt_DAILY_PERIOD_WEIGHTS.sum()
+_pt_DAILY_PERIOD_CDF = np.cumsum(_pt_DAILY_PERIOD_WEIGHTS)
+_pt_FORCED_SUBMODE = None
+
+def _pt_sample_daily_period(rng) -> int:
+    return int(_pt_DAILY_PERIOD_CHOICES[int(np.searchsorted(_pt_DAILY_PERIOD_CDF, rng.random() * (1.0 - 1e-12)))])
+
+def _pt_power_log_uniform(rng, a: float, b: float) -> float:
+    return float(np.exp(rng.uniform(np.log(a), np.log(b))))
+
+def _pt_pick_weighted_option(rng, options, p):
+    p = np.asarray(p, dtype=np.float64)
+    c = np.cumsum(p / p.sum())
+    return options[int(np.searchsorted(c, rng.random() * (1.0 - 1e-12)))]
+
+def _pt_ar1_noise_by_timescale(rng, n: int, timescale: float) -> np.ndarray:
+    if n <= 0:
+        return np.zeros(0, dtype=np.float64)
+    phi = float(np.exp(-1.0 / max(timescale, 0.001)))
+    if phi < 1e-06:
+        return rng.standard_normal(n)
+    z = rng.standard_normal(n)
+    zi = np.array([phi * rng.standard_normal()], dtype=np.float64)
+    y, _ = lfilter(np.array([np.sqrt(max(1.0 - phi * phi, 1e-12))]), np.array([1.0, -phi]), z, zi=zi)
+    return np.asarray(y, dtype=np.float64)
+
+def _pt_twice_filtered_ar1_noise(rng, n: int, timescale: float) -> np.ndarray:
+    if n <= 0:
+        return np.zeros(0, dtype=np.float64)
+    phi = float(np.exp(-1.0 / max(timescale, 0.001)))
+    if phi < 1e-06:
+        return rng.standard_normal(n)
+    b = np.array([np.sqrt(max(1.0 - phi * phi, 1e-12))])
+    a = np.array([1.0, -phi])
+    z = rng.standard_normal(n)
+    y, _ = lfilter(b, a, z, zi=np.array([phi * rng.standard_normal()]))
+    y, _ = lfilter(b, a, y, zi=np.array([phi * y[0] / max(b[0], 1e-12)]))
+    return np.asarray(y, dtype=np.float64) * np.sqrt((1.0 - phi * phi) / (1.0 + phi * phi))
