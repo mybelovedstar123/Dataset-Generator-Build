@@ -13139,3 +13139,231 @@ def _intraday_spot_price(rng: np.random.Generator, n: int, L: int,
         b = min(n, a + 256)
         out[a:b] = _isp_rows(rng, P[a:b], kind[a:b], L, short_start)
     return out
+
+
+def _isp_rows(rng: np.random.Generator, P: np.ndarray, kind: np.ndarray, L: int,
+              short_start: float) -> np.ndarray:
+    """One chunk of rows; P (n,1) samples/day, kind (n,1) archetype code:
+    0 sub-hourly day-ahead, 1 hourly spot, 2 nz dispatch, 3 5-min real-time."""
+    n = P.shape[0]
+    t = np.arange(L, dtype=np.float64)[None, :]
+    idx = np.arange(L, dtype=np.int64)[None, :]
+    da_i = np.flatnonzero(kind[:, 0] <= 1)
+    rt_i = np.flatnonzero(kind[:, 0] >= 2)
+    n_da, n_rt = da_i.size, rt_i.size
+    half = (kind == 0) & (P == 48.0)               # octopus / elexon rows
+
+    def U(*ranges):
+        """per-row uniform draw whose (lo, hi) range depends on the kind."""
+        lo = np.choose(kind, [r[0] for r in ranges])
+        hi = np.choose(kind, [r[1] for r in ranges])
+        return rng.uniform(lo, hi, size=(n, 1))
+
+    hs = 24.0 / P                                  # hours per sample
+    phase = rng.uniform(0.0, 1.0, size=(n, 1)) * P
+    tau = np.mod(t + phase, P) * hs                # hour of day in [0, 24)
+    fday = (t + phase) / P
+    day = np.floor(fday).astype(np.int64)
+    nd = int(day.max()) + 2
+
+    # ── daily level: slow walk + drift + day AR(1) + cycle + weekend ──────
+    rw_sd = U((0.005, 0.04), (0.005, 0.02), (0.06, 0.2), (0.003, 0.015))
+    drift = U((-0.1, 0.8), (-0.2, 0.2), (-0.3, 2.0), (-0.15, 0.15))
+    drift = np.where(half, 0.3 * drift, drift)
+    rw_sd = np.where(half, 0.5 * rw_sd, rw_sd)
+    dd = np.arange(nd, dtype=np.float64)[None, :]
+    slow = np.cumsum(rng.normal(0.0, 1.0, size=(n, nd)) * rw_sd, axis=1) + drift * dd / (L / P)
+    slow = 2.0 * np.tanh(slow / 2.0)
+    sd_day = U((0.03, 0.20), (0.005, 0.02), (0.8, 1.3), (0.06, 0.15))
+    phi_day = U((0.6, 0.9), (0.7, 0.9), (-0.3, 0.1), (0.2, 0.5))
+    ar_day = _isp_day_ar1(rng, n, nd, phi_day, sd_day)
+    T_c = np.where(kind == 1, rng.uniform(6.0, 14.0, size=(n, 1)), rng.uniform(1.8, 3.5, size=(n, 1)))
+    amp_c = np.select([kind == 2, kind == 1], [rng.uniform(0.4, 1.0, size=(n, 1)),
+                                             rng.uniform(0.02, 0.06, size=(n, 1))], 0.0)
+    cyc = amp_c * np.sin(2.0 * np.pi * dd / T_c + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1)))
+    cyc = cyc * np.exp(rng.normal(0.0, 0.3, size=(n, nd)))
+    dow0 = rng.integers(0, 7, size=(n, 1))
+    dow_d = (np.arange(nd, dtype=np.int64)[None, :] + dow0) % 7
+    sat = rng.uniform(0.7, 0.95, size=(n, 1))
+    sun = sat * rng.uniform(0.8, 1.0, size=(n, 1))
+    wk_d = np.where(dow_d == 5, np.log(sat), np.where(dow_d == 6, np.log(sun), 0.0))
+    lowday = (kind == 1) & (rng.random((n, nd)) < 0.03)
+    wk_d = wk_d + np.where(lowday, np.log(rng.uniform(0.5, 0.9, size=(n, nd))), 0.0)
+    logD_d = slow + ar_day + cyc + wk_d
+    logD_hold = np.take_along_axis(logD_d, day, axis=1)
+    frac = fday - day
+    logD_lin = (1.0 - frac) * logD_hold + frac * np.take_along_axis(logD_d, day + 1, axis=1)
+    logD = np.where(kind == 2, logD_lin, logD_hold)
+    wkend = np.take_along_axis(dow_d >= 5, day, axis=1)
+    base = np.where(kind <= 1, np.exp(rng.normal(np.log(60.0), 0.9, size=(n, 1))),
+                    np.exp(rng.normal(np.log(30.0), 0.6, size=(n, 1))))
+    base = np.clip(base, 2.0, 5000.0)
+
+    # ── volatility multiplier ─────────────────────────────────────────────
+    logvol_d = _isp_day_ar1(rng, n, nd, np.full((n, 1), 0.6), rng.uniform(0.1, 0.3, size=(n, 1)))
+    phi_v = 0.9 ** hs
+    e_v = rng.normal(0.0, 1.0, size=(n, L)) * rng.uniform(0.15, 0.45, size=(n, 1)) * np.sqrt(1.0 - phi_v ** 2)
+    v_t = _isp_ar1(e_v, phi_v)
+    vslope = rng.uniform(-0.2, 0.8, size=(n, 1))
+    vol = np.exp(np.tanh(np.take_along_axis(logvol_d, day, axis=1) + v_t + vslope * (t / L - 0.5)))
+    del e_v, v_t
+
+    # ── intraday profile (log bumps, circular in 24 h) ────────────────────
+    def bump(mu, w):
+        d = np.abs(np.mod(tau - mu + 12.0, 24.0) - 12.0)
+        return np.exp(-0.5 * (d / w) ** 2)
+    mu_m = rng.uniform(6.5, 9.0, size=(n, 1))
+    mu_e = rng.uniform(17.0, 20.5, size=(n, 1))
+    mu_n = rng.uniform(2.0, 5.0, size=(n, 1))
+    a_m = U((0.10, 0.40), (0.02, 0.12), (0.0, 0.1), (0.05, 0.15))
+    a_e = U((0.15, 0.60), (0.10, 0.30), (0.02, 0.15), (0.15, 0.35))
+    a_n = U((0.05, 0.30), (0.08, 0.25), (0.02, 0.12), (0.15, 0.35))
+    a_m = np.where(half, rng.uniform(0.02, 0.15, size=(n, 1)), a_m)
+    a_e = np.where(half, rng.uniform(0.20, 0.50, size=(n, 1)), a_e)
+    w_m = rng.uniform(2.5, 3.5, size=(n, 1))
+    w_e = np.where(half, rng.uniform(3.0, 4.5, size=(n, 1)), rng.uniform(3.0, 4.0, size=(n, 1)))
+    w_n = rng.uniform(3.0, 4.5, size=(n, 1))
+    aj = np.select([half, kind == 0, kind == 1], [0.6, 0.3, 0.05], 0.35)
+    phi_j = np.where(half, rng.uniform(0.1, 0.4, size=(n, 1)), rng.uniform(0.3, 0.7, size=(n, 1)))
+    jm = np.take_along_axis(np.exp(_isp_day_ar1(rng, n, nd, phi_j, aj)), day, axis=1)
+    je = np.take_along_axis(np.exp(_isp_day_ar1(rng, n, nd, phi_j, aj)), day, axis=1)
+    jn = np.take_along_axis(np.exp(_isp_day_ar1(rng, n, nd, phi_j, aj)), day, axis=1)
+    je = je * np.where(wkend, rng.uniform(0.6, 0.9, size=(n, 1)), 1.0)
+    t_drift = rng.uniform(-1.0, 1.0, size=(n, 1)) * (t / L - 0.5)
+    t_jit = np.take_along_axis(rng.normal(0.0, 0.7, size=(n, nd)), day, axis=1)
+    prof = (a_m * jm * bump(mu_m + t_drift + t_jit, w_m)
+            + a_e * je * bump(mu_e + t_drift + t_jit, w_e)
+            - a_n * jn * bump(mu_n + t_jit, w_n))
+    del jm, je, jn
+
+    y = np.empty((n, L), dtype=np.float64)
+
+    # ── day-ahead / hourly spot rows ──────────────────────────────────────
+    if n_da:
+        kd = kind[da_i]; Pd = P[da_i]; hd = hs[da_i]; taud = tau[da_i]
+        dayd = day[da_i]; vold = vol[da_i]; based = base[da_i]
+        m = n_da
+        phi_r = rng.uniform(0.7, 0.95, size=(m, 1)) ** hd
+        sd_r = np.where(kd == 1, rng.uniform(0.02, 0.08, size=(m, 1)), rng.uniform(0.05, 0.22, size=(m, 1)))
+        r_t = _isp_ar1(rng.normal(0.0, 1.0, size=(m, L)) * sd_r * np.sqrt(1.0 - phi_r ** 2), phi_r) * vold
+        solar_p = np.select([Pd == 96.0, Pd == 48.0], [0.70, 0.15], 0.20)
+        solar = rng.random((m, 1)) < solar_p
+        s_row = np.where(solar, np.where(kd == 1, rng.uniform(0.3, 0.8, size=(m, 1)),
+                                         rng.uniform(0.75, 1.0, size=(m, 1))),
+                         rng.uniform(0.03, 0.4, size=(m, 1)))
+        s_d = s_row * np.exp(_isp_day_ar1(rng, m, nd, rng.uniform(0.3, 0.7, size=(m, 1)),
+                                         rng.uniform(0.3, 0.6, size=(m, 1))))
+        s_d = s_d * np.where(dow_d[da_i] >= 5, rng.uniform(1.0, 1.3, size=(m, 1)), 1.0)
+        neg_ok = rng.random((m, nd)) < rng.uniform(0.03, 0.25, size=(m, 1))
+        s_d = np.minimum(s_d, np.where(neg_ok, 1.12, 0.99))
+        s_t = np.take_along_axis(s_d, dayd, axis=1)
+        mu_s = rng.uniform(12.5, 14.0, size=(m, 1)) + 0.5 * t_jit[da_i]
+        w_s = rng.uniform(3.5, 5.0, size=(m, 1))
+        k_s = rng.uniform(1.2, 2.0, size=(m, 1))
+        S = np.exp(-(np.abs(taud - mu_s) / w_s) ** k_s)
+        scar_p = np.where(kd == 1, rng.uniform(0.02, 0.08, size=(m, 1)), rng.uniform(0.0, 0.10, size=(m, 1)))
+        scar_d = rng.random((m, nd)) < scar_p
+        amp_lo = np.where(kd == 1, 1.15, 1.3)
+        amp_hi = np.where(kd == 1, 1.4, 3.0)
+        scar_amp = np.where(scar_d, amp_lo + (amp_hi - amp_lo) * rng.random((m, nd)), 1.0)
+        scar_w = np.where(kd == 1, rng.uniform(0.5, 2.0, size=(m, nd)), rng.uniform(0.5, 2.5, size=(m, nd)))
+        scar_mu = mu_e[da_i] + rng.normal(0.0, 1.5, size=(m, nd))
+        dm = np.abs(np.mod(taud - np.take_along_axis(scar_mu, dayd, axis=1) + 12.0, 24.0) - 12.0)
+        scar = 1.0 + (np.take_along_axis(scar_amp, dayd, axis=1) - 1.0) * np.exp(
+            -0.5 * (dm / np.take_along_axis(scar_w, dayd, axis=1)) ** 2)
+        w_sd = np.select([Pd == 96.0, Pd == 48.0], [rng.uniform(0.01, 0.04, size=(m, 1)),
+                                                    rng.uniform(0.01, 0.05, size=(m, 1))], 0.0)
+        shape = prof[da_i] - s_t * S
+        ramp = np.abs(np.diff(shape, axis=1, prepend=shape[:, :1]))
+        ramp = ramp / (ramp.mean(axis=1, keepdims=True) + 1e-9)
+        w_raw = rng.laplace(0.0, 1.0, size=(m, L))
+        w_t = w_raw * (w_sd / np.sqrt(2.0)) * vold * (0.4 + 0.6 * ramp)
+        D = based * np.exp(logD[da_i])
+        price = D * (np.exp(prof[da_i] + r_t + w_t) * scar - s_t * S)
+        fk = rng.random((m, 1))
+        hard = fk < np.where(kd == 1, 0.20, 0.10)
+        soft = ~hard & (fk < np.where(kd == 1, 0.70, 0.35))
+        fl = np.where(hard, 0.0, np.where(soft, based * rng.uniform(0.02, 0.2, size=(m, 1)),
+                                          -based * rng.uniform(0.01, 0.08, size=(m, 1))))
+        fl_pos = based * rng.uniform(0.0005, 0.01, size=(m, 1))
+        neg_ok_t = np.take_along_axis(neg_ok, dayd, axis=1)
+        fl_t = np.where(hard, 0.0, np.where(neg_ok_t, fl, np.maximum(fl, fl_pos)) + based * 0.003 * w_raw)
+        price = np.maximum(price, fl_t)
+        # hourly spot rows: offer-tier grid in log space + micro-jitter
+        grid = (kd == 1) & (rng.random((m, 1)) < 0.6)
+        if grid.any():
+            g = rng.uniform(0.01, 0.06, size=(m, 1))
+            tiered = np.exp(np.rint(np.log(np.maximum(price, 1e-9)) / g) * g)
+            micro = rng.random((m, L)) < rng.uniform(0.6, 0.9, size=(m, 1))
+            mj = np.exp(rng.normal(0.0, 1.0, size=(m, L)) * rng.uniform(1.0e-3, 5.0e-3, size=(m, 1)))
+            price = np.where(grid & (price > 0), np.where(micro, tiered * mj, tiered), price)
+        y[da_i] = price
+        del r_t, S, scar, shape, ramp, w_raw, w_t, D, price, fl_t
+
+    # ── dispatch rows: tiers, collapses, jitter, spikes ───────────────────
+    if n_rt:
+        kr = kind[rt_i]; Pr = P[rt_i]; volr = vol[rt_i]; baser = base[rt_i]
+        m = n_rt
+        dwell = np.where(kr == 2, rng.uniform(1.2, 4.0, size=(m, 1)), rng.uniform(24.0, 150.0, size=(m, 1)))
+        phi_z = rng.uniform(0.3, 0.8, size=(m, 1)) ** (1.0 / dwell)
+        sd_z = rng.uniform(0.02, 0.08, size=(m, 1))
+        z_t = _isp_ar1(rng.normal(0.0, 1.0, size=(m, L)) * sd_z * np.sqrt(1.0 - phi_z ** 2), phi_z)
+        cp = rng.random((m, L)) < (1.0 / dwell)
+        cp[:, 0] = True
+        src = np.maximum.accumulate(np.where(cp, idx, 0), axis=1)
+        K = rng.integers(2, 5, size=(m, 1)).astype(np.float64)
+        spacing = rng.uniform(0.4, 0.9, size=(m, 1))
+        state = np.take_along_axis(np.floor(rng.random((m, L)) * K), src, axis=1)
+        tier = np.where(kr == 2, (state - 0.5 * (K - 1.0)) * spacing, np.take_along_axis(z_t, src, axis=1))
+        del z_t, state, src
+        dip_rate = np.where(kr == 2, rng.uniform(0.002, 0.012, size=(m, 1)), 0.0)
+        u_dip = rng.random((m, L))
+        dstart = u_dip < dip_rate
+        dmask = _isp_runs(rng, idx, dstart, rng.uniform(1.5, 4.0, size=(m, 1)))
+        dip_val = np.log(5.0e-4) + (np.log(0.1) - np.log(5.0e-4)) * u_dip / np.maximum(dip_rate, 1e-9)
+        src_d = np.maximum.accumulate(np.where(dstart, idx, 0), axis=1)
+        tier = np.where(dmask, np.take_along_axis(dip_val, src_d, axis=1), tier)
+        del u_dip, dstart, dmask, dip_val, src_d
+        alpha = np.where(kr == 2, rng.uniform(0.0, 0.4, size=(m, 1)), 0.0)
+        tier = (1.0 - alpha) * tier + alpha * np.concatenate([tier[:, :1], tier[:, :-1]], axis=1)
+        rate = np.where(kr == 2, rng.uniform(0.1, 0.5, size=(m, 1)), rng.uniform(0.5, 1.2, size=(m, 1))) / Pr
+        mag_lo = np.where(kr == 3, np.log(2.5), np.log(1.5))
+        mag_hi = np.where(kr == 3, np.log(20.0), np.log(3.0))
+        u_hit = rng.random((m, L))
+        hit = u_hit < rate
+        mag = mag_lo + (mag_hi - mag_lo) * np.minimum(u_hit / rate, 1.0)
+        tau_s = np.where(kr == 3, rng.uniform(0.7, 2.0, size=(m, 1)), rng.uniform(0.5, 3.0, size=(m, 1)))
+        tau_s = np.where((kr == 2) & (rng.random((m, 1)) < 0.15), rng.uniform(3.0, 8.0, size=(m, 1)), tau_s)
+        spk = _isp_ar1(np.where(hit, mag, 0.0), np.exp(-1.0 / tau_s))
+        spk = np.minimum(spk * np.sqrt(volr), np.log(30.0))
+        del u_hit, hit, mag
+        jit_sd = np.where(kr == 3, rng.uniform(0.002, 0.01, size=(m, 1)), rng.uniform(0.01, 0.03, size=(m, 1)))
+        jit = rng.normal(0.0, 1.0, size=(m, L)) * jit_sd
+        burst = (kr == 3) & (rng.random((m, L)) < rng.uniform(0.15, 0.35, size=(m, 1)))
+        jit = (jit + np.where(burst, rng.normal(0.0, 1.0, size=(m, L)) * rng.uniform(0.05, 0.12, size=(m, 1)), 0.0)) * volr
+        u_rt = logD[rt_i] + prof[rt_i] + tier + jit + spk
+        u_cap = np.where(kr == 3, np.log(18.0), np.log(10.0))
+        u_rt = np.where(u_rt > u_cap, u_cap + 0.3 * (u_rt - u_cap), u_rt)
+        y[rt_i] = baser * np.exp(u_rt)
+        del tier, jit, burst, spk, u_rt
+    del prof, vol, logD, tau
+
+    # ── observation: repeat runs, integer snaps, tick ─────────────────────
+    h_row = U((0.0, 0.03), (0.03, 0.22), (0.03, 0.2), (0.01, 0.06))
+    c_row = U((0.2, 0.5), (0.3, 0.6), (0.3, 0.7), (0.2, 0.5))
+    u_obs = rng.random((n, L))
+    hold = _isp_runs(rng, idx, u_obs < h_row, 1.0 / (1.0 - c_row))
+    hold[:, 0] = False
+    src_h = np.maximum.accumulate(np.where(hold, 0, idx), axis=1)
+    y = np.take_along_axis(y, src_h, axis=1)
+    q_row = np.where(rng.random((n, 1)) < 0.45, rng.uniform(0.01, 0.25, size=(n, 1)), 0.0)
+    snap = u_obs > 1.0 - q_row
+    unit = np.where(rng.random((n, 1)) < 0.33, 5.0, 1.0)
+    y = np.where(snap, np.rint(y / unit) * unit, y)
+    y = np.rint(y / 0.01) * 0.01
+
+    # ── mid-row start: constant prefix at the first real value ────────────
+    pre = rng.random((n, 1)) < short_start
+    cut = np.where(pre, (rng.uniform(0.25, 0.85, size=(n, 1)) * L).astype(np.int64), 0)
+    first = np.take_along_axis(y, cut, axis=1)
+    return np.where(idx < cut, first, y)
