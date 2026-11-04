@@ -3037,3 +3037,77 @@ _CAS1_WORKLOAD_ENABLED = True
 
 
 MAX_TAPS = 64
+
+
+# ═════════════════════════════ C1 epi_renewal ══════════════════════════════
+
+def c1_params(rng, B, cfg):
+    p = cfg["families"]["epi_renewal"]
+    q = {
+        "r_tau": logu(rng, p["logr_corr_time"][0], p["logr_corr_time"][1], B),
+        "r_sig": np.abs(rng.normal(0.0, p["logr_sigma"], B)) + 0.05,
+        "r_mu": rng.normal(0.0, 0.12, B),
+        "mu_g": logu(rng, p["serial_interval_mean"][0], p["serial_interval_mean"][1], B),
+        "cv_g": rng.uniform(0.35, 0.8, B),
+        "disp": logu(rng, p["dispersion"][0], p["dispersion"][1], B),
+        "import_tau": logu(rng, 500.0, 4000.0, B),
+        "import_size": logu(rng, 1.0, 200.0, B),
+        "endemic": rng.random(B) < p["endemic_rate"],
+        "endemic_rate": logu(rng, 0.05, 6.0, B),
+        "i0": logu(rng, 1.0, 500.0, B),
+        "report": rng.random(B) < p["reporting_layer_rate"],
+    }
+    q.update(c2_params(rng, B, cfg))
+    return q
+
+
+def _serial_interval(mu_g, cv_g, n):
+    """Discretised Gamma serial-interval kernel, truncated at 4 mu_g."""
+    a = 1.0 / np.maximum(cv_g.reshape(n, 1) ** 2, 1e-3)
+    scale = np.maximum(mu_g.reshape(n, 1), 1.0) / a
+    s = np.arange(MAX_TAPS, dtype=np.float64)[None, :] + 0.5
+    logw = (a - 1.0) * np.log(s) - s / scale
+    logw -= logw.max(axis=1, keepdims=True)
+    w = np.exp(logw)
+    trunc = np.minimum(np.ceil(4.0 * mu_g.reshape(n, 1)), MAX_TAPS)
+    w = np.where(np.arange(MAX_TAPS)[None, :] < trunc, w, 0.0)
+    w /= np.maximum(w.sum(axis=1, keepdims=True), 1e-12)
+    taps = np.clip(trunc[:, 0].astype(np.int64), 1, MAX_TAPS)
+    return np.ascontiguousarray(w), taps
+
+
+def c1_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    logr = ou(rng, n, L, P["r_tau"]) * P["r_sig"].reshape(n, 1) \
+        + P["r_mu"].reshape(n, 1)
+    rt = np.exp(np.clip(logr, -3.0, 2.0))
+
+    w, taps = _serial_interval(P["mu_g"], P["cv_g"], n)
+    imp = np.where(rng.random((n, L)) < (1.0 / P["import_tau"].reshape(n, 1)),
+                   P["import_size"].reshape(n, 1), 0.0)
+    # A pure renewal process with heavy over-dispersion has zero as an absorbing
+    # state, so most windows would be extinct.  Real notifiable-disease feeds
+    # carry a background importation rate; endemic rows get one, and the rest
+    # keep the sporadic-introduction behaviour.
+    imp = imp + np.where(P["endemic"].reshape(n, 1),
+                         P["endemic_rate"].reshape(n, 1), 0.0)
+
+    k = np.maximum(P["disp"].reshape(n, 1), 1e-2)
+    gam = rng.gamma(np.broadcast_to(k, (n, L))) / k
+    u = rng.random((n, L))
+    z = rng.standard_normal((n, L))
+    out = np.zeros((n, L))
+    k_renewal(w, taps, np.ascontiguousarray(rt), imp, gam, u, z,
+                np.ascontiguousarray(P["i0"]), out)
+
+    rep = P["report"].reshape(n, 1)
+    if P["report"].any():
+        obs = _reporting_layer(P, rng, out, cal, cfg)
+        out = np.where(rep, obs, out)
+
+    fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.6, quant_boost=0.2)
+    fl["integer"] = (
+        ~(P["report"] & P["revise_on"])
+        if cfg.get("_native_integer_flags", False) else np.ones(n, dtype=bool)
+    )
+    return out, fl
