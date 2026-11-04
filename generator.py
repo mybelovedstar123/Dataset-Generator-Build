@@ -13834,3 +13834,299 @@ class _EngineGenerator(_H413_PARENT_GENERATOR):
     @property
     def name(self) -> str:
         return super().name + "-h393-rendezvous-h413-chunked-selector"
+
+
+# ═══════════════ partner family program (names prefixed _pt_) ═══════════════
+_pt_PARTNER_CONFIG = json.loads(Path(__file__).with_name('config.json').read_text(encoding='utf-8'))['partner']
+_pt_LENGTH_QUANTILE_LEVELS = np.array([0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0])
+_pt_LENGTH_QUANTILE_VALUES = np.array([340.0, 475.0, 900.0, 1803.0, 3100.0, 4096.0, 4096.0])
+_pt_SEASONAL_PERIODS = np.array([7, 24, 288, 96, 60, 48, 144, 168, 336, 12])
+_pt_SEASONAL_PERIOD_PROBS = np.array([0.213, 0.201, 0.181, 0.159, 0.13, 0.078, 0.031, 0.003, 0.002, 0.002])
+_pt_SEASONAL_PERIOD_PROBS = _pt_SEASONAL_PERIOD_PROBS / _pt_SEASONAL_PERIOD_PROBS.sum()
+_pt_DEFAULT_ROUND_PROB = 0.54
+_pt_MAX_SERIES_LENGTH = 4096
+_pt_DEFAULT_FAMILY_WEIGHTS = (('multi_harmonic_ar', 0.14), ('markov_switching_ar', 0.12), ('gp_kernel_mixture', 0.12), ('poisson_gp_intensity_counts', 0.11), ('bounded_integer_walk', 0.09), ('arma_arima', 0.09), ('piecewise_linear_trend', 0.08), ('random_dwell_steps', 0.08), ('sparse_jump_decay', 0.06), ('weekday_poisson_counts', 0.06), ('garch_price_path', 0.05))
+
+@njit(cache=False, fastmath=False)
+def _pt_regime_switching_ou_path(n, z, u, reversion_speeds, regime_means, regime_sigmas, switch_prob, x0):
+    out = np.empty(n, dtype=np.float64)
+    x = x0
+    s = 0
+    for i in range(n):
+        if u[i] < switch_prob:
+            s = 1 - s
+        th = reversion_speeds[s]
+        mu = regime_means[s]
+        sg = regime_sigmas[s]
+        x = x + th * (mu - x) + sg * z[i]
+        out[i] = x
+    return out
+
+@njit(cache=False, fastmath=False)
+def _pt_ar1_filter(n, z, ar_coef, x0):
+    out = np.empty(n, dtype=np.float64)
+    x = x0
+    for i in range(n):
+        x = ar_coef * x + z[i]
+        out[i] = x
+    return out
+
+@njit(cache=False, fastmath=False)
+def _pt_bounded_integer_walk(n, u, capacity, stay_prob, x0):
+    out = np.empty(n, dtype=np.float64)
+    x = x0
+    for i in range(n):
+        ui = u[i]
+        if ui >= stay_prob:
+            step = 1 if ui < stay_prob + (1.0 - stay_prob) * 0.5 else -1
+            x = x + step
+            if x < 0:
+                x = 0
+            elif x > capacity:
+                x = capacity
+        out[i] = x
+    return out
+
+@njit(cache=False, fastmath=False)
+def _pt_garch11_returns(n, z, omega, alpha, beta):
+    out = np.empty(n, dtype=np.float64)
+    s2 = omega / max(1e-09, 1.0 - alpha - beta)
+    for i in range(n):
+        e = z[i] * np.sqrt(s2)
+        out[i] = e
+        s2 = omega + alpha * e * e + beta * s2
+    return out
+
+@njit(cache=False, fastmath=False)
+def _pt_jump_decay_path(n, jump_flags, jump_sizes, decay, baseline):
+    out = np.empty(n, dtype=np.float64)
+    x = baseline
+    for i in range(n):
+        x = baseline + decay * (x - baseline)
+        if jump_flags[i] > 0:
+            x += jump_sizes[i]
+        out[i] = x
+    return out
+
+def _pt_sample_series_length(rng: np.random.Generator) -> int:
+    q = rng.random()
+    v = float(np.interp(q, _pt_LENGTH_QUANTILE_LEVELS, _pt_LENGTH_QUANTILE_VALUES))
+    return int(min(_pt_MAX_SERIES_LENGTH, max(64, round(v))))
+
+def _pt_random_kernel_gp_draw(rng: np.random.Generator, n: int) -> np.ndarray:
+    m = 1
+    while m < 2 * n:
+        m *= 2
+    lags = np.concatenate([np.arange(m // 2 + 1), np.arange(m // 2 - 1, 0, -1)]).astype(np.float64)
+    k = np.zeros(m, dtype=np.float64)
+    n_kernels = int(rng.integers(1, 4))
+    for _ in range(n_kernels):
+        kernel_kind = rng.integers(0, 4)
+        ls = float(np.exp(rng.uniform(np.log(4.0), np.log(max(8.0, n / 3.0)))))
+        w = float(np.exp(rng.uniform(-1.0, 1.0)))
+        d = lags / ls
+        if kernel_kind == 0:
+            kernel_vals = np.exp(-0.5 * d * d)
+        elif kernel_kind == 1:
+            r = np.sqrt(3.0) * d
+            kernel_vals = (1.0 + r) * np.exp(-r)
+        elif kernel_kind == 2:
+            kernel_vals = np.exp(-d)
+        else:
+            p = float(_pt_SEASONAL_PERIODS[rng.integers(0, len(_pt_SEASONAL_PERIODS))])
+            kernel_vals = np.exp(-2.0 * np.sin(np.pi * lags / p) ** 2 / max(0.25, (ls / p) ** 2))
+        k += w * kernel_vals
+    spectrum = np.fft.rfft(k).real
+    spectrum = np.maximum(spectrum, 0.0)
+    amplitude = np.sqrt(spectrum / m)
+    zr = rng.standard_normal(spectrum.size)
+    zi = rng.standard_normal(spectrum.size)
+    gp_draw = np.fft.irfft((zr + 1j * zi) * amplitude, n=m) * np.sqrt(m)
+    return np.ascontiguousarray(gp_draw[:n])
+
+def _pt_harmonics_plus_ar_noise(rng, n):
+    t = np.arange(n, dtype=np.float64)
+    p1 = float(_pt_SEASONAL_PERIODS[rng.choice(len(_pt_SEASONAL_PERIODS), p=_pt_SEASONAL_PERIOD_PROBS)])
+    x = np.zeros(n, dtype=np.float64)
+    n_harmonics = int(rng.integers(1, 4))
+    for h in range(1, n_harmonics + 1):
+        x += rng.normal(0.0, 1.0 / h) * np.sin(2 * np.pi * h * t / p1 + rng.uniform(0, 2 * np.pi))
+    if rng.random() < 0.55:
+        p2 = p1 * float(rng.choice(np.array([7.0, 24.0, 4.0])))
+        x += rng.normal(0.0, 0.6) * np.sin(2 * np.pi * t / p2 + rng.uniform(0, 2 * np.pi))
+    ar_coef = float(rng.uniform(0.2, 0.93))
+    x += 0.35 * _pt_ar1_filter(n, rng.standard_normal(n), ar_coef, 0.0)
+    return x
+
+def _pt_poisson_exp_gp_counts(rng, n):
+    base_rate = float(np.exp(rng.uniform(np.log(0.05), np.log(60.0))))
+    gp_multiplier = np.exp(0.6 * _pt_random_kernel_gp_draw(rng, n) * rng.uniform(0.3, 1.2))
+    rate = base_rate * gp_multiplier / max(1e-09, gp_multiplier.mean())
+    x = rng.poisson(np.clip(rate, 0.0, 1000000.0)).astype(np.float64)
+    if rng.random() < 0.3:
+        keep_mask = rng.random(n) < rng.uniform(0.6, 0.97)
+        x = x * keep_mask
+    return x
+
+def _pt_dock_occupancy_walk(rng, n):
+    capacity = int(np.clip(round(np.exp(rng.normal(np.log(18.0), 0.55))), 4, 80))
+    stay_prob = float(rng.uniform(0.5, 0.93))
+    u = rng.random(n)
+    x = _pt_bounded_integer_walk(n, u, capacity, stay_prob, float(rng.integers(0, capacity + 1)))
+    if rng.random() < 0.3:
+        p = float(_pt_SEASONAL_PERIODS[rng.choice(len(_pt_SEASONAL_PERIODS), p=_pt_SEASONAL_PERIOD_PROBS)])
+        t = np.arange(n, dtype=np.float64)
+        x = np.clip(x + 0.12 * capacity * np.sin(2 * np.pi * t / p), 0, capacity)
+    return x
+
+def _pt_random_arima_series(rng, n):
+    z = rng.standard_normal(n + 64)
+    p = int(rng.integers(1, 4))
+    x = z.copy()
+    for _ in range(p):
+        r = float(rng.uniform(0.15, 0.95)) * (1.0 if rng.random() < 0.7 else -1.0)
+        x = _pt_ar1_filter(x.size, x, r, 0.0)
+    q = int(rng.integers(0, 3))
+    for _ in range(q):
+        th = float(rng.uniform(-0.8, 0.8))
+        x = x + th * np.concatenate([[0.0], x[:-1]])
+    out = x[64:]
+    if rng.random() < 0.25:
+        out = np.cumsum(out) * 0.1
+    return out
+
+def _pt_piecewise_linear_trend(rng, n):
+    k = int(rng.integers(1, 6))
+    breakpoints = np.sort(rng.choice(np.arange(1, n), size=min(k, max(1, n - 1)), replace=False))
+    x = np.zeros(n, dtype=np.float64)
+    level = float(rng.normal(0, 1))
+    slope = float(rng.normal(0, 0.003))
+    seg_start = 0
+    for c in list(breakpoints) + [n]:
+        offsets = np.arange(c - seg_start, dtype=np.float64)
+        x[seg_start:c] = level + slope * offsets
+        level = x[c - 1] + float(rng.normal(0, 1.2)) if c > seg_start else level
+        slope = float(rng.normal(0, 0.003))
+        seg_start = c
+    x += 0.25 * _pt_ar1_filter(n, rng.standard_normal(n), float(rng.uniform(0.1, 0.8)), 0.0)
+    return x
+
+def _pt_random_dwell_steps(rng, n):
+    out = np.empty(n, dtype=np.float64)
+    i = 0
+    level = float(rng.normal(0, 1))
+    mean_dwell = float(np.exp(rng.uniform(np.log(3.0), np.log(40.0))))
+    while i < n:
+        dwell = max(1, int(rng.exponential(mean_dwell)))
+        j = min(n, i + dwell)
+        out[i:j] = level
+        level += float(rng.normal(0, rng.uniform(0.3, 2.0)))
+        i = j
+    if rng.random() < 0.35:
+        out = out + rng.normal(0, 0.05, n)
+    return out
+
+def _pt_sparse_decaying_jumps(rng, n):
+    base_level = float(np.exp(rng.uniform(np.log(0.5), np.log(50.0))))
+    jump_prob = float(rng.uniform(0.0008, 0.01))
+    jump_flags = (rng.random(n) < jump_prob).astype(np.int64)
+    jump_sizes = np.abs(rng.standard_t(4, n)) * base_level * rng.uniform(2.0, 40.0)
+    decay = float(rng.uniform(0.9, 0.998))
+    return _pt_jump_decay_path(n, jump_flags, jump_sizes, decay, base_level)
+
+def _pt_weekday_business_counts(rng, n):
+    base_rate = float(np.exp(rng.uniform(np.log(5.0), np.log(300.0))))
+    dow = np.arange(n) % 7
+    day_factor = np.ones(n)
+    wk = rng.uniform(0.0, 0.35) if rng.random() < 0.5 else rng.uniform(0.15, 0.6)
+    day_factor[(dow == 5) | (dow == 6)] = wk
+    holidays = rng.random(n) < 6.0 / 365.0
+    day_factor[holidays] = 0.0
+    annual_cycle = 1.0 + 0.25 * np.sin(2 * np.pi * np.arange(n) / 365.0 + rng.uniform(0, 6.28))
+    x = rng.poisson(np.clip(base_rate * day_factor * annual_cycle, 0.0, 1000000.0)).astype(np.float64)
+    zero_days = x == 0
+    if zero_days.any():
+        zero_idx = np.flatnonzero(zero_days)
+        catchup_idx = np.clip(zero_idx + 1, 0, n - 1)
+        x[catchup_idx] = x[catchup_idx] * rng.uniform(1.1, 1.9)
+    return x
+
+def _pt_garch_price_path(rng, n):
+    omega = float(rng.uniform(1e-06, 0.0001))
+    alpha = float(rng.uniform(0.03, 0.18))
+    beta = float(rng.uniform(0.7, 0.95 - alpha))
+    r = _pt_garch11_returns(n, rng.standard_normal(n), omega, alpha, beta)
+    return np.cumsum(r) * 100.0
+
+def _pt_markov_switching_ou_series(rng, n):
+    reversion_speeds = np.array([rng.uniform(0.002, 0.05), rng.uniform(0.05, 0.4)])
+    mu = np.array([rng.normal(0, 1), rng.normal(0, 3)])
+    regime_sigmas = np.array([rng.uniform(0.02, 0.3), rng.uniform(0.3, 1.5)])
+    switch_prob = float(rng.uniform(0.0005, 0.02))
+    return _pt_regime_switching_ou_path(n, rng.standard_normal(n), rng.random(n), reversion_speeds, mu, regime_sigmas, switch_prob, float(mu[0]))
+
+def _pt_warp_increments_stochastic_vol(rng, x, vol_strength):
+    if x.size < 16:
+        return x
+    d = np.diff(x)
+    n = d.size
+    ln = _pt_ar1_filter(n, rng.standard_normal(n) * np.sqrt(1.0 - 0.995 ** 2), 0.995, 0.0)
+    vol_multiplier = np.exp(vol_strength * ln)
+    vol_multiplier = vol_multiplier / np.sqrt(np.mean(vol_multiplier * vol_multiplier))
+    return np.concatenate([[x[0]], x[0] + np.cumsum(d * vol_multiplier)])
+
+def _pt_add_heavy_tailed_level_shifts(rng, x, shift_rate, shift_scale):
+    n = x.size
+    k = int(rng.poisson(max(0.0, shift_rate * n)))
+    if k <= 0 or n < 8:
+        return x
+    step_scale = float(np.std(np.diff(x))) or float(np.std(x)) or 1.0
+    at = np.sort(rng.integers(1, n, size=k))
+    shift_sizes = rng.standard_t(2.5, size=k) * step_scale * shift_scale
+    level_offset = np.zeros(n)
+    for a, m in zip(at, shift_sizes):
+        level_offset[a:] += m
+    return x + level_offset
+
+def _pt_apply_tail_hold(rng, x, max_hold_len):
+    n = x.size
+    hi = min(max_hold_len, n // 2)
+    if hi < 64:
+        return x
+    T = int(rng.integers(64, hi + 1))
+    tail_start = n - T
+    last_value = float(x[tail_start - 1])
+    mode = rng.random()
+    out = x.copy()
+    if mode < 0.65:
+        out[tail_start:] = last_value
+    elif mode < 0.88:
+        p = int(_pt_SEASONAL_PERIODS[rng.choice(len(_pt_SEASONAL_PERIODS), p=_pt_SEASONAL_PERIOD_PROBS)])
+        if tail_start >= p:
+            n_repeats = int(np.ceil(T / p))
+            out[tail_start:] = np.tile(x[tail_start - p:tail_start], n_repeats)[:T]
+        else:
+            out[tail_start:] = last_value
+    else:
+        slope = float(x[tail_start - 1] - x[max(0, tail_start - 33)]) / 32.0 * float(rng.uniform(0.0, 0.6))
+        out[tail_start:] = last_value + slope * np.arange(1, T + 1)
+    return out
+_pt_WEB_TWO_PI = 2.0 * np.pi
+
+def _pt_stationary_ar1_noise(rng, n, phi, sd):
+    e = rng.standard_normal(n) * (sd * np.sqrt(max(1e-12, 1.0 - phi * phi)))
+    e[0] = rng.standard_normal() * sd
+    return lfilter([1.0], [1.0, -phi], e)
+
+def _pt_interpolated_coarse_ar1(rng, n, knot_spacing, phi, sd):
+    k = n // knot_spacing + 2
+    d = _pt_stationary_ar1_noise(rng, k, phi, sd)
+    return np.interp(np.arange(n) / knot_spacing, np.arange(k), d)
+
+def _pt_normalized_harmonic_profile(rng, m, n_harmonics, decay_exponent):
+    u = np.arange(m) / m
+    s = np.zeros(m)
+    for h in range(1, n_harmonics + 1):
+        s += rng.normal(0.0, h ** (-decay_exponent)) * np.cos(_pt_WEB_TWO_PI * h * u + rng.uniform(0.0, _pt_WEB_TWO_PI))
+    lo, hi = (s.min(), s.max())
+    return (s - lo) / max(hi - lo, 1e-09)
