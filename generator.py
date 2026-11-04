@@ -1536,3 +1536,245 @@ def multi_seasonal(rng: np.random.Generator, n: int, L: int, cad: CadenceDraw,
 
     fallback = unit_std(np.cumsum(rng.standard_normal((n, L)), axis=1))
     return np.where(any_on, unit_std(out), fallback)
+
+
+# ═══════════════ chronoforge: cf_calendars ═══════════════
+# Broadcast calendar arrays — no pandas, no Python loops.
+#
+# For every row we draw a starting day-of-week and day-of-year, then derive::
+#
+#     day_index[i, t] = floor(t / P_day[i])
+#     dow[i, t]       = (start_dow[i] + day_index) % 7
+#     doy[i, t]       = (start_doy[i] + day_index) % 365
+#
+# The calendar layer exists because the losing domains are administrative.  Real
+# public-health and hospital feeds do not carry a +-0.12 additive log day-of-week
+# offset: they carry a 2-5x *multiplicative* factor, a Monday catch-up spike,
+# holiday collapses with a compensating spike on the next working day, batched
+# multi-day releases, and revisions.  All of that lives here.
+
+
+DAYS_IN_YEAR = 365
+MAX_YEARS = 16
+
+
+class Calendar:
+    """Lazily materialised calendar arrays for one group of rows."""
+
+    __slots__ = ("n", "L", "p_day", "start_dow", "start_doy", "_day_index",
+                 "_dow", "_doy")
+
+    def __init__(self, n: int, L: int, p_day: np.ndarray,
+                 start_dow: np.ndarray, start_doy: np.ndarray):
+        self.n = n
+        self.L = L
+        self.p_day = np.asarray(p_day, dtype=np.float64).reshape(n, 1)
+        self.start_dow = np.asarray(start_dow, dtype=np.int64).reshape(n, 1)
+        self.start_doy = np.asarray(start_doy, dtype=np.int64).reshape(n, 1)
+        self._day_index = None
+        self._dow = None
+        self._doy = None
+
+    @property
+    def day_index(self) -> np.ndarray:
+        if self._day_index is None:
+            t = np.arange(self.L, dtype=np.float64)[None, :]
+            self._day_index = np.floor(t / np.maximum(self.p_day, 1e-9)).astype(np.int64)
+        return self._day_index
+
+    @property
+    def dow(self) -> np.ndarray:
+        if self._dow is None:
+            self._dow = (self.start_dow + self.day_index) % 7
+        return self._dow
+
+    @property
+    def doy(self) -> np.ndarray:
+        if self._doy is None:
+            self._doy = (self.start_doy + self.day_index) % DAYS_IN_YEAR
+        return self._doy
+
+    @property
+    def is_weekend(self) -> np.ndarray:
+        return self.dow >= 5
+
+    def take(self, rows: np.ndarray) -> "Calendar":
+        return Calendar(len(rows), self.L, self.p_day[rows, 0],
+                        self.start_dow[rows, 0], self.start_doy[rows, 0])
+
+
+def draw_calendar(rng: np.random.Generator, n: int, L: int,
+                  p_day: np.ndarray) -> Calendar:
+    return Calendar(n, L, p_day,
+                    rng.integers(0, 7, size=n),
+                    rng.integers(0, DAYS_IN_YEAR, size=n))
+
+
+# ───────────────────────── multiplicative factors ──────────────────────────
+
+def dow_factors(rng: np.random.Generator, n: int, cfg: dict) -> np.ndarray:
+    """Seven multiplicative day-of-week factors, geometric mean normalised to 1.
+
+    Weekend ~ LogN(log 0.45, 0.35) -> a 0.2-0.9x weekend; Monday carries a
+    catch-up multiplier.  These are an order of magnitude stronger than the
+    additive log offsets the incumbent field uses, and they are what the data
+    actually shows.
+    """
+    c = cfg["calendar"]
+    f = np.empty((n, 7))
+    f[:, 0] = np.exp(rng.normal(np.log(c["monday_factor"]), c["monday_sigma"], size=n))
+    for d in (1, 2, 3, 4):
+        f[:, d] = np.exp(rng.normal(0.0, c["weekday_sigma"], size=n))
+    for d in (5, 6):
+        f[:, d] = np.exp(rng.normal(np.log(c["weekend_factor"]),
+                                    c["weekend_sigma"], size=n))
+    # Sat != Sun
+    f[:, 6] *= np.exp(rng.normal(0.0, 0.22, size=n))
+    g = np.exp(np.mean(np.log(np.maximum(f, 1e-6)), axis=1, keepdims=True))
+    return f / g
+
+
+def apply_dow(fac: np.ndarray, cal: Calendar) -> np.ndarray:
+    """Gather the 7 factors onto the (n, L) grid."""
+    return np.take_along_axis(fac, cal.dow, axis=1)
+
+
+def holiday_factor(rng: np.random.Generator, cal: Calendar, cfg: dict
+                   ) -> tuple[np.ndarray, np.ndarray]:
+    """Multiplicative holiday collapse plus a next-working-day compensation.
+
+    Returns ``(factor, comp)`` on the (n, L) grid.  Holidays are 8-13 fixed
+    day-of-year anchors plus 2-4 moving ones (an Easter-like offset from a drawn
+    anchor), each with a +-1 day shoulder.
+    """
+    n, L = cal.n, cal.L
+    c = cfg["calendar"]
+    n_fixed = int(c["n_fixed_holidays"])
+    n_moving = int(c["n_moving_holidays"])
+    total = n_fixed + n_moving
+    anchors = rng.integers(0, 365, size=(n, total))
+    live = np.arange(total)[None, :] < rng.integers(
+        c["holiday_count_lo"], c["holiday_count_hi"] + 1, size=(n, 1))
+    depth = np.exp(rng.normal(np.log(c["holiday_factor"]), c["holiday_sigma"],
+                              size=(n, total)))
+    depth = np.clip(depth, 0.02, 1.0)
+
+    doy = cal.doy
+    # A daily-cadence window spans ~11 virtual years, so a *moving* feast really
+    # does land on a different day-of-year each year.  Fixed anchors do not.
+    year = np.minimum(cal.day_index // DAYS_IN_YEAR, MAX_YEARS - 1)
+    year_shift = rng.integers(-25, 26, size=(n, MAX_YEARS))
+    shift = np.take_along_axis(year_shift, year, axis=1)
+
+    # Fixed anchors depend only on day-of-year, so they are resolved once on a
+    # (n, 365) table and gathered; only the moving feasts need the full grid.
+    grid = np.arange(DAYS_IN_YEAR, dtype=np.int64)[None, :]
+    tab = np.ones((n, DAYS_IN_YEAR))
+    tab_hit = np.zeros((n, DAYS_IN_YEAR), dtype=bool)
+    for j in range(n_fixed):
+        if not live[:, j].any():
+            continue
+        d = np.abs(((grid - anchors[:, j:j + 1] + 182) % 365) - 182)
+        on = (d <= 1) & live[:, j:j + 1]
+        f = np.where(d == 0, depth[:, j:j + 1], 0.5 * (1.0 + depth[:, j:j + 1]))
+        tab = np.where(on, np.minimum(tab, f), tab)
+        tab_hit |= on
+    fac = np.take_along_axis(tab, doy, axis=1)
+    hit = np.take_along_axis(tab_hit, doy, axis=1)
+
+    for j in range(n_fixed, total):
+        if not live[:, j].any():
+            continue
+        d = np.abs(((doy - (anchors[:, j:j + 1] + shift) + 182) % 365) - 182)
+        on = (d <= 1) & live[:, j:j + 1]
+        # shoulder days are milder than the holiday itself
+        f = np.where(d == 0, depth[:, j:j + 1], 0.5 * (1.0 + depth[:, j:j + 1]))
+        fac = np.where(on, np.minimum(fac, f), fac)
+        hit |= on
+
+    comp = np.zeros((n, L))
+    if L > 1:
+        # compensation lands on the first sample after the holiday block ends
+        boundary = np.zeros((n, L), dtype=bool)
+        boundary[:, 1:] = hit[:, :-1] & (~hit[:, 1:])
+        amp = rng.uniform(c["holiday_comp_lo"], c["holiday_comp_hi"], size=(n, 1)) - 1.0
+        span = np.maximum(cal.p_day, 1.0)
+        comp = np.where(boundary, amp, 0.0)
+        # spread the catch-up over one "day" of samples
+        if float(np.max(span)) > 1.5:
+            comp = decay_convolve(comp, np.maximum(span[:, 0] * 0.4, 1.0))
+    return fac, comp
+
+
+def month_boundary(cal: Calendar) -> np.ndarray:
+    """True on the first sample of each 30/31-day month block."""
+    m = (cal.doy // 30)
+    b = np.zeros_like(m, dtype=bool)
+    b[:, 1:] = m[:, 1:] != m[:, :-1]
+    return b
+
+
+def business_day_index(cal: Calendar) -> np.ndarray:
+    """Cumulative count of business days, i.e. the business-day observation grid.
+
+    Econ/fin daily feeds publish on business days only, so their effective weekly
+    period is 5 rather than 7 and their release calendar advances only on
+    weekdays.  Ubiquitous in the pool and modelled by nobody.
+    """
+    di = cal.day_index
+    new_day = np.zeros_like(di, dtype=bool)
+    new_day[:, 0] = True
+    new_day[:, 1:] = di[:, 1:] != di[:, :-1]
+    return np.cumsum((new_day & (~cal.is_weekend)).astype(np.int64), axis=1)
+
+
+def dst_shift(rng: np.random.Generator, cal: Calendar, rate: float) -> np.ndarray:
+    """A one-hour daily-phase jump at two day-of-year anchors (civil-time feeds).
+
+    Returned in *cycles*: one hour of a 24-hour day is 1/24 of the daily phase,
+    whatever the sampling cadence.
+
+    Deliberately NOT applied to the meteorological families: that source requests
+    UTC, so an ERA5 series has no DST discontinuity and a spurious one would be a
+    mismatch rather than a prior.
+    """
+    n, L = cal.n, cal.L
+    on = rng.random((n, 1)) < rate
+    a1 = rng.integers(60, 120, size=(n, 1))
+    a2 = rng.integers(270, 330, size=(n, 1))
+    inside = (cal.doy >= a1) & (cal.doy < a2)
+    return np.where(on & inside, 1.0 / 24.0, 0.0)
+
+
+def batch_release(rng: np.random.Generator, x: np.ndarray, cal: Calendar,
+                  period_days: np.ndarray) -> np.ndarray:
+    """Accumulate over a k-day batch and release the whole sum on one sample.
+
+    Everything between releases is an exact zero.  This is how a large fraction
+    of public-health feeds actually report and it destroys naive persistence.
+    """
+    n, L = x.shape
+    blk = (cal.day_index // np.maximum(period_days.reshape(n, 1), 1))
+    boundary = np.zeros((n, L), dtype=bool)
+    boundary[:, 1:] = blk[:, 1:] != blk[:, :-1]
+    boundary[:, 0] = True
+    cum = np.cumsum(x, axis=1)
+    # A_t is the total accumulated strictly before t; S_t is A at the most recent
+    # boundary at or before t.  Shifting S by one sample gives A at the PREVIOUS
+    # boundary, so each release reports exactly the block that just closed.
+    a = cum - x
+    s = np.maximum.accumulate(np.where(boundary, a, 0.0), axis=1)
+    prev = np.zeros_like(s)
+    prev[:, 1:] = s[:, :-1]
+    return np.where(boundary, a - prev, 0.0)
+
+
+def revision_ramp(rng: np.random.Generator, x: np.ndarray, n_last: np.ndarray,
+                  depth: np.ndarray) -> np.ndarray:
+    """Systematically under-report the most recent k samples, ramping to truth."""
+    n, L = x.shape
+    k = np.maximum(np.asarray(n_last).reshape(n, 1), 1)
+    age = (L - 1) - np.arange(L)[None, :]
+    w = np.clip(1.0 - age / k, 0.0, 1.0)
+    d = np.asarray(depth).reshape(n, 1)
+    return x * (1.0 - w * d)
