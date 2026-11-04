@@ -312,3 +312,299 @@ def psd_convolve(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     fb = np.fft.rfft(b, n=m, axis=1)
     c = np.fft.irfft(fa * fb, n=m, axis=1)[:, :nf]
     return np.maximum(c, 0.0)
+
+
+# ═══════════════ chronoforge: cf_kernels ═══════════════
+# Sequential recursions that NumPy cannot vectorise, as numba kernels.
+#
+# Every kernel takes *per-row parameter arrays* and writes into a caller-allocated
+# ``(n, L)`` output, so one call replaces ``n`` Python-level calls.  All are
+# compiled with ``fastmath=False`` and ``parallel=False`` (no reduction-order
+# variation), ``nogil=True`` (so the producer threads actually overlap) and
+# ``cache=False`` (the sandbox must not write files).
+#
+# Randomness never originates inside a kernel: every stochastic kernel consumes
+# pre-drawn uniform / normal / gamma variates produced by a seeded NumPy
+# ``Generator``.  That keeps the corpus a pure function of ``(seed, batch)``
+# regardless of numba's internal thread-local RNG state.
+
+
+import math
+import threading
+
+
+try:  # pragma: no cover - exercised by whichever branch the env provides
+    from numba import njit as _numba_njit
+
+    HAVE_NUMBA = True
+except Exception:  # numba unavailable -> pure-Python fallback (slow but correct)
+    HAVE_NUMBA = False
+    _numba_njit = None
+
+
+def _kernel(fn):
+    if HAVE_NUMBA:
+        return _numba_njit(cache=False, fastmath=False, parallel=False, nogil=True)(fn)
+    return fn
+
+
+def _inline(fn):
+    if HAVE_NUMBA:
+        return _numba_njit(cache=False, fastmath=False, parallel=False,
+                           nogil=True, inline="always")(fn)
+    return fn
+
+
+# ─────────────────────────── count sampling helper ─────────────────────────
+
+@_inline
+def _pois(lam, u, z):
+    """Poisson draw from a pre-drawn uniform ``u`` and standard normal ``z``.
+
+    Exact inversion below lambda=30; a continuity-corrected normal above it
+    (relative error < 1e-3 there, and the tail behaviour is what matters).
+    """
+    if lam <= 0.0:
+        return 0.0
+    if lam < 30.0:
+        p = math.exp(-lam)
+        s = p
+        k = 0
+        while u > s and k < 400:
+            k += 1
+            p *= lam / k
+            s += p
+        return float(k)
+    v = lam + math.sqrt(lam) * z
+    if v < 0.0:
+        v = 0.0
+    return math.floor(v + 0.5)
+
+
+@_kernel
+def k_poisson(lam, u, z, out):
+    n, L = lam.shape
+    for i in range(n):
+        for t in range(L):
+            out[i, t] = _pois(lam[i, t], u[i, t], z[i, t])
+
+
+# ───────────────────────────────── ARMA ────────────────────────────────────
+
+@_kernel
+def k_arma(phi, p_ord, theta, q_ord, e, out):
+    """Per-row ARMA(p, q) filter.  ``out`` must be zero-initialised."""
+    n, L = e.shape
+    for i in range(n):
+        p = p_ord[i]
+        q = q_ord[i]
+        for t in range(L):
+            v = e[i, t]
+            for j in range(q):
+                k = t - 1 - j
+                if k >= 0:
+                    v += theta[i, j] * e[i, k]
+            for j in range(p):
+                k = t - 1 - j
+                if k >= 0:
+                    v += phi[i, j] * out[i, k]
+            if v > 1.0e150:
+                v = 1.0e150
+            elif v < -1.0e150:
+                v = -1.0e150
+            out[i, t] = v
+
+
+@_kernel
+def k_seasonal_int(x, m, out):
+    """Inverse of the seasonal difference (1 - B^m), per row."""
+    n, L = x.shape
+    for i in range(n):
+        mm = m[i]
+        if mm < 1:
+            mm = 1
+        for t in range(L):
+            if t < mm:
+                out[i, t] = x[i, t]
+            else:
+                out[i, t] = out[i, t - mm] + x[i, t]
+
+
+@_kernel
+def k_setar(thr, c_lo, phi_lo, c_hi, phi_hi, e, out):
+    """Two-regime self-exciting threshold AR(1)."""
+    n, L = e.shape
+    for i in range(n):
+        x = e[i, 0]
+        out[i, 0] = x
+        for t in range(1, L):
+            if x < thr[i]:
+                v = c_lo[i] + phi_lo[i] * x
+            else:
+                v = c_hi[i] + phi_hi[i] * x
+            v += e[i, t]
+            if v > 1.0e150:
+                v = 1.0e150
+            elif v < -1.0e150:
+                v = -1.0e150
+            out[i, t] = v
+            x = v
+
+
+@_kernel
+def k_ar1_tv(phi, mu, e, out):
+    """AR(1) around a time-varying mean: x_t = mu_t + phi (x_{t-1} - mu_{t-1}) + e_t."""
+    n, L = e.shape
+    for i in range(n):
+        d = e[i, 0]
+        out[i, 0] = mu[i, 0] + d
+        for t in range(1, L):
+            d = phi[i] * d + e[i, t]
+            if d > 1.0e150:
+                d = 1.0e150
+            elif d < -1.0e150:
+                d = -1.0e150
+            out[i, t] = mu[i, t] + d
+
+
+# ───────────────────────────────── GARCH ───────────────────────────────────
+
+@_kernel
+def k_garch(omega, alpha, gamma, beta, z, out_r, out_s):
+    """GJR-GARCH(1,1): sigma^2_t = w + (a + g*1[e<0]) e^2_{t-1} + b sigma^2_{t-1}."""
+    n, L = z.shape
+    for i in range(n):
+        denom = 1.0 - alpha[i] - 0.5 * gamma[i] - beta[i]
+        if denom < 1.0e-4:
+            denom = 1.0e-4
+        s2 = omega[i] / denom
+        eprev = 0.0
+        for t in range(L):
+            ind = 1.0 if eprev < 0.0 else 0.0
+            s2 = omega[i] + (alpha[i] + gamma[i] * ind) * eprev * eprev + beta[i] * s2
+            if s2 > 1.0e120:
+                s2 = 1.0e120
+            if s2 < 1.0e-30:
+                s2 = 1.0e-30
+            sd = math.sqrt(s2)
+            e = sd * z[i, t]
+            out_r[i, t] = e
+            out_s[i, t] = sd
+            eprev = e
+
+
+# ───────────────────────────────── Hawkes ──────────────────────────────────
+
+@_kernel
+def k_hawkes(mu, decays, weights, u, z, out_lam, out_n):
+    """Discrete-time self-exciting process with K exponential kernels.
+
+    ``decays[i, k]`` is exp(-1/tau_k); ``weights[i, k]`` the branching weight of
+    component k.  Emits both the conditional intensity and the counts.
+    """
+    n, L = mu.shape
+    K = decays.shape[1]
+    s = np.zeros(K, dtype=np.float64)
+    for i in range(n):
+        for k in range(K):
+            s[k] = 0.0
+        for t in range(L):
+            lam = mu[i, t]
+            for k in range(K):
+                lam += s[k]
+            if lam < 0.0:
+                lam = 0.0
+            if lam > 1.0e8:
+                lam = 1.0e8
+            cnt = _pois(lam, u[i, t], z[i, t])
+            out_lam[i, t] = lam
+            out_n[i, t] = cnt
+            for k in range(K):
+                s[k] = decays[i, k] * (s[k] + weights[i, k] * cnt)
+
+
+# ───────────────────────── closed-loop resource control ────────────────────
+
+@_kernel
+def k_feedback(d, th_up, th_dn, k_up, k_dn, gam, lag, c0, mode, out, out_cap):
+    """Autoscaling controller.
+
+    mode 0 -> utilisation min(d/c, 1); 1 -> capacity c_t; 2 -> queue backlog.
+    """
+    n, L = d.shape
+    for i in range(n):
+        c = c0[i]
+        if c <= 0.0:
+            c = 1.0
+        uc = 0
+        dc = 0
+        pend = 0
+        pdir = 0
+        q = 0.0
+        m = mode[i]
+        for t in range(L):
+            dt = d[i, t]
+            if c < 1.0e-9:
+                c = 1.0e-9
+            r = dt / c
+            if r > th_up[i]:
+                uc += 1
+                dc = 0
+            elif r < th_dn[i]:
+                dc += 1
+                uc = 0
+            else:
+                uc = 0
+                dc = 0
+            if pend > 0:
+                pend -= 1
+                if pend == 0:
+                    if pdir > 0:
+                        c = c * (1.0 + gam[i])
+                    else:
+                        c = c / (1.0 + gam[i])
+                    if c > 1.0e12:
+                        c = 1.0e12
+                    if c < 1.0e-9:
+                        c = 1.0e-9
+            else:
+                if uc >= k_up[i]:
+                    pend = lag[i]
+                    pdir = 1
+                    uc = 0
+                elif dc >= k_dn[i]:
+                    pend = lag[i]
+                    pdir = -1
+                    dc = 0
+            out_cap[i, t] = c
+            if m == 0:
+                v = dt / c
+                if v > 1.0:
+                    v = 1.0
+                if v < 0.0:
+                    v = 0.0
+                out[i, t] = v
+            elif m == 1:
+                out[i, t] = c
+            else:
+                q = q + dt - c
+                if q < 0.0:
+                    q = 0.0
+                if q > 1.0e12:
+                    q = 1.0e12
+                out[i, t] = q
+
+
+@_kernel
+def k_counter_reset_cal(inc, reset, out):
+    """Monotone accumulation with resets flagged in ``reset`` (0/1)."""
+    n, L = inc.shape
+    for i in range(n):
+        acc = 0.0
+        for t in range(L):
+            if reset[i, t] != 0:
+                acc = 0.0
+            acc += inc[i, t]
+            if acc > 1.0e14:
+                acc = 1.0e14
+            out[i, t] = acc
