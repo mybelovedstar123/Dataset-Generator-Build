@@ -11495,3 +11495,303 @@ _SPIKE_CATEGORY_PROBS = np.array([0.75, 0.10, 0.10, 0.05])
 _SPIKE_CATEGORY_CDF = _choice_cdf(_SPIKE_CATEGORY_PROBS)
 _DUTY_PERIODS = np.array([4, 8, 12, 16, 24, 48])
 _NO_ROWS = np.empty(0, dtype=np.int64)
+
+
+def _tirex2_marginal_augments(
+    rng: np.random.Generator,
+    block: np.ndarray,
+    *,
+    amp_trend_rate: float = 0.0,
+    kernel_spike_rate: float = 0.0,
+    periodic_spike_frac: float = 0.0,
+    time_warp_rate: float = 0.0,
+    global_dilation_rate: float = 0.0,
+    duty_cycle_rate: float = 0.0,
+) -> np.ndarray:
+    """TiRex-2 §3.4 / App.F stage-1+3 *univariate* portables.
+
+    The TiRex-2 public repo ships inference only; the paper's pretraining
+    pipeline first perturbs each univariate series with piecewise-linear
+    amplitude trends, shaped spike kernels, then applies observational
+    transforms including Brownian-bridge time warping and time-discretisation
+    (freezes / staircases / duty cycles). Multivariate coupling (SCM,
+    cointegration, linear mixing across variates) is intentionally omitted —
+    cascade heat is univariate. Rates are kept modest; an earlier aggressive
+    observation-rate bump (v77) was a net wash/loss.
+    """
+    out = np.asarray(block, dtype=np.float64)
+    if out.ndim != 2:
+        return out
+    n, L = out.shape
+    if n == 0 or L < 8:
+        return out
+    t = _time_index(L)[0]
+
+    # Fixed child-stream creation is the core of the ablation harness. Each
+    # stage receives the same seed in every variant, irrespective of whether
+    # another stage is enabled, disabled, or changes how many random draws it
+    # consumes.
+    stage_seeds = rng.integers(
+        0, np.iinfo(np.int64).max, size=4, dtype=np.int64
+    )
+    pool = getattr(_STAGE_POOL, "pool", None)
+    if pool is None:
+        pool = _STAGE_POOL.pool = _StreamPool(4)
+    stage_words = _pcg64_seed_words_jit(stage_seeds.astype(np.uint64))
+
+    def stage_rng(slot: int) -> np.random.Generator:
+        """Stage `slot`'s stream, built only if that stage runs.
+
+        Each stage draws from its own slot of the single four-way seed draw
+        above, so skipping a disabled stage cannot shift the stream any enabled
+        stage receives -- the ablation guarantee is in the seed derivation, not
+        in eagerly constructing all four. time_warp_rate and
+        periodic_spike_frac are 0 in the shipped configs, and a PCG64 built per
+        row and never drawn from is pure producer-thread overhead.
+        """
+        return pool.seeded(slot, *stage_words[slot])
+
+    # --- piecewise-linear amplitude trends ---------------------------------
+    if amp_trend_rate > 0.0:
+        amp_rng = stage_rng(0)
+        amp_rows = np.nonzero(amp_rng.random(n) < amp_trend_rate)[0]
+    else:
+        amp_rows = _NO_ROWS
+    if amp_rows.size:
+        centres = _median_rows(out[amp_rows])[:, 0]
+    for k, i in enumerate(amp_rows):
+        n_knots = int(amp_rng.integers(2, 6))
+        knot_t = np.sort(
+            amp_rng.choice(L, size=n_knots, replace=False).astype(np.float64)
+        )
+        knot_t[0] = 0.0
+        knot_t[-1] = float(L - 1)
+        # envelope centred on 1 so quiet stretches keep original scale
+        knot_a = np.exp(amp_rng.normal(0.0, 0.45, size=n_knots))
+        envelope = np.interp(t, knot_t, knot_a)
+        centre = float(centres[k])
+        out[i] = centre + (out[i] - centre) * envelope
+
+    # --- shaped spike kernels (gaussian / triangular / rectangular) --------
+    if kernel_spike_rate > 0.0:
+        spike_rng = stage_rng(1)
+        spike_rows = np.nonzero(spike_rng.random(n) < kernel_spike_rate)[0]
+    else:
+        spike_rows = _NO_ROWS
+    if spike_rows.size:
+        calib = out[spike_rows, : min(L, 512)]
+        center = _median_rows(calib)
+        robust = 1.4826 * _median_rows(np.abs(calib - center))
+        fallback = np.maximum(np.std(calib, axis=1, keepdims=True), 1e-9)
+        robust = np.where(robust > 1e-9, robust, fallback)
+        category = _SPIKE_CATEGORY_CDF.searchsorted(
+            spike_rng.random(spike_rows.size), side="right"
+        )
+        for k, i in enumerate(spike_rows):
+            use_periodic = spike_rng.random() < periodic_spike_frac
+            if not use_periodic:
+                n_spikes = int(spike_rng.integers(1, 5))
+                width = float(spike_rng.uniform(1.5, max(2.0, 0.03 * L)))
+                mag = float(
+                    spike_rng.lognormal(np.log(3.0), 0.55)
+                ) * float(robust[k, 0])
+                sign = float(_CHOICE_PM1[spike_rng.integers(0, 2)])
+                positions = spike_rng.integers(0, L, size=n_spikes)
+                labels = np.zeros(n_spikes, dtype=np.int64)
+            else:
+                options = _SPIKE_PATTERNS_BY_CATEGORY[int(category[k])]
+                pattern = options[int(spike_rng.integers(0, len(options)))]
+                plen = len(pattern)
+                period = float(
+                    spike_rng.uniform(
+                        max(4.0, 0.005 * L),
+                        max(8.0, min(256.0, 0.2 * L)),
+                    )
+                )
+                anchor = float(
+                    spike_rng.uniform(max(0.0, L - period), float(L - 1))
+                )
+                n_back = int(np.ceil(anchor / period)) + 1
+                ks = np.arange(-n_back, 1)
+                positions = anchor + ks * period
+                valid = (positions >= 0.0) & (positions < float(L))
+                positions, ks = positions[valid], ks[valid]
+                cap = max(plen, int(spike_rng.integers(2, 9)))
+                if positions.size > cap:
+                    order = np.argsort(np.abs(ks))[:cap]
+                    positions, ks = positions[order], ks[order]
+                labels = np.asarray(pattern, dtype=np.int64)[np.mod(ks, plen)]
+                width = max(
+                    float(spike_rng.uniform(0.05 * period, 0.2 * period)),
+                    0.75,
+                )
+
+            for label in np.unique(labels):
+                if use_periodic:
+                    mag = float(
+                        spike_rng.lognormal(np.log(3.0), 0.55)
+                    ) * float(robust[k, 0])
+                    sign = float(_CHOICE_PM1[spike_rng.integers(0, 2)])
+                kernel = int(spike_rng.integers(0, 3))
+                # Each kernel is exactly 0.0 outside a bounded radius, so only
+                # that window needs touching: the triangle vanishes at 2*width
+                # and the rectangle at width by construction, and the gaussian's
+                # exponent passes exp's float64 underflow threshold (-745.2) at
+                # 38.6 widths. Adding the tail would add exactly 0.0, so the
+                # windowed update is bit-identical to the full-length one while
+                # the common narrow-spike case stops paying for 4096 samples.
+                radius = (38.7 * width if kernel == 0
+                          else 2.0 * width if kernel == 1
+                          else width)
+                for c in positions[labels == label]:
+                    lo = max(0, int(np.floor(c - radius)))
+                    hi = min(L, int(np.ceil(c + radius)) + 1)
+                    if lo >= hi:
+                        continue
+                    dt = t[lo:hi] - c
+                    if kernel == 0:
+                        ker = np.exp(-0.5 * (dt / width) ** 2)
+                    elif kernel == 1:
+                        ker = np.maximum(0.0, 1.0 - np.abs(dt) / (width * 2.0))
+                    else:
+                        ker = (np.abs(dt) <= width).astype(np.float64)
+                    out[i, lo:hi] = out[i, lo:hi] + sign * mag * ker
+
+    # Global clock dilation uses a child seed and no parent or stage draw.
+    # A contiguous legal crop keeps every interpolation index inside the row.
+    if global_dilation_rate > 0.0:
+        dilation_rng = np.random.default_rng(
+            np.random.SeedSequence((int(stage_seeds[2]), 605)))
+        dilation_rows = np.nonzero(
+            dilation_rng.random(n) < global_dilation_rate)[0]
+        for i in dilation_rows:
+            factor = float(dilation_rng.uniform(0.65, 0.90))
+            offset = float(dilation_rng.uniform(
+                0.0, (L - 1) * (1.0 - factor)))
+            out[i] = np.interp(offset + factor * t, t, out[i])
+
+    # --- Brownian-bridge time warping (smooth reindex) ---------------------
+    if time_warp_rate > 0.0:
+        warp_rng = stage_rng(2)
+        warp_rows = np.nonzero(warp_rng.random(n) < time_warp_rate)[0]
+    else:
+        warp_rows = _NO_ROWS
+    for i in warp_rows:
+        # unit Brownian bridge on [0,1], scaled to a few samples of lag
+        steps = warp_rng.normal(0.0, 1.0, size=L).cumsum()
+        bridge = steps - (t / max(L - 1, 1)) * steps[-1]
+        bridge = bridge - bridge.mean()
+        bstd = float(bridge.std()) or 1.0
+        amp = float(warp_rng.uniform(0.5, 3.0))  # samples of lag
+        lag = amp * (bridge / bstd)
+        src = np.clip(t + lag, 0.0, float(L - 1))
+        lo = np.floor(src).astype(np.int64)
+        hi = np.minimum(lo + 1, L - 1)
+        w = src - lo
+        out[i] = (1.0 - w) * out[i, lo] + w * out[i, hi]
+
+    # --- duty-cycle time discretisation (on/off freezes) -------------------
+    if duty_cycle_rate > 0.0:
+        duty_rng = stage_rng(3)
+        duty_rows = np.nonzero(duty_rng.random(n) < duty_cycle_rate)[0]
+    else:
+        duty_rows = _NO_ROWS
+    if duty_rows.size:
+        t_int = np.arange(L, dtype=np.int64)
+    for i in duty_rows:
+        period = int(_DUTY_PERIODS[duty_rng.integers(0, _DUTY_PERIODS.size)])
+        on = int(duty_rng.integers(1, max(2, period)))
+        phase = int(duty_rng.integers(0, period))
+        active = ((t_int + phase) % period) < on
+        # Freeze to the last active value during off phases. The scalar
+        # carry-forward loop is a running maximum over the active indices
+        # (floored at 0, which is where `last` starts), so gathering through
+        # that index is the same copy without 4096 interpreter steps.
+        source = np.where(active, t_int, 0)
+        np.maximum.accumulate(source, out=source)
+        out[i] = out[i][source]
+
+    return out
+
+
+FLOW_FAMILIES = ('rate_counts', 'seasonal_counts', 'biz_day_counts', 'sparse_admin_counts', 'storm_outage_counts')
+
+def _flow_reporting_total(x, width, mode):
+    """Return k-lag sum or k-times-level control, without mutating x.
+
+    Prior unavailable observations equal the first observation. This affects
+    only the first k-1 samples, never uses future values, and does not imply
+    stationary prehistory. Direct positive-term summation avoids catastrophic
+    cancellation from subtracting cumulative sums on sparse large-scale rows.
+    Integer input retains its lattice while representable in float64. No
+    capacity/stock meaning is asserted: these are totals of flow measurements.
+    """
+    if width not in (4, 8, 16) or mode not in ("rolling", "scale"):
+        raise ValueError("invalid reporting memory experiment")
+    if mode == "scale":
+        return x * width
+    result = x.copy()
+    for lag in range(1, width):
+        if lag < x.shape[1]:
+            result[:, lag:] += x[:, :-lag]
+        result[:, :min(lag, x.shape[1])] += x[:, :1]
+    return result
+
+def _flow_reporting_memory(block, family, base_seed, chunk_index, fam, anchor,
+                           width, mode, rate):
+    if rate == 0.0 or family not in FLOW_FAMILIES:
+        return block
+    # Independent new stream; existing native/observation/mixing draws remain
+    # unchanged. Same eligible rows selected in every width/control variant.
+    rng = np.random.default_rng(np.random.SeedSequence(
+        (base_seed, chunk_index, fam, anchor, 91837)))
+    selected = np.flatnonzero(rng.random(block.shape[0]) < rate)
+    if not selected.size:
+        return block
+    result = block.copy()
+    result[selected] = _flow_reporting_total(block[selected], width, mode)
+    return result
+
+
+def _held_hazard(k, shift, mean_matched):
+    if shift not in (0., .5, 1., 2.):
+        raise ValueError('undeclared event-rate shift')
+    if shift == 0.:
+        return k
+    rate = np.asarray(k, dtype=np.float64) + shift
+    if mean_matched:
+        rate = rate * (1.5 / (1.5 + shift))
+    return rate
+
+_CYCLE_PREDICTIVE_MODE = 'median'
+
+
+def _empirical_cycle_tail(history, lag, length, rng, mode):
+    """Future from at most seven complete observed cycles, aligned at boundary.
+
+    Median picks an observed value at each phase, preserving discrete support.
+    Phase resampling and whole-cycle resampling have the same empirical
+    phase-wise marginals; only their within-cycle dependence differs.
+    All inputs precede the continuation boundary. No native future is read.
+    """
+    if mode == "native":
+        return np.tile(history[-lag:], (length + lag - 1) // lag)[:length]
+    count = min(7, len(history) // lag)
+    if count % 2 == 0:
+        count -= 1
+    if count < 1:
+        raise ValueError("Need at least one complete observed cycle")
+    cycles = history[-count * lag:].reshape(count, lag)
+    phases = np.arange(length, dtype=np.int64) % lag
+    if mode == "median":
+        template = np.partition(cycles, count // 2, axis=0)[count // 2]
+        return template[phases]
+    if mode == "phase":
+        selected = rng.integers(0, count, size=length)
+    elif mode == "block":
+        selected = np.repeat(rng.integers(0, count, size=(length + lag - 1) // lag), lag)[:length]
+    else:
+        raise ValueError("Unknown empirical-cycle mode")
+    return cycles[selected, phases]
+
+_LONG_CYCLE_ENABLED = True
