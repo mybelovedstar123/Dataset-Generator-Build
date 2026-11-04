@@ -4440,3 +4440,73 @@ def f3_build(P, rng, L, cad, cal, cfg):
     fl["integer"] = np.ones(n, dtype=bool)
     fl["offset_pref"] = np.full(n, 2, dtype=np.int8)
     return y, fl
+
+
+# ═══════════════════ F4 econ_release_staircase ═════════════════════════════
+
+def f4_params(rng, B, cfg):
+    p = cfg["families"]["econ_release_staircase"]
+    rel = np.array([7.0, 30.436875, 91.310625])
+    return {
+        "release_days": rel[categorical(rng, p["release_mix"], B)],
+        "latent_ell": logu(rng, 100.0, 3000.0, B),
+        "revise_n": rng.integers(1, 4, B),
+        "revise_depth": rng.uniform(0.01, 0.2, B),
+        "ns": rng.random(B) < p["nelson_siegel_rate"],
+        "ns_phi": rng.uniform(0.985, 0.9999, (B, 3)),
+        "ns_sig": logu(rng, 0.005, 0.12, (B, 3)),
+        "ns_tau": logu(rng, 6.0, 60.0, B),
+        "ns_mat": logu(rng, 0.25, 30.0, B),
+        "level0": rng.normal(0.0, 1.0, B),
+        "biz_grid": rng.random(B) < p["business_day_rate"],
+        "month_end": rng.random(B) < p["month_end_rate"],
+        "month_end_amp": rng.normal(0.0, 0.6, B),
+    }
+
+
+def f4_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    latent = matern_gp(rng, n, L, P["latent_ell"], nu=2.5)
+
+    # The release calendar advances in days; for business-day feeds it advances
+    # only on weekdays, which makes the effective weekly period 5.
+    day_eff = np.where(P["biz_grid"].reshape(n, 1),
+                       business_day_index(cal), cal.day_index).astype(np.float64)
+    blk = np.floor(day_eff / np.maximum(P["release_days"].reshape(n, 1), 1.0))
+    boundary = np.zeros((n, L), dtype=bool)
+    boundary[:, 1:] = blk[:, 1:] != blk[:, :-1]
+    boundary[:, 0] = True
+    idx = np.where(boundary, np.arange(L)[None, :], 0)
+    idx = np.maximum.accumulate(idx, axis=1)
+    stair = np.take_along_axis(latent, idx, axis=1)
+
+    # revisions to the last 1-3 published values
+    age_blk = blk.max(axis=1, keepdims=True) - blk
+    rev = (age_blk < P["revise_n"].reshape(n, 1))
+    stair = np.where(rev, stair * (1.0 - P["revise_depth"].reshape(n, 1)), stair)
+
+    # Nelson-Siegel term structure: level / slope / curvature, each near unit root
+    if P["ns"].any():
+        f = np.zeros((n, L, 3))
+        for j in range(3):
+            f[:, :, j] = ar1(rng, n, L, P["ns_phi"][:, j]) * P["ns_sig"][:, j:j + 1]
+            f[:, :, j] = np.cumsum(f[:, :, j], axis=1) * 0.05
+        lam = 1.0 / np.maximum(P["ns_tau"].reshape(n, 1), 1e-3)
+        mat = P["ns_mat"].reshape(n, 1)
+        x = np.maximum(lam * mat, 1e-6)
+        l1 = (1.0 - np.exp(-x)) / x
+        l2 = l1 - np.exp(-x)
+        ns = f[:, :, 0] + f[:, :, 1] * l1 + f[:, :, 2] * l2
+        stair = np.where(P["ns"].reshape(n, 1), ns, stair)
+
+    # month-end level jumps on econ/admin feeds
+    if P["month_end"].any():
+        me = np.cumsum(month_boundary(cal).astype(np.float64), axis=1)
+        me = me - me.mean(axis=1, keepdims=True)
+        stair = np.where(P["month_end"].reshape(n, 1),
+                         stair + P["month_end_amp"].reshape(n, 1) * 0.05 * me, stair)
+
+    y = stair + P["level0"].reshape(n, 1)
+    fl = new_flags(n, scale_mode=0, offset_pref=1, quant_boost=1.5, quant_rel_hi=0.4)
+    return y, fl
