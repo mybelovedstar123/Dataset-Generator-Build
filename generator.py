@@ -3195,3 +3195,76 @@ def c2_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.5, quant_boost=0.15)
     fl["integer"] = (~P["revise_on"])
     return y, fl
+
+
+# ═══════════════════ C3 physio_quasiperiodic ═══════════════════════════════
+
+TEMPLATE_S = 256
+
+
+def c3_params(rng, B, cfg):
+    p = cfg["families"]["physio_quasiperiodic"]
+    return {
+        "p0": logu(rng, p["base_period"][0], p["base_period"][1], B),
+        "resp_ratio": rng.uniform(3.0, 6.0, B),
+        "rsa": rng.uniform(p["rsa_depth"][0], p["rsa_depth"][1], B),
+        "hrv": rng.uniform(0.005, 0.08, B),
+        "biphasic": rng.random(B) < 0.45,
+        "n_harm": rng.integers(3, 7, B),
+        "peak_sharp": rng.uniform(1.0, 4.0, B),
+        "amp_resp": rng.uniform(0.05, 0.45, B),
+        "wander": rng.uniform(0.1, 1.5, B),
+        "artefact_p": rng.uniform(0.005, 0.05, B),
+        "artefact_amp": rng.uniform(5.0, 40.0, B),
+        "flat_tau": logu(rng, 600.0, 5000.0, B),
+        "flat_len": logu(rng, 10.0, 200.0, B),
+        "noise": logu(rng, 0.005, 0.15, B),
+    }
+
+
+def c3_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+
+    # waveform template: sharp systolic peak, slow recovery (or biphasic)
+    s = np.arange(TEMPLATE_S, dtype=np.float64)[None, :] / TEMPLATE_S
+    tmpl = np.zeros((n, TEMPLATE_S))
+    sharp = P["peak_sharp"].reshape(n, 1)
+    nh = P["n_harm"].reshape(n, 1)
+    for h in range(1, 7):
+        amp = (h ** (-sharp)) * np.where(h <= nh, 1.0, 0.0)
+        psi = (h - 1) * 0.35
+        tmpl += amp * np.cos(_cf_prims_TWO_PI * h * s - psi)
+    bip = P["biphasic"].reshape(n, 1)
+    tmpl = np.where(bip, tmpl - 0.6 * np.roll(tmpl, TEMPLATE_S // 6, axis=1), tmpl)
+    tmpl = unit_std(tmpl)
+
+    # instantaneous period: respiratory sinus arrhythmia + 1/f variability
+    resp_p = P["p0"] * P["resp_ratio"]
+    t = time_grid(L)[None, :]
+    resp = np.sin(_cf_prims_TWO_PI * t / resp_p.reshape(n, 1) + rng.random((n, 1)) * _cf_prims_TWO_PI)
+    hrv = pink_gp(rng, n, L, np.full(n, 1.2))
+    per = P["p0"].reshape(n, 1) * (1.0 + P["rsa"].reshape(n, 1) * resp
+                                   + P["hrv"].reshape(n, 1) * hrv)
+    per = np.maximum(per, 2.0)
+    phase = np.cumsum(1.0 / per, axis=1) + rng.random((n, 1))
+
+    y = np.zeros((n, L))
+    k_template(np.ascontiguousarray(phase), np.ascontiguousarray(tmpl),
+                 np.arange(n, dtype=np.int64), y)
+    y = y * (1.0 + P["amp_resp"].reshape(n, 1) * resp)
+
+    y = y + P["wander"].reshape(n, 1) * pink_gp(rng, n, L, np.full(n, 2.0))
+    y = y + rng.standard_normal((n, L)) * P["noise"].reshape(n, 1)
+
+    art = rng.random((n, L)) < P["artefact_p"].reshape(n, 1)
+    y = np.where(art, y + rng.standard_normal((n, L)) * P["artefact_amp"].reshape(n, 1), y)
+
+    # electrode-off flatlines
+    starts = rng.integers(0, L, size=(n, 4))
+    hit = rng.random((n, 4)) < (L / P["flat_tau"].reshape(n, 1) / 4.0)
+    lens = P["flat_len"].reshape(n, 1) * np.exp(rng.normal(0.0, 0.6, size=(n, 4)))
+    mask = run_mask(n, L, starts, np.where(hit, lens, 0.0))
+    y = np.where(mask, 0.0, y)
+
+    fl = new_flags(n, scale_mode=0, quant_boost=0.8)
+    return y, fl
