@@ -3989,3 +3989,108 @@ def e4_build(P, rng, L, cad, cal, cfg):
     y = unit_std(y) + rng.standard_normal((n, L)) * P["obs_noise"].reshape(n, 1)
     fl = new_flags(n, scale_mode=0, quant_boost=0.6)
     return y, fl
+
+
+# ═══════════════════════ E5 spectral_kernel_zoo ════════════════════════════
+
+N_PSD_TYPES = 7
+
+
+def e5_params(rng, B, cfg):
+    p = cfg["families"]["spectral_kernel_zoo"]
+    return {
+        "n_comp": rng.integers(1, 4, B),
+        "types": rng.integers(0, N_PSD_TYPES, (B, 3)),
+        "weights": rng.uniform(0.2, 1.0, (B, 3)),
+        "ell": logu(rng, 4.0, 2000.0, (B, 3)),
+        "alpha": logu(rng, 0.1, 10.0, (B, 3)),
+        "f0": logu(rng, 1.0 / 900.0, 1.0 / 5.0, (B, 3)),
+        "pwidth": logu(rng, 1e-4, 3e-3, (B, 3)),
+        "pdecay": rng.uniform(0.2, 1.5, (B, 3)),
+        "sm_q": rng.integers(1, 5, B),
+        "sm_c": logu(rng, 1.0 / 2000.0, 0.35, (B, 4)),
+        "sm_w": logu(rng, 2e-5, 8e-3, (B, 4)),
+        "sm_a": rng.uniform(0.2, 1.0, (B, 4)),
+        "beta": rng.uniform(0.4, 2.6, (B, 3)),
+        "fbreak": logu(rng, 1e-5, 5e-3, (B, 3)),
+        "product": rng.random(B) < p["product_rate"],
+        "envelope": rng.random(B) < p["envelope_rate"],
+        "warp": rng.random(B) < p["warp_rate"],
+        "noise": logu(rng, 1e-3, 0.25, B),
+    }
+
+
+def _psd_slot(rng, P, f, n, slot):
+    types = P["types"][:, slot]
+    out = np.zeros((n, f.shape[0]))
+    for ty in range(N_PSD_TYPES):
+        m = types == ty
+        c = int(m.sum())
+        if c == 0:
+            continue
+        ell = P["ell"][m, slot:slot + 1]
+        if ty == 0:
+            s = psd_rbf(f, ell)
+        elif ty == 1:
+            s = psd_matern(f, ell, 0.5)
+        elif ty == 2:
+            s = psd_matern(f, ell, 1.5)
+        elif ty == 3:
+            s = psd_matern(f, ell, 2.5)
+        elif ty == 4:
+            s = psd_rq(f, ell, P["alpha"][m, slot:slot + 1])
+        elif ty == 5:
+            s = psd_periodic(f, P["f0"][m, slot:slot + 1], 6,
+                             P["pdecay"][m, slot:slot + 1],
+                             P["pwidth"][m, slot:slot + 1])
+        else:
+            s = psd_pink(f, P["beta"][m, slot:slot + 1],
+                         P["fbreak"][m, slot:slot + 1])
+        out[m] = s / np.maximum(s.sum(axis=1, keepdims=True), 1e-300)
+    return out
+
+
+def e5_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    f = freq_grid(L)
+    psd = np.zeros((n, f.shape[0]))
+    slots = []
+    for slot in range(3):
+        s = _psd_slot(rng, P, f, n, slot)
+        live = (slot < P["n_comp"]).reshape(n, 1)
+        slots.append(s * live)
+        psd += s * P["weights"][:, slot:slot + 1] * live
+
+    # spectral-mixture component: Q Gaussian peaks at arbitrary centres, giving
+    # quasi-periodic structure at mutually incommensurate, non-integer periods
+    sm = psd_spectral_mixture(f, P["sm_c"], P["sm_w"],
+                              P["sm_a"] * (np.arange(4)[None, :] < P["sm_q"].reshape(n, 1)))
+    psd += sm / np.maximum(sm.sum(axis=1, keepdims=True), 1e-300)
+
+    # A kernel *product* is a PSD convolution; it needs two live components.
+    prod_on = P["product"] & (P["n_comp"] >= 2)
+    if prod_on.any():
+        prod = psd_convolve(np.maximum(slots[0], 1e-300), np.maximum(slots[1], 1e-300))
+        prod /= np.maximum(prod.sum(axis=1, keepdims=True), 1e-300)
+        psd = np.where(prod_on.reshape(n, 1), prod + 1e-6 * psd, psd)
+
+    y = gp_from_psd(rng, np.maximum(psd, 1e-300), L)
+
+    t = time_grid(L)[None, :]
+    if P["envelope"].any():
+        env = 1.0 + 0.9 * matern_gp(rng, n, L, np.full(n, L / 3.0), nu=1.5)
+        y = np.where(P["envelope"].reshape(n, 1), y * np.maximum(env, 0.05), y)
+    if P["warp"].any():
+        bb = np.cumsum(rng.standard_normal((n, L)), axis=1)
+        bb = bb - (t / (L - 1.0)) * bb[:, -1:]
+        bb = bb / np.maximum(np.abs(bb).max(axis=1, keepdims=True), 1e-9)
+        src = np.clip(t + bb * (L * 0.06), 0.0, L - 1.0001)
+        i0 = src.astype(np.int64)
+        fr = src - i0
+        w = np.take_along_axis(y, i0, axis=1) * (1.0 - fr) + \
+            np.take_along_axis(y, np.minimum(i0 + 1, L - 1), axis=1) * fr
+        y = np.where(P["warp"].reshape(n, 1), w, y)
+
+    y = unit_std(y) + rng.standard_normal((n, L)) * P["noise"].reshape(n, 1)
+    fl = new_flags(n, scale_mode=0, quant_boost=0.9)
+    return y, fl
