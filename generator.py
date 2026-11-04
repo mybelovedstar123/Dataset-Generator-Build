@@ -13612,3 +13612,225 @@ def _hourly_social_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarra
     outage &= out_row
     cnt[outage] = 0.0
     return cnt
+
+
+def _weekly_cycle_downloads(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """npm-class daily download counts: a clean weekly shape on a trending level.
+
+    Fitted on npm_downloads_per_pkg (25 series, the pool's single largest
+    king loss contributor: MASE 3.5, 100% of windows worse than the weekly
+    naive) + npm_total_daily. Mon..Sun profile relative to the Tue-Thu
+    plateau (zeros masked, phase-aligned): 0.94 / 1.02 / 1.01 / 0.98 /
+    0.86 / 0.35 / 0.35 (Sat == Sun; weekend/weekday 0.36 [0.33, 0.39];
+    npm_total 0.42; pypi/crates samples 0.5-0.73); weekly spectral share
+    0.47. Level: 7-day-smoothed log-level
+    trend +0.79/yr [+0.55, +0.91] with sd 0.15 around the line, 28-day step
+    sd 0.13; residual cv 0.17 with ACF1 0.32; NO spikes (>2x: 0%); isolated
+    dropout zeros 3.3/yr (runs of 1-2). The king's median cannot reproduce
+    a weekly-seasonal series with a trend -- this family is exactly that.
+
+    Construction: multiplicative DOW profile (trough U[0.30,0.42] for 80% of
+    rows, U[0.42,0.8] for the rest; Sat = trough x U[0.95,1.1]; Mon
+    U[0.90,0.98]; Fri U[0.82,0.90]) on a log-level made of piecewise-linear growth/decay
+    regimes (growth rows 80%: slope U[0.2,1.2]/yr; decay rows U[-0.8,0.1]/yr;
+    regime length U[120,600] d; cumulative excursion soft-capped at ~1100x)
+    + AR(1) wander (sd U[0.03,0.12]) + release events (U[0.5,4]/yr,
+    +U[0.05,0.6] log, half permanent, half decaying with tau U[5,60] d) + a
+    yearly holiday-week dip (depth U[0.35,0.8] over U[7,14] d, 70% of rows);
+    AR(1) lognormal noise sigma U[0.03,0.12], phi U[0.2,0.5]; dropout zeros
+    U[1,6]/yr; integer. Base level log-uniform [3e2, 3e5], LOWERED (never
+    clipped) where the path would cross the 1e6 sanitize rail.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    days = np.arange(L, dtype=np.int64)[None, :]
+    t = _time_index(L)
+
+    phase = rng.integers(0, 7, size=(n, 1))
+    dow = (days + phase) % 7
+    trough = np.where(
+        rng.random((n, 1)) < 0.8,
+        rng.uniform(0.30, 0.42, size=(n, 1)),
+        rng.uniform(0.42, 0.8, size=(n, 1)),
+    )
+    sat = np.minimum(trough * rng.uniform(0.95, 1.1, size=(n, 1)), 0.95)
+    mon = rng.uniform(0.90, 0.98, size=(n, 1))
+    fri = rng.uniform(0.82, 0.90, size=(n, 1))
+    mid = np.exp(rng.normal(0.0, 0.03, size=(n, 3)))
+    prof = np.concatenate([mon, mid, fri, sat, trough], axis=1)
+    prof_t = np.take_along_axis(prof, dow, axis=1)
+
+    base = np.exp(rng.uniform(np.log(3.0e2), np.log(3.0e5), size=(n, 1)))
+    growth = rng.random((n, 1)) < 0.8
+    cp = rng.random((n, L)) < (1.0 / rng.uniform(120.0, 600.0, size=(n, 1)))
+    cp[:, 0] = True
+    slopes = np.where(
+        growth,
+        rng.uniform(0.2, 1.2, size=(n, L)),
+        rng.uniform(-0.8, 0.1, size=(n, L)),
+    ) / 365.0
+    src = np.maximum.accumulate(np.where(cp, days, 0), axis=1)
+    trend = np.cumsum(np.take_along_axis(slopes, src, axis=1), axis=1)
+    # soft cap on the cumulative excursion (~1100x): the local slope survives
+    # inside any window while an 11-year row cannot run away
+    trend = 7.0 * np.tanh(trend / 7.0)
+    tau = rng.uniform(30.0, 150.0, size=(n, 1))
+    phi = np.exp(-1.0 / tau)
+    sd = rng.uniform(0.03, 0.12, size=(n, 1))
+    wander = _ar1_batch(
+        rng.normal(0.0, 1.0, size=(n, L)) * sd * np.sqrt(1.0 - phi * phi), phi
+    )
+    ev = rng.random((n, L)) < (rng.uniform(0.5, 4.0, size=(n, 1)) / 365.0)
+    jump = rng.uniform(0.05, 0.6, size=(n, L)) * np.where(
+        rng.random((n, L)) < 0.8, 1.0, -1.0
+    )
+    perm = rng.random((n, L)) < 0.5
+    steps = np.cumsum(np.where(ev & perm, jump, 0.0), axis=1)
+    tau_e = rng.uniform(5.0, 60.0, size=(n, 1))
+    transient = _ar1_batch(np.where(ev & ~perm, jump, 0.0), np.exp(-1.0 / tau_e))
+    log_level = trend + wander + steps + transient
+    log_level = log_level - log_level[:, :1]
+    # keep the row under the 1e6 sanitize rail by lowering the BASE, never by
+    # flattening the path (a clipped level would read as a held plateau)
+    peak = np.exp(log_level.max(axis=1, keepdims=True))
+    base = np.minimum(base, 9.0e5 / (1.7 * peak))
+
+    h0 = rng.uniform(0.0, 365.0, size=(n, 1))
+    w = rng.uniform(7.0, 14.0, size=(n, 1))
+    d = np.mod(t - h0, 365.0)
+    depth = np.where(rng.random((n, 1)) < 0.7, rng.uniform(0.35, 0.8, size=(n, 1)), 0.0)
+    dip = np.where(d < w, depth * (0.5 - 0.5 * np.cos(2.0 * np.pi * d / w)), 0.0)
+
+    phi_e = rng.uniform(0.2, 0.5, size=(n, 1))
+    sig = rng.uniform(0.03, 0.12, size=(n, 1))
+    noise = _ar1_batch(
+        rng.normal(0.0, 1.0, size=(n, L)) * sig * np.sqrt(1.0 - phi_e * phi_e), phi_e
+    )
+    zero = rng.random((n, L)) < (rng.uniform(1.0, 6.0, size=(n, 1)) / 365.0)
+    run2 = rng.random((n, L)) < 0.3
+    zero[:, 1:] |= zero[:, :-1] & run2[:, :-1]
+
+    y = base * np.exp(log_level + noise) * prof_t * (1.0 - dip)
+    return np.where(zero, 0.0, np.rint(y))
+
+
+# I141: source-independent, stream-isolated insertion of the exact five
+# revision-pinned ticket scalar families. The parent class remains unchanged.
+
+# Grid loads, flows and market prices are published at a fixed resolution
+# (whole MW, a round price tick), so a share of these rows moves in visible
+# steps and holds between them.
+def _publish_steps(fn, share):
+    def wrapped(rng, n, L, *args, **kwargs):
+        out = fn(rng, n, L, *args, **kwargs)
+        pick = rng.random((n, 1)) < share
+        mult = np.exp(rng.uniform(np.log(0.5), np.log(3.0), size=(n, 1)))
+        typical = np.median(np.abs(np.diff(out, axis=1)), axis=1, keepdims=True)
+        raw = typical * mult
+        ok = pick & np.isfinite(raw) & (raw > 0.0) & np.isfinite(out).all(axis=1, keepdims=True)
+        k = np.floor(np.log10(np.where(ok, raw, 1.0)))
+        mant = np.where(ok, raw, 1.0) / 10.0 ** k
+        step = np.where(mant < 1.5, 1.0, np.where(mant < 3.5, 2.0, 5.0)) * 10.0 ** k
+        stepped = np.round(out / step) * step
+        keep = (ok & np.isfinite(stepped).all(axis=1, keepdims=True)
+                & (np.abs(stepped).max(axis=1, keepdims=True) <= 1e37)
+                & (np.ptp(stepped, axis=1, keepdims=True) > 0.0))
+        return np.where(keep, stepped, out)
+    return wrapped
+
+
+_grid_flow = _publish_steps(_grid_flow, 0.6)
+_dispatch_price = _publish_steps(_dispatch_price, 0.6)
+_spiky_price = _publish_steps(_spiky_price, 0.6)
+_price_shock = _publish_steps(_price_shock, 0.6)
+
+class _EngineGenerator(DataGenerator):
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        cfg = json.loads((Path(config_dir) / "config.json").read_text(encoding="utf-8"))
+        self._fraction = float(cfg["isolated_scalar_fraction"])
+        if self._fraction != 0.14779:
+            raise ValueError("I141 isolated scalar fraction is pinned")
+        if any(float(cfg["family_weights"].get(k, -1.0)) != 0.0 for k in
+               ("epi_season_decay", "weekday_ledger_counts", "pull_counter_ramp",
+                "weekly_cycle_downloads", "surveillance_counts", "hourly_social_counts", "intraday_event_counts", "intraday_spot_price", "road_commute_counts",
+                "weekly_demand")):
+            raise ValueError("I141 base stream must give novel families zero weight")
+        self._seed = int(seed)
+        self._config_dir = config_dir
+        self._base = _BaseGenerator(config_dir, seed=self._seed)
+        if (self._base._curriculum_enabled or self._base._domain_mix_enabled
+                or self._base._min_len != 4096 or self._base._max_len != 4096):
+            raise ValueError("I141 requires I081 fixed-length, noncurricular configuration")
+
+    @property
+    def name(self) -> str:
+        return self._base.name
+
+    _SELECTOR_CHUNK = 8192
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        if n_series <= 0:
+            return
+        count = int(n_series)
+        selector_seed = (self._seed ^ 0x65A22A42CA9A1521) & ((1 << 64) - 1)
+        novel_seed = (self._seed ^ 0xDA37B75547EFC9B1) & ((1 << 64) - 1)
+        selector = np.random.default_rng(selector_seed)
+        base_iter = self._base.generate(count)
+        novel_iter = None
+        selected = np.empty(0, dtype=np.bool_)
+        selected_at = 0
+        emitted = 0
+        try:
+            for idx, base_row in enumerate(base_iter):
+                if idx >= count:
+                    raise RuntimeError("I141 base stream overproduced")
+                if selected_at >= selected.size:
+                    take = min(self._SELECTOR_CHUNK, count - idx)
+                    selected = selector.random(take) < self._fraction
+                    selected_at = 0
+                use_novel = bool(selected[selected_at])
+                selected_at += 1
+                if use_novel:
+                    if novel_iter is None:
+                        novel = _BaseGenerator(self._config_dir, seed=novel_seed)
+                        weights = np.asarray([{
+                            "epi_season_decay": 0.05985999999998,
+                            "weekday_ledger_counts": 0.010993422122,
+                            "pull_counter_ramp": 0.007238727924,
+                            "weekly_cycle_downloads": 0.005430485626,
+                            "surveillance_counts": 0.003938973668,
+                            "hourly_social_counts": 0.011517466864,
+                            "intraday_event_counts": 0.011517466864,
+                            "intraday_spot_price": 0.017293456932,
+                            "road_commute_counts": 0.02,
+                            "weekly_demand": 0.006,
+                        }.get(f, 0.0) for f in _FAMILIES], dtype=np.float64)
+                        weights /= weights.sum()
+                        novel._weights = weights
+                        novel._start_weights = weights.copy()
+                        novel_iter = novel.generate(count)
+                    row = next(novel_iter)
+                else:
+                    row = base_row
+                if row.shape != (4096,):
+                    raise RuntimeError("I141 stream produced a nonnative row")
+                emitted += 1
+                yield row
+            if emitted != count:
+                raise RuntimeError("I141 base stream underproduced")
+        finally:
+            base_iter.close()
+            if novel_iter is not None:
+                novel_iter.close()
+
+
+# H413 retains H393 scheduling and chunks only the I141 selector; family groups
+# run on 1 thread (isolated streams and indexed slots keep rows byte-identical).
+_PRODUCER_WORKERS = 3
+_H413_PARENT_GENERATOR = _EngineGenerator
+
+
+class _EngineGenerator(_H413_PARENT_GENERATOR):
+    @property
+    def name(self) -> str:
+        return super().name + "-h393-rendezvous-h413-chunked-selector"
