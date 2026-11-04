@@ -3924,3 +3924,68 @@ def e3_build(P, rng, L, cad, cal, cfg):
     fl["integer"] = (P["emit"] == 0)
     fl["offset_pref"] = np.full(n, 2, dtype=np.int8)
     return y, fl
+
+
+# ═══════════════════════════ E4 chaotic_delay ══════════════════════════════
+
+_SYS_PAR = {
+    0: (10.0, 28.0, 8.0 / 3.0, 0.0),      # Lorenz
+    1: (0.2, 0.2, 5.7, 0.0),              # Rossler
+    2: (1.0, 0.35, 10.0, 15.0),           # Chua (cubic)
+    3: (1.0, 3.0, 5.0, 3.2),              # Hindmarsh-Rose
+}
+
+
+def e4_params(rng, B, cfg):
+    p = cfg["families"]["chaotic_delay"]
+    sysid = categorical(rng, p["system_mix"], B)
+    par = np.zeros((B, 4))
+    for k, v in _SYS_PAR.items():
+        m = sysid == k
+        par[m] = np.array(v)
+    par *= np.exp(rng.normal(0.0, 0.04, size=(B, 4)))
+    return {
+        "system": sysid,
+        "par": par,
+        "dt": logu(rng, 0.004, 0.05, B),
+        "sub": rng.integers(1, 4, B),
+        "state0": rng.normal(0.0, 1.0, size=(B, 3)) + np.array([0.6, 0.4, 1.2]),
+        "project": rng.random(B) < p["projection_rate"],
+        "proj": rng.normal(0.0, 1.0, size=(B, 3)),
+        "mg": rng.random(B) < p["mackey_glass_rate"],
+        "mg_beta": rng.uniform(0.15, 0.3, B),
+        "mg_gamma": rng.uniform(0.08, 0.12, B),
+        "mg_n": rng.uniform(8.0, 12.0, B),
+        "mg_tau": rng.uniform(15.0, 40.0, B),
+        "obs_noise": logu(rng, 1e-4, 5e-2, B),
+    }
+
+
+def e4_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    traj = np.zeros((n, L, 3))
+    k_rk4_3d(np.ascontiguousarray(P["system"]).astype(np.int64),
+               np.ascontiguousarray(P["par"]),
+               np.ascontiguousarray(P["dt"]),
+               np.ascontiguousarray(P["state0"]),
+               np.ascontiguousarray(P["sub"]).astype(np.int64), traj)
+    pick = rng.integers(0, 3, n)
+    coord = traj[np.arange(n), :, pick]
+    proj = np.einsum("ntk,nk->nt", traj, P["proj"])
+    y = np.where(P["project"].reshape(n, 1), proj, coord)
+
+    if P["mg"].any():
+        Bw = 256
+        dsteps = np.clip(np.round(P["mg_tau"] * 4.0).astype(np.int64), 4, Bw - 2)
+        hist = 1.0 + 0.15 * rng.standard_normal((n, Bw))
+        mg = np.zeros((n, L))
+        k_mackey_glass(np.ascontiguousarray(P["mg_beta"]),
+                         np.ascontiguousarray(P["mg_gamma"]),
+                         np.ascontiguousarray(P["mg_n"]),
+                         np.ascontiguousarray(dsteps),
+                         np.ascontiguousarray(hist), mg)
+        y = np.where(P["mg"].reshape(n, 1), mg, y)
+
+    y = unit_std(y) + rng.standard_normal((n, L)) * P["obs_noise"].reshape(n, 1)
+    fl = new_flags(n, scale_mode=0, quant_boost=0.6)
+    return y, fl
