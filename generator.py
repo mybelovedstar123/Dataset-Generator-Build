@@ -24,3 +24,30 @@ from pathlib import Path
 import numpy as np
 
 from cascade.interface import DataGenerator
+
+# ═══════════════ engine: runtime setup and imports ═══════════════
+# Cascade V145 — native support integrity over the V144 persistence candidate.
+#
+# Experimental training-data generator. No measured forecasting gain is implied.
+
+
+# H393: production-sandbox thread control before numerical imports.
+# These must be set before the first numerical import to take effect.
+import os as _h393_os
+for _h393_var in (
+        "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+        "NUMBA_NUM_THREADS"):
+    _h393_os.environ[_h393_var] = "1"
+from threadpoolctl import threadpool_limits as _h393_threadpool_limits
+_H393_THREAD_LIMITER = _h393_threadpool_limits(limits=1)
+del _h393_var
+
+import json
+import os
+from functools import lru_cache, partial
+from queue import Full, Queue
+from threading import Event, Lock, Thread, local
+from typing import Any
+
+from numba import njit
+from scipy.signal import lfilter
