@@ -9345,3 +9345,302 @@ class _BaseGenerator(DataGenerator):
         finally:
             stop.set()
             producer.join(timeout=1.0)
+
+
+# ==============================================================================
+# Kernels, stochastic families, observation
+# ==============================================================================
+
+def _ar1_kernel(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
+    n, L = innov.shape
+    x = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        p = phi[i]
+        prev = 0.0
+        for t in range(L):
+            prev = innov[i, t] + p * prev
+            x[i, t] = prev
+    return x
+
+
+def _cycle_profile(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Repeat a learned cycle shape under slowly evolving cycle-level state.
+
+    Sinusoidal families make the profile known from a few Fourier parameters,
+    while AR families make only nearby samples informative. This process makes
+    an arbitrary smooth profile recur, so several earlier cycles reveal the
+    shape and the latest cycles reveal how its amplitude and level are moving.
+    Those are observable cues for the next 64 samples in traffic, demand, load,
+    and environmental monitoring series.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    # Cycle periodicity matched to the pool's seasonal_period histogram, which
+    # is stable across all 8 snapshots on disk. The previous weights put their
+    # LARGEST share (0.18) on period 168 and 0.42 combined on 168/240/336/672 --
+    # periods occurring zero or near-zero times in every pool -- while period 24
+    # (23.4% of pool) got 0.08 and period 7 (11.2%) was never generated at all.
+    # This is the same coverage defect that, fixed in _ENV_PERIODS on the r17
+    # lineage, beat its base 5-of-5 pools on LCB. Repeated-cycle is the strongest
+    # correction found on this warm start (+1.44% / LCB +0.79% vs UID81), so
+    # pointing it at periods the pool actually contains is the highest-value
+    # instance of the fix rather than a new mechanism.
+    out = np.empty((n, L), dtype=np.float64)
+    t = np.arange(L, dtype=np.int64)
+
+    for row in range(n):
+        period = int(_CYCLE_PERIODS[
+            _CYCLE_PERIOD_CDF.searchsorted(rng.random(), side="right")
+        ])
+        knots = int(rng.integers(8, 17))
+        knot_x = np.linspace(0.0, float(period), knots + 1)
+        knot_y = rng.normal(0.0, 1.0, size=knots)
+        # Circular smoothing retains asymmetric peaks and shoulders without
+        # introducing a discontinuity where one cycle joins the next.
+        for _ in range(2):
+            knot_y = (
+                np.roll(knot_y, 1) + 2.0 * knot_y + np.roll(knot_y, -1)
+            ) / 4.0
+        knot_y = np.concatenate([knot_y, knot_y[:1]])
+        profile = np.interp(np.arange(period, dtype=np.float64), knot_x, knot_y)
+        profile -= profile.mean()
+        profile /= max(float(profile.std()), 1e-9)
+
+        phase = int(rng.integers(0, period))
+        shifted = t + phase
+        cycle = shifted // period
+        position = shifted % period
+        fraction = position.astype(np.float64) / float(period)
+        n_cycles = int(cycle[-1]) + 2
+
+        amp_phi = float(rng.uniform(0.88, 0.985))
+        level_phi = float(rng.uniform(0.90, 0.995))
+        amp_state = np.empty(n_cycles, dtype=np.float64)
+        level_state = np.empty(n_cycles, dtype=np.float64)
+        amp_state[0] = float(rng.normal(0.0, 0.18))
+        level_state[0] = float(rng.normal(0.0, 0.25))
+        amp_sd = float(rng.uniform(0.025, 0.10))
+        level_sd = float(rng.uniform(0.015, 0.10))
+        # The recursion is sequential and has to stay a Python loop, but its two
+        # scalar draws per cycle do not: normal(0, s) is built as s * a standard
+        # normal, and one (n_cycles-1, 2) block consumes the same ziggurat
+        # sequence as the alternating scalar calls, so the stream is unchanged.
+        # np.clip on a scalar costs more in dispatch than the arithmetic around
+        # it, and min/max is exact here because both states are bounded every
+        # step and the noise is finite, so no NaN can reach the comparison.
+        if n_cycles > 1:
+            _noise = rng.normal(0.0, 1.0, size=(n_cycles - 1, 2))
+            _amp = float(amp_state[0])
+            _level = float(level_state[0])
+            for c in range(1, n_cycles):
+                _z_amp = _noise[c - 1, 0]
+                _z_level = _noise[c - 1, 1]
+                _amp = amp_phi * _amp + amp_sd * _z_amp
+                if _amp < -0.65:
+                    _amp = -0.65
+                elif _amp > 0.65:
+                    _amp = 0.65
+                _level = level_phi * _level + level_sd * _z_level
+                if _level < -1.5:
+                    _level = -1.5
+                elif _level > 1.5:
+                    _level = 1.5
+                amp_state[c] = _amp
+                level_state[c] = _level
+
+        # Interpolate between cycle states. The state remains persistent but
+        # does not create artificial jumps exactly at the cycle boundary.
+        amp = (1.0 - fraction) * amp_state[cycle] + fraction * amp_state[cycle + 1]
+        level = ((1.0 - fraction) * level_state[cycle]
+                 + fraction * level_state[cycle + 1])
+        signal = np.exp(amp) * profile[position] + level
+
+        residual_phi = float(rng.uniform(0.45, 0.90))
+        residual_sd = float(rng.uniform(0.015, 0.10))
+        residual = _ar1_batch(
+            rng.normal(0.0, residual_sd, size=(1, L)),
+            np.array([residual_phi]),
+        )[0]
+        scale = float(np.exp(rng.uniform(np.log(1.0), np.log(2000.0))))
+        offset = float(rng.uniform(-1.0, 3.0)) * scale
+        out[row] = (signal + residual) * scale + offset
+
+    return out
+
+
+def _ar1_batch(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
+    if innov.shape[0] == 0:
+        return np.empty_like(innov, dtype=np.float64)
+    return _ar1_kernel(
+        np.ascontiguousarray(innov, dtype=np.float64),
+        np.ascontiguousarray(np.reshape(phi, -1), dtype=np.float64),
+    )
+
+
+@njit(cache=False, fastmath=False)
+def _ar2_kernel(innov: np.ndarray, a1: np.ndarray, a2: np.ndarray) -> np.ndarray:
+    # scipy.signal.lfilter implements a *transposed* Direct Form II, not the
+    # textbook y[t] = x[t] + a1 y[t-1] + a2 y[t-2]. That textbook form is
+    # mathematically the same filter and was the first thing tried; against
+    # lfilter it drifted (and on poles near the unit circle the states
+    # diverged). The transposed update below is what scipy actually runs for
+    # b=[1], a=[1, -a1, -a2], zi=0:
+    #
+    #     y  = x + z1
+    #     z1 = a1 y + z2
+    #     z2 = a2 y
+    #
+    # Checked bit-identical to lfilter over 400 random rows, 5 edge-pole rows
+    # (including 1.8/-0.81), and 100 family-like draws. fastmath stays off so
+    # the compiler cannot reassociate the three assignments. The function
+    # draws nothing, so the RNG stream is untouched.
+    n, L = innov.shape
+    x = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        p1 = a1[i]
+        p2 = a2[i]
+        z1 = 0.0
+        z2 = 0.0
+        for t in range(L):
+            y = innov[i, t] + z1
+            z1 = p1 * y + z2
+            z2 = p2 * y
+            x[i, t] = y
+    return x
+
+
+def _ar2_batch(innov: np.ndarray, a1: np.ndarray, a2: np.ndarray) -> np.ndarray:
+    if innov.shape[0] == 0:
+        return np.empty_like(innov, dtype=np.float64)
+    return _ar2_kernel(
+        np.ascontiguousarray(innov, dtype=np.float64),
+        np.ascontiguousarray(np.reshape(a1, -1), dtype=np.float64),
+        np.ascontiguousarray(np.reshape(a2, -1), dtype=np.float64),
+    )
+
+
+def _prefix_mean_std(
+    x: np.ndarray, *, calibration_points: int = 512
+) -> tuple[np.ndarray, np.ndarray]:
+
+    prefix = x[:, : min(x.shape[1], calibration_points)]
+    mean = prefix.mean(axis=1, keepdims=True)
+    std = prefix.std(axis=1, keepdims=True)
+    return mean, np.where(std < 1e-12, 1.0, std)
+
+
+def _prefix_standardize(
+    x: np.ndarray, *, center: bool = True, calibration_points: int = 512
+) -> np.ndarray:
+    mean, std = _prefix_mean_std(
+        x, calibration_points=calibration_points
+    )
+    return (x - mean) / std if center else x / std
+
+
+def _median_1d(x: np.ndarray):
+    """``np.median(x)`` for a non-empty 1-D float array, without the wrapper.
+
+    np.median spends most of its time in python: it re-derives the kth list,
+    slices, routes through np.mean and then re-checks for NaN. Selecting the
+    same kth set and averaging the same two order statistics is the identical
+    computation for a third of the cost.
+    """
+    n = x.size
+    half = n // 2
+    if n & 1:
+        part = np.partition(x, (half, -1))
+        result = part[half]
+    else:
+        part = np.partition(x, (half - 1, half, -1))
+        result = (part[half - 1] + part[half]) / 2.0
+    # np.median reports NaN whenever one is present; after partitioning with
+    # kth=-1 a NaN always lands last.
+    largest = part[-1]
+    return largest if np.isnan(largest) else result
+
+
+def _lerp(a: np.ndarray, b: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """NumPy's numerically stable lerp; needed for bit-identical quantiles."""
+    diff = b - a
+    out = a + diff * t
+    return np.where(t >= 0.5, b - diff * (1.0 - t), out)
+
+
+def _quantile_rows(a: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """``np.quantile(row, qi)`` for each row (linear method, bit-identical)."""
+    n = a.shape[1]
+    if n <= 1:
+        return a[:, 0].astype(np.float64, copy=True)
+    xs = np.sort(a, axis=1)
+    virt = np.asarray(q, dtype=np.float64) * (n - 1)
+    lo = np.floor(virt).astype(np.intp)
+    hi = np.minimum(lo + 1, n - 1)
+    g = virt - lo
+    idx = np.arange(a.shape[0])
+    out = _lerp(xs[idx, lo], xs[idx, hi], g)
+    nan_row = np.isnan(a).any(axis=1)
+    if nan_row.any():
+        out = np.where(nan_row, np.nan, out)
+    # -0.0 and 0.0 compare equal but have different bits, and that is the only
+    # way two equal float64s can differ, so a tie between them is the one case
+    # where np.sort may select a different representation than the partition
+    # np.quantile uses. Rows holding a negative zero take the exact path;
+    # integer-rounded rows produce them via np.rint of small negatives.
+    zero_tie = np.nonzero((np.signbit(a) & (a == 0.0)).any(axis=1))[0]
+    for i in zero_tie:
+        out[i] = np.quantile(a[i], q[i])
+    return out
+
+
+@lru_cache(maxsize=16)
+def _linspace_segments(L: int, k: int) -> tuple:
+    """Slice bounds and time offsets per knot interval; fixed by (L, k) alone."""
+    t = np.arange(L, dtype=np.float64)
+    knot_t = np.linspace(0.0, float(L - 1), k)
+    pos = t * (k - 1) / (L - 1)
+    lo = np.minimum(np.floor(pos).astype(np.intp), k - 2)
+    bounds = np.searchsorted(lo, np.arange(k - 1), side="left")
+    return tuple(
+        (
+            j,
+            int(bounds[j]),
+            int(bounds[j + 1]) if j + 1 < k - 1 else L,
+            t[int(bounds[j]) : (int(bounds[j + 1]) if j + 1 < k - 1 else L)] - knot_t[j],
+            knot_t[j + 1] - knot_t[j],
+        )
+        for j in range(k - 1)
+    )
+
+
+def _interp_linspace_rows(knot_a: np.ndarray, L: int) -> np.ndarray:
+    """``np.interp(arange(L), linspace(0, L-1, k), knot_a[i])`` for every row.
+
+    On a uniform knot grid the result is linear over each of the k-1 intervals,
+    so every interval is one contiguous slice. Indexing the knots with a
+    length-L index vector instead would cost several (rows, L) gathers and is
+    slower than the per-row ``np.interp`` loop this replaces.
+    """
+    out = np.empty((knot_a.shape[0], L), dtype=np.float64)
+    for j, start, stop, toff, dt in _linspace_segments(L, knot_a.shape[1]):
+        slope = ((knot_a[:, j + 1] - knot_a[:, j]) / dt)[:, None]
+        out[:, start:stop] = slope * toff + knot_a[:, j : j + 1]
+    out[:, -1] = knot_a[:, -1]
+    return out
+
+
+def _median_rows(a: np.ndarray) -> np.ndarray:
+    """``np.median(a, axis=1, keepdims=True)`` for a 2-D float array."""
+    n = a.shape[1]
+    half = n // 2
+    if n & 1:
+        part = np.partition(a, (half, n - 1), axis=1)
+        result = part[:, half]
+    else:
+        part = np.partition(a, (half - 1, half, n - 1), axis=1)
+        result = (part[:, half - 1] + part[:, half]) / 2.0
+    # Match _median_1d/np.median: any NaN partitions to the last column and
+    # makes that row's result NaN.
+    largest = part[:, -1]
+    result = np.where(np.isnan(largest), largest, result)
+    return result[:, None]
