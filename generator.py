@@ -7512,3 +7512,291 @@ def _retail_promo_tail(rng: np.random.Generator, n: int, length: int) -> np.ndar
             sales[start:start + run] = np.minimum(sales[start:start + run], rng.integers(0, 3))
         out[row] = sales
     return out
+
+
+# --- transplanted from count_donor -------------------------------
+# _capacity_counts plus 0 dependency/dependencies it needs that this tree lacked.
+# Inert at weight 0.0 (proved by an unchanged corpus digest).
+
+
+def _tail_smooth(x: np.ndarray, width: int) -> np.ndarray:
+    kernel = np.ones(width, dtype=np.float64) / width
+    return np.convolve(x, kernel, mode="same")
+
+
+def _heavy_traffic_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """npm/wikimedia-class traffic counts, moment-matched to the revealed pool:
+    huge levels (log-level ~ U[5.3, 17]), MILD weekly profile (log-spread
+    U[0.05, 0.5]), multiplicative lognormal noise sigma ~ U[0.35, 1.1] (Fano
+    grows with level), moderate bursts (peak ratio e^U[ln1.5, ln65]) decaying
+    in ~1-5 day-periods."""
+    t = _time_index(L).ravel()
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        p_day = float(np.exp(rng.uniform(np.log(12.0), np.log(96.0))))
+        dow = np.floor((t % (7.0 * p_day)) / p_day).astype(np.int64)
+        spread = rng.uniform(0.05, 0.5)
+        prof = np.exp((rng.random(7) - 0.5) * spread)
+        day = 1.0 + rng.uniform(0.02, 0.15) * np.sin(
+            2.0 * np.pi * t / p_day + rng.uniform(0.0, 2.0 * np.pi)
+        )
+        level = float(np.exp(rng.uniform(5.3, 17.0)))
+        drift = np.exp(np.cumsum(rng.normal(0.0, rng.uniform(0.0, 0.002), size=L)))
+        lam = level * prof[dow] * day * drift
+        for _ in range(int(rng.poisson(rng.uniform(0.3, 2.0)))):
+            s0 = int(rng.integers(0, L))
+            mag = float(np.exp(rng.uniform(np.log(1.5), np.log(65.0))))
+            half = p_day * float(np.exp(rng.uniform(np.log(0.5), np.log(5.0))))
+            lam[s0:] *= 1.0 + (mag - 1.0) * np.exp(-(t[s0:] - t[s0]) / half)
+        sigma = rng.uniform(0.35, 1.1)
+        noise = np.exp(rng.normal(-0.5 * sigma * sigma, sigma, size=L))
+        out[i] = np.round(np.maximum(lam * noise, 0.0))
+    return out
+
+
+def _sparse_admin_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """covid-testing-class administrative counts: TINY levels (e^U[0.2, 2.4]),
+    weekly profile with weekend dip to U[0.6, 0.85], mild NB overdispersion
+    (Fano U[1.5, 8]); zeros arise naturally from the small Poisson levels."""
+    t = _time_index(L).ravel()
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        p_day = float(np.exp(rng.uniform(np.log(4.0), np.log(64.0))))
+        dow = np.floor((t % (7.0 * p_day)) / p_day).astype(np.int64)
+        prof = np.exp((rng.random(7) - 0.5) * rng.uniform(0.3, 0.9))
+        wk = rng.choice(7, size=2, replace=False)
+        prof[wk] *= rng.uniform(0.55, 0.85)
+        prof /= prof.mean()
+        level = float(np.exp(rng.uniform(0.2, 2.4)))
+        trend = np.exp(
+            np.sin(2.0 * np.pi * t / (L * rng.uniform(0.6, 2.5))
+                   + rng.uniform(0.0, 2.0 * np.pi)) * rng.uniform(0.2, 1.2)
+        )
+        lam = level * prof[dow] * trend
+        fano = rng.uniform(1.5, 8.0)
+        r = np.maximum(lam / np.maximum(fano - 1.0, 1e-6), 1e-6)
+        g = rng.gamma(r, 1.0 / r)
+        out[i] = rng.poisson(np.maximum(lam * g, 0.0)).astype(np.float64)
+    return out
+
+
+def _storm_outage_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """outage-class: small gappy baseline (zero runs), rare storm events at
+    75-750x the median level with fast rise and hours-scale recovery."""
+    t = _time_index(L).ravel()
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        base_level = float(np.exp(rng.uniform(np.log(0.2), np.log(4.0))))
+        gate = rng.random(L) < rng.uniform(0.3, 0.9)
+        lam = base_level * gate
+        p_day = float(np.exp(rng.uniform(np.log(12.0), np.log(96.0))))
+        for _ in range(int(rng.poisson(rng.uniform(0.5, 4.0)))):
+            s0 = int(rng.integers(0, L))
+            mag = base_level * float(np.exp(rng.uniform(np.log(75.0), np.log(750.0))))
+            rise = float(np.exp(rng.uniform(np.log(0.5), np.log(4.0))))
+            half = p_day * float(np.exp(rng.uniform(np.log(0.1), np.log(1.5))))
+            dt = t[s0:] - t[s0]
+            lam[s0:] = lam[s0:] + mag * (1.0 - np.exp(-dt / rise)) * np.exp(-dt / half)
+        out[i] = rng.poisson(np.maximum(lam, 0.0)).astype(np.float64)
+    return out
+
+
+# Published precipitation resolutions: 0.01 mm processed 15-min totals,
+# 0.1 mm synoptic hourly totals, 0.2 mm tipping buckets, 0.01 in, 0.5 mm.
+_RAIN_TICKS = np.array([0.01, 0.1, 0.2, 0.254, 0.5])
+_RAIN_TICK_CDF = _choice_cdf([0.40, 0.30, 0.18, 0.07, 0.05])
+
+
+def _rain_alternating(rng: np.random.Generator, off_len: np.ndarray,
+                      on_len: np.ndarray, L: int) -> np.ndarray:
+    """Boolean path of alternating off/on runs, entered at a random offset."""
+    k = off_len.size
+    runs = np.empty(2 * k, dtype=np.int64)
+    runs[0::2], runs[1::2] = off_len, on_len
+    flags = np.zeros(2 * k, dtype=bool)
+    flags[1::2] = True
+    path = np.repeat(flags, runs)
+    offset = int(rng.integers(0, max(int(runs[:2].sum()), 1)))
+    path = path[offset:offset + L]
+    if path.size < L:
+        path = np.concatenate([path, np.zeros(L - path.size, dtype=bool)])
+    return path
+
+
+def _gauge_rain(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """rain-gauge-class: precipitation totals per reporting interval.
+
+    Storms (short wet bursts broken by short gaps) alternate with heavy-tailed
+    dry spells. Per-step amounts are heavy-tailed, autocorrelated within a
+    storm and rounded to the gauge's published resolution, so drizzle reads
+    as single ticks, amounts under half a tick read as zero and dry spells
+    are exact zeros (~85-99% zeros, median wet run 1-3 steps). Some rows open
+    with a long dry stretch, as a dry-season or late-starting feed does."""
+    out = np.zeros((n, L), dtype=np.float64)
+    for i in range(n):
+        tick = float(_RAIN_TICKS[_RAIN_TICK_CDF.searchsorted(rng.random(), side="right")])
+        dry_med = float(np.exp(rng.uniform(np.log(36.0), np.log(360.0))))
+        storm_med = float(np.exp(rng.uniform(np.log(12.0), np.log(96.0))))
+        k = int(4.0 * L / (dry_med + storm_med)) + 8
+        dry = np.maximum(np.rint(dry_med * np.exp(rng.normal(0.0, 1.0, size=k))), 1)
+        storm = np.maximum(np.rint(storm_med * np.exp(rng.normal(0.0, 0.7, size=k))), 1)
+        stormy = _rain_alternating(rng, dry.astype(np.int64), storm.astype(np.int64), L)
+        stay = rng.uniform(0.5, 0.85)
+        start = rng.uniform(0.05, 0.25)
+        m = L // 2 + 16
+        gaps = rng.geometric(start, size=m)
+        bursts = rng.geometric(1.0 - stay, size=m)
+        wet = stormy & _rain_alternating(rng, gaps, bursts, L)
+        storm_id = np.cumsum(np.diff(np.concatenate([[False], stormy])).astype(bool) & stormy)
+        storm_level = np.exp(rng.normal(0.0, 0.7, size=int(storm_id.max()) + 1))
+        phi = rng.uniform(0.4, 0.8)
+        step_sd = rng.uniform(0.9, 1.4)
+        innov = rng.normal(0.0, step_sd * np.sqrt(1.0 - phi * phi), size=L)
+        innov[0] = rng.normal(0.0, step_sd)
+        med_ticks = float(np.exp(rng.uniform(np.log(1.5), np.log(8.0))))
+        amount = med_ticks * storm_level[storm_id] * np.exp(lfilter([1.0], [1.0, -phi], innov))
+        out[i] = np.rint(np.where(wet, amount, 0.0)) * tick
+        if rng.random() < 0.15:
+            # dry season or a feed that starts late: a long exact-zero lead-in
+            out[i, :int(rng.integers(L // 8, 3 * L // 4))] = 0.0
+        if not out[i].any():
+            out[i, int(rng.integers(0, L))] = tick
+    return out
+
+
+def _gauge_rain_native(rng: np.random.Generator, n: int, L: int):
+    """Rain rows keep their published law: exact zeros on the gauge lattice.
+
+    Flagged as native rows, so the host restores them after the observation
+    stages and the tail continuation, and never pads or blends them."""
+    return _gauge_rain(rng, n, L), {"bounded": np.ones(n, dtype=bool),
+                                    "integer": np.zeros(n, dtype=bool)}
+
+
+_gauge_rain.with_metadata = _gauge_rain_native
+
+
+def _store_sales_panel(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """DeepEcho/DoppelGANger-inspired retail sales (v35.11 strengthened)."""
+    t = _time_index(L).ravel()
+    out = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        store = int(rng.integers(0, 3))
+        level = float(np.exp(rng.uniform(*[(2.0, 4.5), (4.5, 7.0), (7.0, 10.5)][store])))
+        p_day = float(np.exp(rng.uniform(np.log(12.0), np.log(96.0))))
+        dow = np.floor((t % (7.0 * p_day)) / p_day).astype(np.int64) % 7
+        prof = np.exp((rng.random(7) - 0.5) * rng.uniform(0.25, 0.9))
+        wk = rng.choice(7, size=2, replace=False)
+        soft = {0: (0.55, 0.85), 1: (0.5, 0.8), 2: (0.65, 0.95)}[store]
+        prof[wk] *= rng.uniform(*soft)
+        prof /= max(float(prof.mean()), 1e-9)
+        open_mask = np.ones(L, dtype=bool)
+        for _ in range(int(rng.poisson(rng.uniform(0.5, 3.0)))):
+            z0 = int(rng.integers(0, L))
+            zl = int(p_day * rng.uniform(0.5, 3.5))
+            open_mask[z0:min(L, z0 + zl)] = False
+        if not open_mask.any():
+            open_mask[:] = True
+        cust = prof[dow] * np.exp(rng.normal(0.0, rng.uniform(0.05, 0.2), size=L))
+        cust = np.maximum(cust, 0.0)
+        cust[~open_mask] = 0.0
+        active = open_mask & (cust > 0)
+        if active.any():
+            cust[active] /= float(np.mean(cust[active]))
+        ticket = float(np.exp(rng.uniform(*[(0.5, 2.0), (1.0, 5.0), (2.0, 12.0)][store])))
+        sales = level * cust * ticket
+        for _ in range(int(rng.poisson(rng.uniform(0.3, 2.0)))):
+            s0 = int(rng.integers(0, L))
+            mag = float(np.exp(rng.uniform(np.log(1.5), np.log(5.0))))
+            half = p_day * float(np.exp(rng.uniform(np.log(0.5), np.log(4.0))))
+            dt = t[s0:] - t[s0]
+            sales[s0:] *= 1.0 + (mag - 1.0) * np.exp(-dt / max(half, 1e-6))
+        sales = np.maximum(sales, 0.0)
+        sales[~open_mask] = 0.0
+        if rng.random() < 0.6:
+            out[i] = np.round(sales)
+        else:
+            out[i] = sales
+    return out
+
+
+def _sales_promo_stockout_panel(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Retail panel demand with promo lifts and explicit stock-out capping.
+
+    Sales-domain only: multi-store DOW seasonality and closure windows from the
+    panel law, plus Poisson stock-out runs from the retail-promo tail law.
+    """
+    out = _store_sales_panel(rng, n, L)
+    for row in range(n):
+        sales = out[row]
+        period = int(rng.choice([7, 24, 48, 168, 336]))
+        starts = rng.random(L) < rng.uniform(1.0, 4.0) / L
+        lift = np.ones(L, dtype=np.float64)
+        for start in np.flatnonzero(starts):
+            run = int(rng.integers(2, max(3, min(period, 64))))
+            lift[start:start + run] *= rng.uniform(1.25, 3.5)
+        sales = sales * lift
+        for _ in range(int(rng.poisson(1.5))):
+            start = int(rng.integers(0, L))
+            run = int(rng.integers(2, max(3, min(period, 48))))
+            sales[start:start + run] = np.minimum(
+                sales[start:start + run], rng.integers(0, 3)
+            )
+        out[row] = np.maximum(sales, 0.0)
+    return out
+
+
+def _settle_hold(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Active history that settles into an EXACT constant tail.
+
+    Transport dock/counter/fuel-hold windows: moving prefix then noise-free
+    plateau tail at a nonzero integer level.
+    """
+    t = _time_index(L)
+    short = rng.random((n, 1)) < 0.55
+    T = np.where(
+        short,
+        rng.integers(64, 256, size=(n, 1)),
+        rng.integers(256, 1536, size=(n, 1)),
+    )
+    T = np.minimum(T, max(L - 8, 1))
+    start = L - T
+
+    regime = rng.random((n, 1))
+    is_price = (regime >= 0.55) & (regime < 0.90)
+    is_zero = regime >= 0.90
+
+    lvl_int = np.rint(np.exp(rng.uniform(np.log(1.0), np.log(100.0), size=(n, 1))))
+    at_cap = rng.random((n, 1)) < 0.5
+    cap = np.where(at_cap, lvl_int, np.rint(lvl_int * rng.uniform(1.2, 3.0, size=(n, 1))))
+    cap = np.maximum(cap, 2.0)
+    hold = rng.uniform(0.55, 0.95, size=(n, 1))
+    move = rng.random((n, L)) >= hold
+    sgn = np.where(rng.random((n, L)) < 0.5, -1.0, 1.0)
+    walk = rng.uniform(0.15, 0.85, size=(n, 1)) * cap + np.cumsum(move * sgn, axis=1)
+    span = 2.0 * cap
+    walk = np.rint(cap - np.abs(np.mod(walk, span) - cap))
+    period = rng.choice(np.array([24.0, 96.0, 288.0]), size=(n, 1))
+    phase = rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
+    amp = rng.uniform(0.3, 1.0, size=(n, 1))
+    prof = cap * (0.5 + 0.5 * amp * np.sin(2.0 * np.pi * t / period + phase))
+    prof = prof + (
+        rng.normal(0.0, 1.0, size=(n, L))
+        * np.sqrt(np.maximum(prof, 1.0))
+        * rng.uniform(0.2, 0.8, size=(n, 1))
+    )
+    prof = np.clip(np.rint(prof), 0.0, cap)
+    diurnal = rng.random((n, 1)) < 0.4
+    pre_int = np.where(diurnal, prof, walk)
+
+    grid = rng.choice(np.array([0.05, 0.1, 0.25, 0.5]), size=(n, 1))
+    base = np.exp(rng.uniform(np.log(1.0), np.log(500.0), size=(n, 1)))
+    innov = rng.normal(0.0, 1.0, size=(n, L)) * base * rng.uniform(0.002, 0.02, size=(n, 1))
+    price = np.maximum(base + np.cumsum(innov, axis=1), 0.01 * base)
+
+    pre = np.where(is_price, price, pre_int)
+    last = np.take_along_axis(pre, np.maximum(start - 1, 0), axis=1)
+    lvl = np.where(at_cap, cap, last)
+    lvl = np.where(is_price, np.rint(last / grid) * grid, lvl)
+    lvl = np.where(is_zero, 0.0, lvl)
+    return np.where(t >= start, lvl, pre)
