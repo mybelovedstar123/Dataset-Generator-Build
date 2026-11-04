@@ -8339,3 +8339,76 @@ def _apply_renewal_persistence(
         chunk[slot] = _renewal_persistence_series(path_rng, noise_rng, int(old.size), settings)
         selected[slot] = True
     return selected
+
+
+# ==============================================================================
+# V145: preserve native support; prevent incompatible post-processing
+# ==============================================================================
+
+_NATIVE_SIGNED_FAMILIES = frozenset({
+    "grid_flow", "spiky_price", "price_shock", "tidal_constituents",
+    "energy_load_price_solar",
+})
+_SUPPORT_DEFAULTS = {
+    "restore_signed": False,
+    "restore_bounded_native": False,
+    "guard_mixing": False,
+    "repair_degenerate_rollback": False,
+}
+
+
+def _parse_support_contract(raw: Any) -> dict[str, bool]:
+    """All-off is the V144 control; misspellings/implicit bool casts are errors."""
+    if not isinstance(raw, dict):
+        raise ValueError("support_contract must be a JSON object")
+    unknown = set(raw) - set(_SUPPORT_DEFAULTS)
+    if unknown:
+        raise ValueError("unknown support_contract keys: " + ", ".join(sorted(unknown)))
+    result = dict(_SUPPORT_DEFAULTS)
+    result.update(raw)
+    for name, value in result.items():
+        if type(value) is not bool:
+            raise ValueError(f"support_contract.{name} must be a JSON boolean")
+    return result
+
+
+def _native_bounded_mask(flags: Any, n: int) -> np.ndarray:
+    """Copy the builder's actual row mask, not a whole-family approximation."""
+    if flags is None:
+        return np.zeros(n, dtype=bool)
+    mask = np.asarray(flags.get("bounded", np.zeros(n, dtype=bool)), dtype=bool)
+    if mask.shape != (n,):
+        raise ValueError("native bounded flag has the wrong row count")
+    return mask.copy()
+
+
+def _mixup_support_compatible(
+    protected: np.ndarray, host: int, donors: np.ndarray,
+) -> bool:
+    """V145 does not invent a new law by blending protected rows across families.
+
+    Called AFTER donor/weight draws so refusing a mix does not perturb the
+    selection or parameters of later mixes. No resampling or retry loop.
+    """
+    return not (bool(protected[host]) or bool(np.any(protected[donors])))
+
+
+# V146: native temporal laws, independently switchable for paired ablations.
+_TEMPORAL_DEFAULTS = {
+    "complete_renewals": False,
+    "native_integer_flags": False,
+    "instance_config": False,
+}
+
+
+def _parse_temporal_integrity(value: Any) -> dict[str, bool]:
+    if not isinstance(value, dict):
+        raise ValueError("temporal_integrity must be an object")
+    if set(value) - set(_TEMPORAL_DEFAULTS):
+        raise ValueError("unknown temporal_integrity key")
+    out = dict(_TEMPORAL_DEFAULTS)
+    for key, flag in value.items():
+        if type(flag) is not bool:
+            raise ValueError("temporal_integrity flags must be booleans")
+        out[key] = flag
+    return out
