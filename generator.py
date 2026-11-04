@@ -15460,3 +15460,297 @@ def _pt_traffic_volume_or_speed(rng, n):
     if rng.random() < 0.15 and base_level < 5000:
         return 12.0 * _pt_overdispersed_poisson_counts(rng, np.maximum(mean_count / 12.0, 0.001), k)
     return _pt_overdispersed_poisson_counts(rng, np.maximum(mean_count, 0.001), k)
+
+def _pt_diurnal_counts_or_occupancy(rng, n):
+    mode = int(_pt_pick_option_by_weight(rng, (0, 1, 2), (0.37, 0.18, 0.45)))
+    if mode == 2:
+        tod, dow = _pt_time_of_day_and_weekday(rng, n, 1.0)
+        weekday_factors = np.exp(rng.normal(0.0, 0.08, 7))
+        weekday_factors[int(rng.integers(0, 7))] *= rng.uniform(0.4, 0.9)
+        weekday_factors[int(rng.integers(0, 7))] *= rng.uniform(0.6, 0.95)
+        weekday_factors[int(rng.integers(0, 7))] *= rng.uniform(1.05, 1.5)
+        log_level_drift = rng.uniform(0.5, 1.4) * _pt_smooth_random_curve(rng, n, rng.uniform(15.0, 90.0))
+        base_rate = _pt_mobility_log_uniform(rng, 0.5, 20.0)
+        rate = base_rate * weekday_factors[dow] * np.exp(log_level_drift - 0.5 * log_level_drift.var())
+        return _pt_overdispersed_poisson_counts(rng, rate, _pt_mobility_log_uniform(rng, 2.0, 40.0))
+    steps_per_day = _pt_pick_option_by_weight(rng, (24.0, 48.0, 96.0, 288.0), (0.5, 0.3, 0.1, 0.1))
+    tod, dow = _pt_time_of_day_and_weekday(rng, n, steps_per_day)
+    lo = rng.uniform(0.4, 0.85)
+    diurnal_profile = lo + (1.0 - lo) * (_pt_daily_gaussian_bump(tod, rng.uniform(0.55, 0.85), rng.uniform(0.12, 0.25)) + rng.uniform(0.0, 0.5) * _pt_daily_gaussian_bump(tod, rng.uniform(0.35, 0.45), 0.08))
+    diurnal_profile = diurnal_profile / diurnal_profile.mean()
+    wk = np.exp(rng.normal(0.0, 0.06, 7))[dow]
+    slow_drift = np.exp(rng.uniform(0.1, 0.45) * _pt_smooth_random_curve(rng, n, rng.uniform(3.0, 20.0) * steps_per_day))
+    if mode == 0:
+        base_rate = _pt_mobility_log_uniform(rng, 0.8, 35.0)
+        rate = base_rate * diurnal_profile * wk * slow_drift
+        if rng.random() < 0.3:
+            for _ in range(int(rng.integers(1, 4))):
+                L = int(rng.integers(2, max(3, int(steps_per_day // 2))))
+                s = int(rng.integers(0, max(1, n - L)))
+                rate[s:s + L] *= rng.uniform(1.5, 4.0)
+        return _pt_overdispersed_poisson_counts(rng, rate, _pt_mobility_log_uniform(rng, 4.0, 80.0))
+    mean_stay = _pt_mobility_log_uniform(rng, 1.5, 12.0)
+    mean_occupancy = _pt_mobility_log_uniform(rng, 0.8, 12.0)
+    rate = mean_occupancy / mean_stay * diurnal_profile * wk * slow_drift
+    arrivals = rng.poisson(rate).astype(np.float64)
+    capacity = float(np.ceil(mean_occupancy * rng.uniform(1.0, 2.2) + 1))
+    return _pt_simulate_occupancy_geometric_stays(arrivals, rng.random(n), 1.0 / mean_stay, capacity)
+
+def _pt_seasonal_positivity_percent(rng, n):
+    tod, dow = _pt_time_of_day_and_weekday(rng, n, 1.0)
+    t = np.arange(n, dtype=np.float64)
+    kind = int(_pt_pick_option_by_weight(rng, (0, 1, 2, 3), (0.3, 0.25, 0.25, 0.2)))
+    base_fraction = (_pt_mobility_log_uniform(rng, 4.0, 14.0), _pt_mobility_log_uniform(rng, 0.12, 0.6), _pt_mobility_log_uniform(rng, 0.05, 0.5), _pt_mobility_log_uniform(rng, 0.02, 0.12))[kind] / 100.0
+    season_amplitude = (rng.uniform(0.5, 1.2), rng.uniform(0.8, 1.8), rng.uniform(2.5, 4.5), rng.uniform(2.2, 4.0))[kind]
+    ph = rng.uniform(0.0, 365.0)
+    c = 0.5 * (1.0 + np.cos(2 * np.pi * (t - ph) / 365.25))
+    season_logit = season_amplitude * c ** rng.uniform(2.0, 8.0)
+    if kind == 1:
+        season_logit = season_logit + rng.uniform(0.3, 0.9) * _pt_smooth_random_curve(rng, n, rng.uniform(20.0, 45.0))
+    logit_noise = rng.uniform(0.1, 0.35) * _pt_smooth_random_curve(rng, n, rng.uniform(10.0, 40.0)) + rng.uniform(0.1, 0.5) * _pt_smooth_random_curve(rng, n, rng.uniform(60.0, 150.0))
+    weekday_factor = np.exp(rng.normal(0.0, rng.uniform(0.005, 0.05), 7))[dow]
+    logit = np.log(base_fraction / (1 - base_fraction)) + season_logit + logit_noise + np.log(weekday_factor)
+    p = 1.0 / (1.0 + np.exp(-logit))
+    mean_trials = _pt_mobility_log_uniform(rng, 400.0, 30000.0)
+    weekend_factor = np.where(dow >= 5, rng.uniform(0.75, 0.95), 1.0)
+    N = np.maximum(1.0, np.round(mean_trials * weekend_factor * np.exp(0.05 * rng.standard_normal(n))))
+    k = rng.binomial(N.astype(np.int64), np.clip(p, 0.0, 1.0))
+    percent = 100.0 * k / N
+    glitch_mask = rng.random(n) < rng.uniform(0.0, 0.012)
+    percent = np.where(glitch_mask, percent * rng.uniform(0.3, 1.9, n), percent)
+    return np.round(percent, 2)
+_pt_PROFILE_PERIODS = np.array([24, 96, 288, 168, 7, 12, 48, 144, 60, 52], dtype=np.int64)
+_pt_PROFILE_PERIOD_PROBS = np.array([0.28, 0.28, 0.13, 0.08, 0.09, 0.05, 0.05, 0.02, 0.01, 0.01])
+_pt_PROFILE_PERIOD_PROBS = _pt_PROFILE_PERIOD_PROBS / _pt_PROFILE_PERIOD_PROBS.sum()
+_pt_PROFILE_TWO_PI = 2.0 * np.pi
+_pt_PROFILE_PERIOD_CDF = np.cumsum(_pt_PROFILE_PERIOD_PROBS)
+_pt_WAVEFORM_KIND_CDF = np.cumsum([0.16, 0.36, 0.2, 0.14, 0.14])
+
+def _pt_sample_profile_period(rng, n):
+    i = min(int(np.searchsorted(_pt_PROFILE_PERIOD_CDF, rng.random(), side='right')), _pt_PROFILE_PERIODS.size - 1)
+    p = int(_pt_PROFILE_PERIODS[i])
+    while p > 7 and n < 3 * p:
+        p = {288: 96, 168: 48, 144: 48, 96: 24, 60: 24, 52: 24, 48: 24, 24: 12, 12: 7}[p]
+    return p
+
+def _pt_raised_cosine_bump(u, half_width, power):
+    scaled_dist = np.abs((u + 0.5) % 1.0 - 0.5) / half_width
+    b = np.where(scaled_dist < 1.0, 0.5 * (1.0 + np.cos(np.pi * np.minimum(scaled_dist, 1.0))), 0.0)
+    return b ** power if power != 1 else b
+
+def _pt_random_cycle_waveform(rng, u, p):
+    kind = int(np.searchsorted(_pt_WAVEFORM_KIND_CDF, rng.random(), side='right'))
+    if kind == 0:
+        k = int(rng.integers(1, 5))
+        w = np.zeros_like(u)
+        for h in range(1, k + 1):
+            a = rng.uniform(0.2, 1.0) / h ** rng.uniform(0.8, 1.8)
+            w += a * np.cos(_pt_PROFILE_TWO_PI * h * u + rng.uniform(0, _pt_PROFILE_TWO_PI))
+    elif kind == 1:
+        if p < 12:
+            half_width = rng.uniform(0.2, 0.45)
+        elif rng.random() < 0.5:
+            half_width = rng.uniform(1.0, 4.0) / p
+        else:
+            half_width = rng.uniform(min(4.0 / p, 0.2), 0.25)
+        power = float(2 ** int(rng.integers(0, 3)))
+        w = _pt_raised_cosine_bump(u, half_width, power)
+        if rng.random() < 0.45:
+            w = w + rng.uniform(0.3, 1.0) * _pt_raised_cosine_bump((u - rng.uniform(0.25, 0.75)) % 1.0, half_width * rng.uniform(0.6, 1.6), power)
+    elif kind == 2:
+        on = rng.uniform(0.2, 0.6)
+        ramp_width = 1.0 / p if rng.random() < 0.5 else max(1.0 / p, rng.uniform(0.005, 0.08))
+        v = (u - rng.uniform(0, 1)) % 1.0
+        rise = np.clip(v / ramp_width, 0, 1)
+        fall = np.clip((on - v) / ramp_width, 0, 1)
+        w = 0.5 - 0.5 * np.cos(np.pi * np.minimum(rise, fall))
+        if rng.random() < 0.5:
+            w = w * (1.0 - rng.uniform(0.1, 0.5) * _pt_raised_cosine_bump((v - on * rng.uniform(0.35, 0.65)) % 1.0, on * rng.uniform(0.05, 0.2), 1.0))
+    elif kind == 3:
+        v = (u - rng.uniform(0, 1)) % 1.0
+        decay_scale = rng.uniform(0.03, 0.35)
+        rise = 1.0 / p if rng.random() < 0.5 else max(1.0 / p, rng.uniform(0.0, 0.06))
+        w = np.where(v < rise, v / rise, np.exp(-(v - rise) / decay_scale))
+        w = w - np.exp(-(1.0 - rise) / decay_scale) * (v >= rise)
+    else:
+        s = rng.uniform(-0.8, 0.8)
+        v = (u - rng.uniform(0, 1)) % 1.0
+        w = np.cos(_pt_PROFILE_TWO_PI * v + s * np.sin(_pt_PROFILE_TWO_PI * v))
+        if rng.random() < 0.5:
+            w = np.abs(w) ** rng.uniform(0.5, 3.0) * np.sign(w)
+    lo, hi = (w.min(), w.max())
+    return (w - lo) / (hi - lo + 1e-12)
+
+def _pt_slow_sine_mixture(rng, t, n, k):
+    w = _pt_PROFILE_TWO_PI / n
+    out = rng.normal() * np.sin(t * (w * rng.uniform(0.2, 2.5)) + rng.uniform(0, _pt_PROFILE_TWO_PI))
+    for _ in range(k - 1):
+        out += rng.normal() * np.sin(t * (w * rng.uniform(0.2, 2.5)) + rng.uniform(0, _pt_PROFILE_TWO_PI))
+    sd = np.sqrt(np.dot(out, out) / n)
+    return out / sd if sd > 0 else out
+
+def _pt_periodic_profile_series(rng, n):
+    n = int(n)
+    t = np.arange(n, dtype=np.float64)
+    p = _pt_sample_profile_period(rng, n)
+    phase_offset = rng.uniform(0, 1)
+    phase_jitter = 0.0
+    if rng.random() < 0.3:
+        phase_jitter = rng.uniform(0.005, 0.04) * _pt_slow_sine_mixture(rng, t, n, 2)
+    u = (t / p + phase_offset + phase_jitter) % 1.0
+    profile = _pt_random_cycle_waveform(rng, u, p)
+    r = rng.random()
+    if p in (24, 96, 288, 48, 12) and r < 0.35:
+        day = {12: 12, 24: 24, 48: 48, 96: 96, 288: 288}[p]
+        steps_per_week = 7 * day
+        if n >= 2 * steps_per_week and rng.random() < 0.6:
+            wk = (t / steps_per_week + rng.uniform(0, 1)) % 1.0
+            d = np.floor(wk * 7)
+            is_weekend = (d >= 5).astype(np.float64)
+            day_frac = wk * 7 - d
+            e = 0.1
+            prev_is_weekend = ((d - 1) % 7 >= 5).astype(np.float64)
+            edge_progress = np.clip(day_frac / e, 0, 1)
+            weekend_weight = prev_is_weekend + (is_weekend - prev_is_weekend) * (0.5 - 0.5 * np.cos(np.pi * edge_progress))
+            profile = profile * (1.0 - rng.uniform(0.2, 0.8) * weekend_weight)
+        else:
+            u2 = (t / (p * int(rng.integers(2, 5))) + rng.uniform(0, 1)) % 1.0
+            profile = profile + rng.uniform(0.1, 0.5) * _pt_random_cycle_waveform(rng, u2, p)
+    elif r < 0.5:
+        profile = profile + rng.uniform(0.05, 0.3) * np.cos(_pt_PROFILE_TWO_PI * rng.integers(2, 5) * u + rng.uniform(0, _pt_PROFILE_TWO_PI))
+    am = rng.random()
+    if am < 0.45:
+        am_depth = rng.uniform(0.1, 0.7)
+        am_envelope = 1.0 + am_depth * np.tanh(0.8 * _pt_slow_sine_mixture(rng, t, n, int(rng.integers(1, 4))))
+        profile = profile * np.maximum(am_envelope, 0.05)
+    if am >= 0.3 and rng.random() < 0.6:
+        nc = n // p + 2
+        g = np.exp(rng.normal(0.0, rng.uniform(0.05, 0.4), nc))
+        profile = profile * np.interp(t / p, np.arange(nc), g)
+    if rng.random() < 0.35:
+        slow_wave = rng.normal() * np.sin(t * (_pt_PROFILE_TWO_PI / (p * rng.uniform(0.6, 5.0))) + rng.uniform(0, _pt_PROFILE_TWO_PI))
+        for _ in range(2):
+            slow_wave += rng.normal() * np.sin(t * (_pt_PROFILE_TWO_PI / (p * rng.uniform(0.6, 5.0))) + rng.uniform(0, _pt_PROFILE_TWO_PI))
+        profile = profile + rng.uniform(0.15, 0.6) * profile.std() * slow_wave / (slow_wave.std() + 1e-12)
+    level_scale = np.exp(rng.normal(np.log(80.0), 2.2))
+    x = level_scale * profile
+    signal_sd = level_scale * profile.std()
+    rl = rng.random()
+    if rl >= 0.15:
+        drift_amp = signal_sd * (rng.uniform(0.05, 0.3) if rl < 0.6 else rng.uniform(0.3, 0.9))
+        x += drift_amp * _pt_slow_sine_mixture(rng, t, n, int(rng.integers(1, 3)))
+    if rng.random() < 0.1:
+        x += signal_sd * rng.normal(0.0, 0.6) * (t / n - 0.5)
+    series_sd = x.std() + 1e-12 * (1.0 + level_scale)
+    ev = rng.random()
+    if ev < 0.12:
+        k = int(rng.integers(n // 5, 4 * n // 5))
+        x[k:] += (1.0 if rng.random() < 0.5 else -1.0) * rng.uniform(0.5, 2.0) * series_sd
+    elif ev < 0.28:
+        for _ in range(int(rng.integers(1, 4))):
+            x[int(rng.integers(0, n))] += (1.0 if rng.random() < 0.75 else -1.0) * rng.uniform(3.0, 12.0) * series_sd
+    elif ev < 0.33:
+        k = int(rng.integers(n // 4, 3 * n // 4))
+        g = np.ones(n)
+        g[k:] = rng.uniform(0.15, 0.5)
+        x = (x - x.mean()) * g + x.mean()
+    if p <= 7:
+        noise_frac = rng.uniform(0.03, 0.22)
+    elif rng.random() < (0.62 if p <= 48 else 0.5):
+        noise_frac = 0.0
+    else:
+        max_noise_frac = 0.3 * min(1.0, p / 64.0)
+        noise_frac = float(np.exp(rng.uniform(np.log(0.004), np.log(max_noise_frac))))
+    if noise_frac > 0:
+        robust_sd = 1.4826 * np.median(np.abs(x - np.median(x)))
+        x = x + noise_frac * min(series_sd, max(robust_sd, 0.1 * series_sd)) * rng.standard_normal(n)
+    else:
+        x = x + 1e-09 * series_sd * rng.standard_normal(n)
+    if rng.random() < 0.78:
+        x = x - x.min() + (0.0 if rng.random() < 0.3 else rng.uniform(0.0, 3.0)) * series_sd
+    else:
+        x = x - np.median(x) + rng.normal(0.0, 0.5) * series_sd
+    rq = rng.random()
+    if rq < 0.25:
+        q = 1.0 if rq < 0.1 and series_sd > 60.0 else series_sd / float(np.exp(rng.uniform(np.log(20.0), np.log(2000.0))))
+        xq = np.round(x / q) * q
+        if np.mean(np.diff(xq) == 0) < 0.045:
+            x = xq
+    x = np.where(np.isfinite(x), x, 0.0)
+    return x.astype(np.float64)
+_pt_LOGLEVEL_KIND_PROBS = np.array([0.32, 0.24, 0.14, 0.2, 0.1])
+
+def _pt_loglevel_log_uniform(rng, lo, hi):
+    return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+
+def _pt_ar1_filter_stationary(z, ar_coef):
+    z = z.copy()
+    z[0] /= np.sqrt(max(1.0 - ar_coef * ar_coef, 1e-12))
+    y = lfilter([1.0], [1.0, -ar_coef], z)
+    return y * np.sqrt(1.0 - ar_coef * ar_coef)
+
+def _pt_ar_smoothed_unit_noise(rng, n, timescale, n_passes):
+    ar_coef = float(np.exp(-1.0 / timescale))
+    y = _pt_ar1_filter_stationary(rng.standard_normal(n), ar_coef)
+    if n_passes == 2:
+        y = _pt_ar1_filter_stationary(y, ar_coef)
+    s = y.std()
+    return y / s if s > 0 else y
+
+def _pt_ar1_student_t_noise(rng, n):
+    df = float(rng.uniform(3.0, 12.0))
+    e = rng.standard_t(df, n)
+    e = e / np.sqrt(df / (df - 2.0))
+    ar_coef = float(rng.uniform(0.3, 0.97)) if rng.random() < 0.9 else 0.0
+    if ar_coef != 0.0:
+        e = lfilter([1.0], [1.0, -ar_coef], e) * np.sqrt(1.0 - ar_coef * ar_coef)
+    return np.clip(e, -8.0, 8.0)
+
+def _pt_random_level_and_scale_shifts(rng, n):
+    k = int(rng.choice(3, p=[0.55, 0.3, 0.15]))
+    level_shift = np.zeros(n)
+    scale_mult = np.ones(n)
+    if k == 0 or n < 32:
+        return (level_shift, scale_mult)
+    change_points = np.sort(rng.integers(int(0.1 * n), int(0.9 * n), size=k))
+    shift_sign = rng.choice([-1.0, 1.0])
+    for c in change_points:
+        level_shift[c:] += shift_sign * rng.uniform(0.1, 0.8)
+        if rng.random() < 0.6:
+            shift_sign = -shift_sign
+        scale_mult[c:] *= _pt_loglevel_log_uniform(rng, 0.4, 2.5)
+    return (level_shift, scale_mult)
+
+def _pt_add_decaying_spikes(rng, x, positive_only):
+    n = x.size
+    spike_rate = _pt_loglevel_log_uniform(rng, 0.001, 0.03)
+    k = int(rng.poisson(spike_rate * n)) if rng.random() < 0.75 else 0
+    if k == 0:
+        return x
+    spike_idx = rng.integers(0, n, size=k)
+    typical_step = np.median(np.abs(np.diff(x))) + 1e-09 * (np.abs(x).mean() + 1e-09)
+    spike_sizes = typical_step * (4.0 + rng.pareto(2.0, size=k) * _pt_loglevel_log_uniform(rng, 3.0, 15.0))
+    spike_sizes = np.minimum(spike_sizes, typical_step * 2000.0)
+    if not positive_only:
+        spike_sizes = spike_sizes * np.where(rng.random(k) < 0.8, 1.0, -1.0)
+    impulses = np.zeros(n)
+    np.add.at(impulses, spike_idx, spike_sizes)
+    if rng.random() < 0.55:
+        decay_coef = float(rng.uniform(0.3, 0.85))
+        impulses = lfilter([1.0], [1.0, -decay_coef], impulses)
+    return x + impulses
+
+def _pt_loglevel_smooth_gp(rng, n):
+    timescale = _pt_loglevel_log_uniform(rng, 15.0, 30.0 + 0.15 * n)
+    log_level_amp = _pt_loglevel_log_uniform(rng, 0.1, 1.0)
+    smooth_level = log_level_amp * _pt_ar_smoothed_unit_noise(rng, n, timescale, int(rng.integers(1, 3)))
+    level_shift, scale_mult = _pt_random_level_and_scale_shifts(rng, n)
+    s = _pt_loglevel_log_uniform(rng, 0.008, 0.2)
+    e = _pt_ar1_student_t_noise(rng, n)
+    log_level = smooth_level + level_shift
+    if rng.random() < 0.6:
+        x = np.exp(log_level + s * scale_mult * e)
+    else:
+        x = np.exp(log_level) * (1.0 + s * scale_mult * e)
+        x = np.abs(x)
+    return _pt_add_decaying_spikes(rng, x, True)
