@@ -3111,3 +3111,87 @@ def c1_build(P, rng, L, cad, cal, cfg):
         if cfg.get("_native_integer_flags", False) else np.ones(n, dtype=bool)
     )
     return out, fl
+
+
+# ═══════════════════ C2 admin_reporting_counts ═════════════════════════════
+
+def c2_params(rng, B, cfg):
+    p = cfg["families"]["admin_reporting_counts"]
+    return {
+        "base": logu(rng, 3.0, 2.0e5, B),
+        "smooth_ell": logu(rng, 30.0, 1500.0, B),
+        "smooth_amp": rng.uniform(0.1, 0.9, B),
+        "batch_on": rng.random(B) < p["batch_rate"],
+        "batch_days": rng.integers(2, 8, B),
+        "revise_on": rng.random(B) < p["revision_rate"],
+        "revise_k": rng.integers(3, 13, B),
+        "revise_depth": rng.uniform(0.05, 0.5, B),
+        "emit": categorical(rng, p["emission_mix"], B),
+        "nb_k": logu(rng, 0.3, 100.0, B),
+        "under_phi": rng.uniform(0.05, 0.9, B),
+        "hol_on": rng.random(B) < p["holiday_rate"],
+        "trend": rng.normal(0.0, 0.35, B),
+        "month_end": rng.random(B) < p["month_end_rate"],
+        "month_end_lift": rng.uniform(1.2, 3.0, B),
+    }
+
+
+def _reporting_layer(P, rng, latent, cal, cfg):
+    """Multiplicative calendar + emission, applied to a non-negative latent."""
+    n, L = latent.shape
+    fac = dow_factors(rng, n, cfg)
+    dow = apply_dow(fac, cal)
+    # holidays only for the rows that use them: the moving-feast masks and the
+    # compensation convolve are full-(rows, L) work, so computing them for
+    # every row and then masking was most of this family's cost.
+    hol_rows = np.nonzero(P["hol_on"])[0]
+    hol = np.ones((n, L))
+    comp = np.zeros((n, L))
+    if hol_rows.size:
+        h_sub, c_sub = holiday_factor(rng, cal.take(hol_rows), cfg)
+        hol[hol_rows] = h_sub
+        comp[hol_rows] = c_sub
+    mu = np.maximum(latent * dow * hol * (1.0 + comp), 0.0)
+    if P["month_end"].any():
+        lift = np.where(month_boundary(cal),
+                        P["month_end_lift"].reshape(n, 1), 1.0)
+        mu = np.where(P["month_end"].reshape(n, 1), mu * lift, mu)
+
+    # one count model per row, sampled only on the rows that select it (the
+    # three full-grid draws + a where() were three times the sampling cost)
+    emit = np.asarray(P["emit"]).reshape(n)
+    y = np.zeros((n, L))
+    r_nb = np.nonzero(emit == 0)[0]
+    r_po = np.nonzero(emit == 1)[0]
+    r_bi = np.nonzero(emit >= 2)[0]
+    if r_nb.size:
+        y[r_nb] = nb_counts(rng, mu[r_nb], P["nb_k"][r_nb])
+    if r_po.size:
+        y[r_po] = rng.poisson(np.minimum(mu[r_po], 1e8)).astype(np.float64)
+    if r_bi.size:
+        phi = P["under_phi"][r_bi].reshape(-1, 1)
+        ntr = np.maximum(np.round(mu[r_bi] / np.maximum(1.0 - phi, 1e-3)), 0.0)
+        ntr = np.minimum(ntr, 1e7)
+        # under-dispersed counts: var = mu * phi < mu.  Exists nowhere in the field.
+        y[r_bi] = rng.binomial(ntr.astype(np.int64),
+                               np.broadcast_to(1.0 - phi, (r_bi.size, L))).astype(np.float64)
+
+    if P["batch_on"].any():
+        rel = batch_release(rng, y, cal, P["batch_days"])
+        y = np.where(P["batch_on"].reshape(n, 1), rel, y)
+    if P["revise_on"].any():
+        rv = revision_ramp(rng, y, P["revise_k"], P["revise_depth"])
+        y = np.where(P["revise_on"].reshape(n, 1), rv, y)
+    return y
+
+
+def c2_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    smooth = matern_gp(rng, n, L, P["smooth_ell"], nu=1.5)
+    latent = P["base"].reshape(n, 1) * np.exp(
+        P["smooth_amp"].reshape(n, 1) * smooth + P["trend"].reshape(n, 1) * t / L)
+    y = _reporting_layer(P, rng, latent, cal, cfg)
+    fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.5, quant_boost=0.15)
+    fl["integer"] = (~P["revise_on"])
+    return y, fl
