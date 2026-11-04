@@ -2690,3 +2690,57 @@ def b2_build(P, rng, L, cad, cal, cfg):
     fl["bounded"] = (P["mode"] == 0)
     fl["scale_mode"] = np.where(P["mode"] == 0, 2, 1).astype(np.int8)
     return y, fl
+
+
+# ═══════════════════════ B3 ops_counter_reset ══════════════════════════════
+
+def b3_params(rng, B, cfg):
+    p = cfg["families"]["ops_counter_reset"]
+    return {
+        "rate": logu(rng, 1.0, 4.0e3, B),
+        "nb_k": logu(rng, 0.4, 60.0, B),
+        "reset_mode": categorical(rng, p["reset_mix"], B),
+        "reset_tau": logu(rng, 400.0, 4000.0, B),
+        "cal_week": rng.random(B) < 0.35,
+        "diurnal_amp": rng.uniform(0.0, 0.9, B),
+        "revise": rng.random(B) < p["revision_rate"],
+        "revise_k": rng.integers(2, 9, B),
+        "revise_depth": rng.uniform(0.02, 0.3, B),
+        "integer": rng.random(B) < 0.55,
+    }
+
+
+def b3_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    ph, has_day = _daily_phase(rng, n, L, cad.p_day)
+    prof = 1.0 + P["diurnal_amp"].reshape(n, 1) * np.where(has_day, np.sin(_cf_prims_TWO_PI * ph), 0.0)
+    mean_inc = P["rate"].reshape(n, 1) * np.maximum(prof, 0.05)
+    inc = nb_counts(rng, mean_inc, P["nb_k"])
+    cont = np.maximum(mean_inc * rng.gamma(np.broadcast_to(
+        np.maximum(P["nb_k"].reshape(n, 1), 1e-2), (n, L))) /
+        np.maximum(P["nb_k"].reshape(n, 1), 1e-2), 0.0)
+    inc = np.where(P["integer"].reshape(n, 1), inc, cont)
+
+    mode = P["reset_mode"].reshape(n, 1)
+    poisson_reset = rng.random((n, L)) < (1.0 / P["reset_tau"].reshape(n, 1))
+    day_idx = cal.day_index
+    period = np.where(P["cal_week"].reshape(n, 1), 7, 1)
+    blk = day_idx // np.maximum(period, 1)
+    cal_reset = np.zeros((n, L), dtype=bool)
+    cal_reset[:, 1:] = blk[:, 1:] != blk[:, :-1]
+    reset = np.where(mode == 0, poisson_reset,
+                     np.where(mode == 1, cal_reset, False))
+    out = np.zeros((n, L))
+    k_counter_reset_cal(np.ascontiguousarray(inc),
+                          np.ascontiguousarray(reset).astype(np.int8), out)
+
+    # revisions: the last few published points are corrected downward
+    if P["revise"].any():
+        age = (L - 1) - np.arange(L)[None, :]
+        w = np.clip(1.0 - age / np.maximum(P["revise_k"].reshape(n, 1), 1), 0.0, 1.0)
+        out = np.where(P["revise"].reshape(n, 1),
+                       out * (1.0 - w * P["revise_depth"].reshape(n, 1)), out)
+
+    fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.5, quant_boost=0.3)
+    fl["integer"] = P["integer"] & (~P["revise"])
+    return out, fl
