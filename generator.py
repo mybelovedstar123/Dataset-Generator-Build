@@ -3616,3 +3616,64 @@ def d2_build(P, rng, L, cad, cal, cfg):
     if cfg.get('_complete_native_renewals', False):
         fl['renewal_extended'] = extended
     return y, fl
+
+
+# ═══════════════ D3 smooth_drift_extrapolable ══════════════════════════════
+
+def d3_params(rng, B, cfg):
+    p = cfg["families"]["smooth_drift_extrapolable"]
+    return {
+        "nu_idx": categorical(rng, p["matern_nu_mix"], B),
+        "ell": logu(rng, p["lengthscale"][0], p["lengthscale"][1], B),
+        "gp_w": rng.uniform(0.2, 1.0, B),
+        "llt_w": rng.uniform(0.2, 1.0, B),
+        "sig_level": logu(rng, 1e-3, 1.0, B),
+        "slope_ratio": logu(rng, 1e-4, 1e-1, B),
+        "damped": rng.random(B) < p["damped_rate"],
+        "damp_phi": rng.uniform(0.80, 0.995, B),
+        "saturating": rng.random(B) < p["saturating_rate"],
+        "sat_kind": rng.integers(0, 2, B),
+        "sat_infl": rng.uniform(-0.4, 1.4, B),
+        "sat_rate": logu(rng, 2.0, 30.0, B),
+        "sat_amp": logu(rng, 0.5, 12.0, B),
+        "obs_ratio": logu(rng, p["obs_noise_ratio"][0], p["obs_noise_ratio"][1], B),
+    }
+
+
+NU_VALUES = (0.5, 1.5, 2.5)
+
+
+def d3_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    gp = np.zeros((n, L))
+    for k, nu in enumerate(NU_VALUES):
+        m = P["nu_idx"] == k
+        c = int(m.sum())
+        if c:
+            gp[m] = matern_gp(rng, c, L, P["ell"][m], nu=nu)
+
+    damp = np.where(P["damped"], P["damp_phi"], 1.0)
+    llt = local_linear_trend(rng, n, L, P["sig_level"],
+                             P["sig_level"] * P["slope_ratio"],
+                             damp=damp)
+    llt = unit_std(llt)
+
+    y = P["gp_w"].reshape(n, 1) * gp + P["llt_w"].reshape(n, 1) * llt
+
+    if P["saturating"].any():
+        x0 = P["sat_infl"].reshape(n, 1) * L
+        k = np.maximum(L / P["sat_rate"].reshape(n, 1), 1.0)
+        logis = 1.0 / (1.0 + np.exp(-np.clip((t - x0) / k, -40.0, 40.0)))
+        gomp = np.exp(-np.exp(-np.clip((t - x0) / k, -40.0, 40.0)))
+        curve = np.where(P["sat_kind"].reshape(n, 1) == 0, logis, gomp)
+        y = np.where(P["saturating"].reshape(n, 1),
+                     y + P["sat_amp"].reshape(n, 1) * curve, y)
+
+    sig = unit_std(y)
+    obs = rng.standard_normal((n, L)) * P["obs_ratio"].reshape(n, 1)
+    y = sig + obs
+
+    fl = new_flags(n, scale_mode=0, quant_boost=0.7)
+    fl["offset_pref"] = np.where(P["obs_ratio"] < 0.02, 1, 0).astype(np.int8)
+    return y, fl
