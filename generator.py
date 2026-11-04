@@ -7251,3 +7251,55 @@ def _coastal_residual(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     y = x * scale + offset
     positive = rng.random((n, 1)) < 0.45
     return np.where(positive, np.abs(y) + 0.05 * scale, y)
+
+
+def _validate_parameters(parameters: dict[str, float], label: str) -> None:
+    if not all(np.isfinite(value) for value in parameters.values()):
+        raise ValueError(f"{label} must contain only finite values")
+    probability_names = {
+        "sa_clean_frac",
+        "integrated_heavy_frac",
+        "integrated_sv_frac",
+        "step_level_exact_frac",
+        "nonneg_integer_frac",
+        "nonneg_integer_min_std_frac",
+        "tsmixup_mean_scale",
+        "tail_rebase_rate",
+        *(key for key in parameters if key.startswith(("observation.", "augment."))),
+    }
+    for name in probability_names:
+        if not 0.0 <= parameters[name] <= 1.0:
+            raise ValueError(f"{label}.{name} must be in [0, 1]")
+    for name in (
+        "tr_exc_lo",
+        "tr_exc_hi",
+        "gr_exc_lo",
+        "gr_exc_hi",
+        "sa_clean_lo",
+        "sa_clean_hi",
+        "step_level_noise_lo",
+        "step_level_noise_hi",
+        "cs_calm_noise",
+        "nonneg_integer_min_std",
+        "flat_level_spread",
+    ):
+        if parameters[name] < 0.0:
+            raise ValueError(f"{label}.{name} must be non-negative")
+    if parameters["step_level_jumps_lo"] < 1.0:
+        raise ValueError(f"{label}.step_level_jumps_lo must be at least 1")
+    if parameters["lm_beta_lo"] >= parameters["lm_beta_hi"]:
+        raise ValueError(f"{label}.lm_beta_lo must be below lm_beta_hi")
+    if parameters["tsmixup_source_alpha"] <= 0.0:
+        raise ValueError(f"{label}.tsmixup_source_alpha must be positive")
+    for lo_name, hi_name in (
+        ("tr_exc_lo", "tr_exc_hi"),
+        ("gr_exc_lo", "gr_exc_hi"),
+        ("sa_clean_lo", "sa_clean_hi"),
+        ("step_level_jumps_lo", "step_level_jumps_hi"),
+        ("step_level_noise_lo", "step_level_noise_hi"),
+        ("observation.irregular_hold_prob_lo", "observation.irregular_hold_prob_hi"),
+        ("observation.shock_prob_lo", "observation.shock_prob_hi"),
+        ("observation.censor_q_lo", "observation.censor_q_hi"),
+    ):
+        if parameters[lo_name] > parameters[hi_name]:
+            raise ValueError(f"{label}.{lo_name} must be <= {hi_name}")
