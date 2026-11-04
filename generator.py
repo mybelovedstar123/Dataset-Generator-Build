@@ -5141,3 +5141,213 @@ def validate(cfg, family_names):
     if cfg["internal_length"] % 32 != 0:
         raise ConfigError("internal_length must be a multiple of 32")
     return cfg
+
+
+# ═══════════════ engine ═══════════════
+def _cumulative_counter_params(rng: np.random.Generator, n: int, cfg: dict) -> dict:
+    """Parameters for persistent usage counters with observable increment laws."""
+    high_dispersion = rng.random(n) < 0.45
+    return {
+        "base": np.exp(rng.uniform(np.log(0.08), np.log(5.0e4), size=n)),
+        "phi": rng.uniform(0.965, 0.9997, size=n),
+        "log_cv": np.exp(rng.uniform(np.log(0.025), np.log(0.85), size=n)),
+        "trend": rng.normal(0.0, 0.45, size=n),
+        "period": np.array([24.0, 48.0, 96.0, 168.0, 336.0])[
+            np.searchsorted(
+                np.array([0.12, 0.52, 0.72, 0.88, 1.0]),
+                rng.random(n), side="right",
+            )
+        ],
+        "season_amp": rng.uniform(0.0, 0.75, size=n),
+        "phase": rng.uniform(0.0, 2.0 * np.pi, size=n),
+        "disp": np.where(
+            high_dispersion,
+            np.exp(rng.uniform(np.log(150.0), np.log(5000.0), size=n)),
+            np.exp(rng.uniform(np.log(0.6), np.log(150.0), size=n)),
+        ),
+        "integer": rng.random(n) < 0.90,
+        "tick": np.power(2.0, rng.integers(0, 11, size=n)),
+        "age": np.exp(rng.uniform(np.log(512.0), np.log(1.0e7), size=n)),
+        "reset": rng.random(n) < 0.10,
+        "reset_at": rng.uniform(0.20, 0.80, size=n),
+    }
+
+
+def _cumulative_counter_build(P: dict, rng: np.random.Generator, L: int,
+                              cad: Any, cal: Any, cfg: dict):
+    """Build monotone cumulative counters without a terminal plateau rewrite."""
+    n = int(cad.n)
+    t = np.arange(L, dtype=np.float64)[None, :]
+    phi = np.asarray(P["phi"], dtype=np.float64).reshape(n, 1)
+    innovation = rng.standard_normal((n, L)) * np.sqrt(
+        np.maximum(1.0 - phi * phi, 1.0e-6)
+    )
+    latent = np.zeros((n, L), dtype=np.float64)
+    k_arma(
+        np.ascontiguousarray(phi), np.ones(n, dtype=np.int64),
+        np.zeros((n, 1), dtype=np.float64), np.zeros(n, dtype=np.int64),
+        np.ascontiguousarray(innovation), latent,
+    )
+    log_rate = (
+        np.asarray(P["log_cv"]).reshape(n, 1) * latent
+        + np.asarray(P["trend"]).reshape(n, 1) * (t / max(L - 1, 1) - 0.5)
+    )
+    seasonal = 1.0 + np.asarray(P["season_amp"]).reshape(n, 1) * np.sin(
+        2.0 * np.pi * t / np.asarray(P["period"]).reshape(n, 1)
+        + np.asarray(P["phase"]).reshape(n, 1)
+    )
+    mean = np.asarray(P["base"]).reshape(n, 1) * np.exp(
+        np.clip(log_rate, -5.0, 5.0)
+    ) * np.maximum(seasonal, 0.05)
+    discrete = nb_counts(rng, mean, np.asarray(P["disp"]))
+    shape = np.maximum(np.asarray(P["disp"]).reshape(n, 1), 1.0e-3)
+    continuous = mean * rng.gamma(np.broadcast_to(shape, (n, L))) / shape
+    increments = np.where(
+        np.asarray(P["integer"]).reshape(n, 1), discrete, continuous
+    )
+    tick = np.asarray(P["tick"]).reshape(n, 1)
+    increments = np.where(
+        np.asarray(P["integer"]).reshape(n, 1),
+        np.rint(increments) * tick,
+        increments,
+    )
+    initial = np.asarray(P["base"]).reshape(n, 1) * np.asarray(P["age"]).reshape(n, 1)
+    initial = np.where(
+        np.asarray(P["integer"]).reshape(n, 1), np.rint(initial / tick) * tick,
+        initial,
+    )
+    out = initial + np.cumsum(np.maximum(increments, 0.0), axis=1)
+    reset_rows = np.nonzero(np.asarray(P["reset"], dtype=bool))[0]
+    for row in reset_rows:
+        at = int(np.clip(P["reset_at"][row] * L, 1, L - 1))
+        out[row, at:] -= out[row, at - 1]
+    flags = new_flags(
+        n, scale_mode=2, positive=True, obs_boost=0.0,
+        quant_boost=0.0, allow_agg=False,
+    )
+    flags["integer"] = np.asarray(P["integer"], dtype=bool).copy()
+    return out, flags
+
+
+# Replace only the native counter slot. The registry index and every other
+# family remain unchanged, so this is a bounded family-law intervention.
+_counter_index = FAMILY_INDEX["ops_counter_reset"]
+_counter_families = list(FAMILIES)
+_counter_spec = _counter_families[_counter_index]
+_counter_families[_counter_index] = _counter_spec._replace(
+    params=_cumulative_counter_params,
+    build=_cumulative_counter_build,
+)
+FAMILIES = tuple(_counter_families)
+
+
+# Station thermometers and barometers publish in fixed units: tenths of a
+# degree or of a hectopascal, whole degrees, or whole Fahrenheit degrees
+# converted to Celsius. The thermal and pressure laws emit anomalies of a few
+# natural units, so an integer publication step turns them into staircases of
+# three to six levels; expressing each row in a drawn published unit restores
+# the measured station resolution (a tick of 1-5% of the series spread).
+def _met_published_units(build, units, probs, natural_lo, natural_hi):
+    units = np.asarray(units, dtype=np.float64)
+    probs = np.asarray(probs, dtype=np.float64)
+
+    def published(P, rng, L, cad, cal, cfg):
+        y, flags = build(P, rng, L, cad, cal, cfg)
+        n = y.shape[0]
+        unit = rng.choice(units, size=n, p=probs)
+        natural = np.exp(rng.uniform(np.log(natural_lo), np.log(natural_hi), size=n))
+        return y * (unit * natural)[:, None], flags
+
+    return published
+
+
+_met_families = list(FAMILIES)
+for _met_name, _met_units, _met_probs, _met_lo, _met_hi in (
+        ("met_thermal", (10.0, 1.8, 1.0), (0.6, 0.2, 0.2), 1.0, 1.0),
+        ("met_pressure_smooth", (10.0, 1.0), (0.85, 0.15), 4.0, 10.0)):
+    _met_index = FAMILY_INDEX[_met_name]
+    _met_spec = _met_families[_met_index]
+    _met_families[_met_index] = _met_spec._replace(
+        build=_met_published_units(_met_spec.build, _met_units, _met_probs,
+                                   _met_lo, _met_hi))
+FAMILIES = tuple(_met_families)
+
+_CF_CFG: dict = json.loads(
+    Path(__file__).with_name("config.json").read_text(encoding="utf-8")
+)["chronoforge"]
+_CF_COARSE = coarse_pref_vector(_CF_CFG)
+
+CF_GRAFT: tuple[str, ...] = (
+    'ops_diurnal_traffic',
+    'ops_saturating_feedback',
+    'ops_counter_reset',
+    'ops_latency_queue',
+    'ops_deploy_transient',
+    'ops_rate_plateau',
+    'epi_renewal',
+    'admin_reporting_counts',
+    'physio_quasiperiodic',
+    'clinical_bounded_vitals',
+    'met_thermal',
+    'met_pressure_smooth',
+    'met_bounded_atom',
+    'met_wind_speed',
+    'wet_dry_intermittent',
+    'regime_dwell_flat',
+    'regime_dwell_microdrift',
+    'regime_dwell_intcounter',
+    'regime_dwell_zerosparse',
+    'regime_dwell_transitional',
+    'level_ladder_staircase',
+    'smooth_drift_extrapolable',
+    'arma_sarima',
+    'garch_leverage',
+    'hawkes_marked',
+    'chaotic_delay',
+    'spectral_kernel_zoo',
+    'changepoint_composite',
+    'energy_load_price_solar',
+    'transport_flow',
+    'retail_promo_intermittent',
+    'econ_release_staircase',
+)
+
+
+def _cf_builder(name: str, config: dict | None = None):
+    """Adapt the native builder without discarding its per-row capabilities.
+
+    The ordinary callable still returns only an array, preserving the original
+    interface and draw order. The host may explicitly request metadata through
+    ``with_metadata``; metadata is local to the call, never thread-global.
+    """
+    f = FAMILY_INDEX[name]
+    spec = FAMILIES[f]
+    cf_config = _CF_CFG if config is None else config
+    pref = float(coarse_pref_vector(cf_config)[f])
+
+    def build_with_metadata(rng: np.random.Generator, n: int, L: int):
+        cad = draw_cadence(rng, n, np.full(n, pref), cf_config)
+        cal = draw_calendar(rng, n, L, cad.p_day)
+        P = spec.params(rng, n, cf_config)
+        y, flags = spec.build(P, rng, L, cad, cal, cf_config)
+        return np.ascontiguousarray(y, dtype=np.float64), flags
+
+    def build(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+        y, _ = build_with_metadata(rng, n, L)
+        return y
+
+    build.__name__ = f"_cf_{name}"
+    build.with_metadata = build_with_metadata
+    return build
+
+
+CF_BUILDERS: tuple = tuple(_cf_builder(name) for name in CF_GRAFT)
+
+
+def chunk_batch_size(produced: int) -> int:
+    """Match Midas v47 monolithic chunk ramp (256 → 1024 → 2048)."""
+    if produced == 0:
+        return _STARTUP_CHUNK
+    if produced == _STARTUP_CHUNK:
+        return _RAMP_CHUNK
+    return _CHUNK
