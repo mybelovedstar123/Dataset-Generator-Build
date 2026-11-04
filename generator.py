@@ -3822,3 +3822,65 @@ def e1_build(P, rng, L, cad, cal, cfg):
 
     fl = new_flags(n, scale_mode=0, quant_boost=0.9)
     return out, fl
+
+
+# ═══════════════════════════ E2 garch_leverage ═════════════════════════════
+
+def e2_params(rng, B, cfg):
+    p = cfg["families"]["garch_leverage"]
+    persist = rng.uniform(p["persistence"][0], p["persistence"][1], B)
+    lev = rng.uniform(0.0, 1.5, B)
+    alpha = rng.uniform(0.02, 0.14, B)
+    gamma = alpha * lev
+    beta = np.maximum(persist - alpha - 0.5 * gamma, 0.05)
+    return {
+        "omega": logu(rng, 1e-8, 1e-3, B),
+        "alpha": alpha,
+        "gamma": gamma,
+        "beta": beta,
+        "student": rng.random(B) < p["student_rate"],
+        "nu": rng.uniform(3.5, 12.0, B),
+        "emit": categorical(rng, p["emit_mix"], B),
+        "arma_mean": rng.random(B) < p["arma_mean_rate"],
+        "mean_phi": rng.uniform(-0.3, 0.4, B),
+        "s0": logu(rng, 1.0, 5.0e4, B),
+        "mu_drift": rng.normal(0.0, 3e-4, B),
+    }
+
+
+def e2_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    z = rng.standard_normal((n, L))
+    if P["student"].any():
+        nu = np.maximum(P["nu"].reshape(n, 1), 2.5)
+        g = rng.chisquare(np.broadcast_to(nu, (n, L))) / nu
+        tt = z / np.sqrt(np.maximum(g, 1e-9)) * np.sqrt((nu - 2.0) / nu)
+        z = np.where(P["student"].reshape(n, 1), tt, z)
+
+    r = np.zeros((n, L))
+    sd = np.zeros((n, L))
+    k_garch(np.ascontiguousarray(P["omega"]), np.ascontiguousarray(P["alpha"]),
+              np.ascontiguousarray(P["gamma"]), np.ascontiguousarray(P["beta"]),
+              np.ascontiguousarray(z), r, sd)
+
+    if P["arma_mean"].any():
+        mean = np.zeros((n, L))
+        k_arma(np.ascontiguousarray(P["mean_phi"].reshape(n, 1)),
+                 np.ones(n, dtype=np.int64), np.zeros((n, 1)),
+                 np.zeros(n, dtype=np.int64), np.ascontiguousarray(r), mean)
+        r = np.where(P["arma_mean"].reshape(n, 1), mean, r)
+    r = r + P["mu_drift"].reshape(n, 1)
+
+    price = P["s0"].reshape(n, 1) * np.exp(np.clip(np.cumsum(r, axis=1), -50.0, 50.0))
+    rv = decay_convolve(sd ** 2, np.full(n, 24.0)) * 24.0
+    emit = P["emit"].reshape(n, 1)
+    y = np.where(emit == 0, r, np.where(emit == 1, price, np.sqrt(np.maximum(rv, 0.0))))
+
+    fl = new_flags(n, scale_mode=0, quant_boost=0.9)
+    # mean-zero return series have a small sum|y| and are therefore the
+    # relative-WQL amplifiers; anchor them at zero rather than on a big offset
+    fl["offset_pref"] = np.where(P["emit"] == 0, 3,
+                                 np.where(P["emit"] == 1, 1, 2)).astype(np.int8)
+    fl["scale_mode"] = np.where(P["emit"] == 0, 0, 1).astype(np.int8)
+    fl["positive"] = (P["emit"] > 0)
+    return y, fl
