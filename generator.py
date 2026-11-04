@@ -10714,3 +10714,157 @@ def _dispersion_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             r = np.maximum(mu[i] / (p_i - 1.0), 1.0e-6)
             out[i] = rng.negative_binomial(r, r / (r + mu[i]))
     return out
+
+
+def _dispatch_blocks(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """An asset that is off at exactly zero, then holds a level when on.
+
+    Scale-free measurement of the pool found energy's real dispersion gap: 28.4% of
+    its integer series sit above our CV^2 ceiling, where CV^2 = var/mean^2 is the
+    dispersion a scale-normalising model can actually see. The raw Fano gap was
+    checked first and largely discarded -- web_cloudops reads 22.2% uncovered on
+    raw Fano but only 7.9% scale-free, so most of that hole was series magnitude,
+    which the metric penalises and the model ignores.
+
+    Splitting energy's integer rows at CV^2 = 3 separates two populations sharing
+    almost nothing. The high group, 28 of 88 rows, runs CV^2 17.9 with 46% exact
+    zeros, 82% held values, max/mean 45, a median at 2% of the mean, and 5% unique
+    values. A median that far below the mean with that few distinct values is not a
+    spiky series with noise on top; it is a *blocky* one: dispatchable generation,
+    curtailment, a plant cycling on and off, a battery charging.
+
+    ``_intermittent`` is the closest existing family and it is the wrong shape.
+    Independent Bernoulli occurrence with gamma magnitudes produces isolated
+    spikes, so it can raise the zero fraction but can never hold a level across a
+    sustained run. Nothing in the other 36 families does either.
+
+    Alternating off and on runs; a heavy-tailed level per on-run, which is what
+    carries CV^2 since a single repeated level would give a two-valued series with
+    CV^2 near 1; optional ramps at the block edges; and either coarse reporting
+    (quantised to a few levels) or mild within-block wander, since a series that is
+    piecewise constant to the sample lands at a third of the archetype's
+    unique-value fraction.
+
+    Built by run rather than by sample. Since the shortest run is 4 steps there can
+    never be more than L // 4 + 2 runs, so every draw a row needs is taken in one
+    vectorised call up front and the runs are expanded with ``repeat``. The obvious
+    formulation walks the row in a Python ``while`` loop, but a row whose off scale
+    sits at the low end of its log-uniform range holds a few hundred runs, each
+    paying scalar-Generator and small-array overhead; that costs roughly ten times
+    what the arithmetic does and it is paid inside the training process's producer
+    thread, where it holds the GIL against the training loop.
+    """
+    out = np.zeros((n, L), dtype=np.float64)
+    idx = np.arange(L)
+    for row in range(n):
+        on_frac = float(rng.uniform(0.25, 0.80))
+        off_hi = float(np.exp(rng.uniform(np.log(24.0), np.log(400.0))))
+        on_hi = off_hi * on_frac / max(1.0 - on_frac, 1e-6)
+        sigma = float(rng.uniform(1.2, 3.0))
+        base = float(np.exp(rng.uniform(np.log(1.0), np.log(3000.0))))
+        ramp = float(rng.uniform(0.0, 0.35))
+        quant = rng.random() < 0.5
+        first_on = rng.random() < on_frac
+
+        cap = L // 4 + 2
+        # Run i is an on-run when its parity matches the row's opening state.
+        on_run = (np.arange(cap) % 2 == 0) == bool(first_on)
+        hi = np.where(on_run, max(5.0, on_hi), max(5.0, off_hi))
+        spans = (4.0 + rng.random(cap) * (hi - 4.0)).astype(np.int64)
+
+        ends = np.cumsum(spans)
+        nrun = int(np.searchsorted(ends, L, side="left")) + 1
+        nrun = min(nrun, cap)
+        spans = spans[:nrun].copy()
+        on_run = on_run[:nrun]
+        # Trim the final run so the runs tile exactly L samples.
+        spans[nrun - 1] -= int(ends[nrun - 1] - L)
+        if spans[nrun - 1] <= 0:
+            spans[nrun - 1] = 1
+
+        levels = base * np.exp(rng.normal(0.0, sigma, size=nrun))
+        run_of = np.repeat(np.arange(nrun), spans)[:L]
+        size_of = spans[run_of]
+        active = on_run[run_of]
+        val = np.where(active, levels[run_of], 0.0)
+
+        if ramp > 0.0:
+            start_of = np.repeat(np.cumsum(spans) - spans, spans)[:L]
+            head = idx - start_of
+            tail = size_of - 1 - head
+            k = np.maximum((size_of * ramp).astype(np.int64), 1)
+            den = np.maximum(k - 1, 1)
+            wide = k > 1
+            # linspace(0.2, 1.0, k) at the run head, its mirror at the tail; a
+            # single-sample ramp degenerates to linspace's lone endpoint.
+            up = np.where(wide, 0.2 + 0.8 * head / den, 0.2)
+            down = np.where(wide, 1.0 - 0.8 * (k - 1 - tail) / den, 1.0)
+            edge = size_of > 4
+            val = val * np.where(edge & (head < k), up, 1.0)
+            val = val * np.where(edge & (tail < k), down, 1.0)
+
+        if quant:
+            step = np.maximum(
+                levels[run_of] / rng.integers(2, 9, size=nrun)[run_of], 1e-9
+            )
+            val = np.where(active, np.round(val / step) * step, val)
+        else:
+            wander = 1.0 + rng.normal(0.0, 0.06, size=L)
+            val = np.where(active & (size_of > 2), val * wander, val)
+
+        out[row] = val
+    return np.clip(np.rint(out), 0.0, None)
+
+
+def _intermittent(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+
+
+    t = _time_index(L)
+    base_p = rng.uniform(0.03, 0.35, size=(n, 1))
+    period = rng.choice([7.0, 12.0, 24.0, 48.0, 168.0], size=(n, 1))
+    season = rng.uniform(0.2, 1.2, size=(n, 1)) * np.sin(
+        2.0 * np.pi * t / period + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
+    )
+    logit = np.log(base_p / (1.0 - base_p)) + season
+    p = 1.0 / (1.0 + np.exp(-logit))
+    occur = (rng.random((n, L)) < p).astype(np.float64)
+    magnitude = np.maximum(
+        1.0,
+        np.rint(
+        rng.gamma(shape=2.0, scale=1.0, size=(n, L))
+        * rng.uniform(1.0, 10.0, size=(n, 1))
+        * np.exp(0.25 * season)
+        ),
+    )
+    return occur * magnitude
+
+
+def _pulse_outlier(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+
+
+    base = _spectral_gp(rng, n, L) * rng.uniform(0.5, 2.0, size=(n, 1))
+    base += _seasonal(rng, n, L, k_max=1) * rng.uniform(0.0, 1.0, size=(n, 1))
+    sharp = _sparse_jumps(
+        rng, n, L, rate=3.0 / L, scale=rng.uniform(3.0, 8.0, size=n)
+    )
+    impulses = _sparse_jumps(
+        rng, n, L, rate=2.0 / L, scale=rng.uniform(2.0, 7.0, size=n)
+    )
+    recovery = _ar1_batch(impulses, rng.uniform(0.75, 0.995, size=n))
+    series = base + sharp + recovery
+
+
+    starts = rng.random((n, L)) < (2.0 / L)
+    starts[:, 0] = False
+    for row in range(n):
+        for start in np.nonzero(starts[row])[0]:
+            run = int(rng.integers(3, 65))
+            end = min(int(start) + run, L)
+            series[row, start:end] = series[row, start - 1]
+    return series
+
+
+_CS_CALM_LO = 192
+_CS_CALM_HI = 1024
+_CS_DYNAMIC_LO = 96
+_CS_DYNAMIC_HI = 512
