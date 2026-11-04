@@ -16595,3 +16595,286 @@ def _pt_coerce_length_pad_last_value(x, n):
     if not np.all(np.isfinite(x)):
         x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     return np.ascontiguousarray(x, dtype=np.float64)
+
+def _pt_sparse_pulse_response_series(rng, n):
+    n = int(n)
+    event_rate = float(np.exp(rng.uniform(np.log(0.002), np.log(0.009))))
+    k = int(rng.poisson(event_rate * n))
+    u = np.zeros(n, dtype=np.float64)
+    if k > 0:
+        event_idx = rng.integers(0, n, size=k)
+        event_sizes = np.exp(rng.normal(0.0, rng.uniform(0.5, 1.3), size=k))
+        np.add.at(u, event_idx, event_sizes)
+        if rng.random() < 0.35:
+            echo_lags = rng.integers(1, 4, size=k)
+            np.add.at(u, np.minimum(event_idx + echo_lags, n - 1), event_sizes * rng.uniform(0.2, 0.7))
+    if rng.random() < 0.52:
+        quiet_tail_len = int(min(n - 8, np.exp(rng.uniform(np.log(48.0), np.log(700.0)))))
+        if quiet_tail_len > 0:
+            u[n - quiet_tail_len:] = 0.0
+    sharp_regime = rng.random() < 0.5
+    rise_time = float(np.exp(rng.uniform(np.log(1.0), np.log(3.0))) if sharp_regime else np.exp(rng.uniform(np.log(2.5), np.log(16.0))))
+    decay_half_life = float(np.exp(rng.uniform(np.log(14.0), np.log(2057.0))))
+    rise_coef = float(np.clip(np.exp(-1.0 / rise_time), 0.0, 0.999))
+    decay_coef = float(np.clip(2.0 ** (-1.0 / decay_half_life), 0.0, 0.99999))
+    if decay_coef <= rise_coef:
+        decay_coef = min(0.99999, rise_coef + 0.001)
+    tail_coef = float(np.clip(2.0 ** (-1.0 / (decay_half_life * rng.uniform(4.0, 30.0))), 0.0, 0.999995))
+    qk = _pt_rise_decay_pulse_filter(u, rise_coef, decay_coef, tail_coef, rng.uniform(0.3, 3.0))
+    mx = float(qk.max())
+    if mx > 0.0:
+        qk = qk / mx
+    P = _pt_pick_period_min_three_cycles(rng, n)
+    t = np.arange(n, dtype=np.float64)
+    wave_period = P * float(np.exp(rng.uniform(np.log(20.0), np.log(400.0))))
+    slow_wave = _pt_slow_sine_with_end_phase(rng, n, wave_period, rng.uniform(0.0, 0.8), 0.75)
+    pulse_decades = float(np.exp(rng.uniform(np.log(0.25), np.log(2.2))) if sharp_regime else np.exp(rng.uniform(np.log(0.02), np.log(0.6))))
+    log_level = np.log(10.0) * pulse_decades * qk + slow_wave
+    if rng.random() < 0.3:
+        log_level += rng.uniform(0.005, 0.06) * np.sin(2.0 * np.pi * t / P + rng.uniform(0, 2 * np.pi))
+    noise_timescale = float(np.exp(rng.uniform(np.log(30.0), np.log(600.0))))
+    noise_ar_coef = float(np.clip(np.exp(-1.0 / noise_timescale), 0.0, 0.99999))
+    ar_noise = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - noise_ar_coef * noise_ar_coef)), np.zeros(n), noise_ar_coef, 0.0, 1.0, 0.0)
+    ms = float(np.std(ar_noise))
+    log_level = log_level + rng.uniform(0.0, 0.2) * pulse_decades * ar_noise / (ms if ms > 0 else 1.0)
+    log_level += _pt_outlier_contaminated_noise(rng, n, rng.uniform(0.00015, 0.0022) if sharp_regime else rng.uniform(0.0008, 0.016))
+    base_level = float(np.exp(rng.uniform(np.log(0.03), np.log(400.0))))
+    x = base_level * np.exp(log_level - log_level.mean())
+    mode = rng.random()
+    if mode < 0.35:
+        x = np.sign(x) * np.abs(x) ** rng.uniform(0.35, 0.65)
+        x = x - x.min()
+        if rng.random() < 0.75:
+            x = x + float(np.exp(rng.uniform(np.log(0.5), np.log(8000.0))))
+        elif rng.random() < 0.4:
+            x = x - rng.uniform(0.2, 4.0) * float(np.std(x) + 1e-09)
+    elif mode < 0.5:
+        x = x - x.min() + float(np.exp(rng.uniform(np.log(1.0), np.log(300.0))))
+    target_flat_frac = float(np.clip(rng.beta(3.0, 2.6), 0.02, 0.94))
+    x, _ = _pt_quantize_to_flat_fraction(rng, x, target_flat_frac)
+    x = _pt_maybe_add_stuck_holds(rng, x, 0.26, n)
+    return _pt_coerce_length_pad_last_value(x, n)
+
+def _pt_integrated_ar_mixture_series(rng, n):
+    n = int(n)
+    P = _pt_pick_period_min_three_cycles(rng, n)
+    t = np.arange(n, dtype=np.float64)
+    velocity_ar_coef = float(np.clip(rng.uniform(0.3, 0.9995), 0.0, 0.9999))
+    mean_reversion = float(np.exp(rng.uniform(np.log(2e-05), np.log(0.003))))
+    e = rng.standard_normal(n)
+    x = _pt_leaky_integrate_ar1_velocity(e, velocity_ar_coef, mean_reversion)
+    s = float(np.std(x))
+    if s <= 0.0:
+        s = 1.0
+    x = x / s
+    r = rng.random()
+    if r < 0.3:
+        k = 1 + int(rng.integers(0, 2))
+        harmonic_amps = np.exp(rng.uniform(np.log(0.05), np.log(1.4), size=k)) / (1.0 + np.arange(k))
+        ph = rng.uniform(0.0, 2.0 * np.pi, size=k)
+        seasonal = _pt_sum_period_harmonics(n, float(P), harmonic_amps, ph)
+        if rng.random() < 0.45:
+            amp_modulation = 1.0 + rng.uniform(0.1, 0.5) * np.sin(2.0 * np.pi * t / (P * rng.uniform(12.0, 16.0)) + rng.uniform(0, 2 * np.pi))
+            seasonal = seasonal * amp_modulation
+        x = x + seasonal
+    if rng.random() < 0.7:
+        x = x + _pt_slow_sine_with_end_phase(rng, n, P * float(np.exp(rng.uniform(np.log(15.0), np.log(500.0)))), rng.uniform(0.3, 2.4), 0.72)
+    if rng.random() < 0.2:
+        k = 1 + int(rng.integers(0, 3))
+        shift_points = np.sort(rng.integers(n // 10, n, size=k))
+        level_shifts = np.zeros(n, dtype=np.float64)
+        for c in shift_points:
+            level_shifts[int(c):] += rng.normal(0.0, rng.uniform(0.3, 2.5))
+        x = x + level_shifts
+    noise_timescale = float(np.exp(rng.uniform(np.log(20.0), np.log(400.0))))
+    noise_ar_coef = float(np.clip(np.exp(-1.0 / noise_timescale), 0.0, 0.99999))
+    ar_noise = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - noise_ar_coef * noise_ar_coef)), np.zeros(n), noise_ar_coef, 0.0, 1.0, 0.0)
+    ms = float(np.std(ar_noise))
+    x = x + rng.uniform(0.0, 0.7) * ar_noise / (ms if ms > 0 else 1.0)
+    x = x + _pt_outlier_contaminated_noise(rng, n, float(np.exp(rng.uniform(np.log(0.0025), np.log(0.1)))))
+    x = x / (float(np.std(x)) + 1e-12)
+    cv = float(np.exp(rng.uniform(np.log(0.005), np.log(1.5))))
+    base_level = float(np.exp(rng.uniform(np.log(0.05), np.log(1500.0))))
+    x = base_level * (1.0 + cv * x)
+    if rng.random() < 0.85:
+        m = float(x.min())
+        if m < 0.0:
+            x = x - m + rng.uniform(0.0, 0.05) * base_level
+    target_flat_frac = float(np.clip(rng.beta(1.4, 3.6), 0.01, 0.92))
+    x, _ = _pt_quantize_to_flat_fraction(rng, x, target_flat_frac)
+    x = _pt_maybe_add_stuck_holds(rng, x, 0.26, n)
+    return _pt_coerce_length_pad_last_value(x, n)
+
+def _pt_two_timescale_weather_series(rng, n):
+    n = int(n)
+    P = _pt_pick_period_min_three_cycles(rng, n)
+    t = np.arange(n, dtype=np.float64)
+    fast_timescale = max(1.0, P * float(np.exp(rng.uniform(np.log(0.01), np.log(0.4)))))
+    slow_timescale = max(fast_timescale * 1.5, P * float(np.exp(rng.uniform(np.log(0.8), np.log(10.0)))))
+    a1 = float(np.clip(np.exp(-1.0 / fast_timescale), 0.0, 0.99999))
+    a2 = float(np.clip(np.exp(-1.0 / slow_timescale), 0.0, 0.999999))
+    slow_weight = float(rng.uniform(0.25, 0.97))
+    n1 = np.sqrt(max(1e-12, 1.0 - a1 * a1))
+    n2 = np.sqrt(max(1e-12, 1.0 - a2 * a2))
+    ar_mix = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * n1, rng.standard_normal(n) * n2, a1, a2, 1.0 - slow_weight, slow_weight)
+    rs = float(np.std(ar_mix))
+    ar_mix = ar_mix / (rs if rs > 0 else 1.0)
+    nh = 1 + int(rng.integers(0, 3))
+    a0 = float(np.exp(rng.uniform(np.log(0.1), np.log(3.0))))
+    harmonic_amps = a0 * np.exp(rng.uniform(-0.6, 0.0, size=nh)) / (1.0 + np.arange(nh))
+    ph = rng.uniform(0.0, 2.0 * np.pi, size=nh)
+    seasonal = _pt_sum_period_harmonics(n, float(P), harmonic_amps, ph)
+    if rng.random() < 0.7:
+        mod = 1.0 + rng.uniform(0.15, 0.7) * _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - a2 * a2)), np.zeros(n), a2, 0.0, 1.0, 0.0)
+        seasonal = seasonal * np.clip(mod, 0.0, 3.0)
+    slow_wave = 0.0
+    if rng.random() < 0.78:
+        slow_wave = _pt_slow_sine_with_end_phase(rng, n, P * float(np.exp(rng.uniform(np.log(20.0), np.log(400.0)))), rng.uniform(0.15, 1.1), 0.6)
+    y = seasonal + ar_mix + slow_wave
+    y = y + _pt_outlier_contaminated_noise(rng, n, rng.uniform(0.0015, 0.055))
+    y = y - y.mean()
+    ys = float(np.std(y))
+    y = y / (ys if ys > 0 else 1.0)
+    sensor_kind = _pt_draw_weighted_value(rng, np.array([0, 1, 2, 3, 4]), np.array([0.44, 0.1, 0.08, 0.14, 0.24]))
+    if sensor_kind == 0:
+        x = rng.normal(rng.uniform(-2.0, 26.0), 1.0) + y * float(np.exp(rng.uniform(np.log(0.8), np.log(12.0))))
+        target_flat_frac = float(np.clip(rng.beta(1.5, 9.0), 0.005, 0.5))
+    elif sensor_kind == 1:
+        x = rng.uniform(995.0, 1022.0) + y * rng.uniform(4.0, 14.0)
+        target_flat_frac = float(np.clip(rng.beta(1.6, 12.0), 0.005, 0.4))
+    elif sensor_kind == 2:
+        x = rng.uniform(58.0, 86.0) + y * rng.uniform(9.0, 26.0)
+        x = np.clip(x, 0.0, 100.0)
+        x = np.round(x)
+        return _pt_coerce_length_pad_last_value(_pt_maybe_add_stuck_holds(rng, x, 0.05, n), n)
+    elif sensor_kind == 3:
+        m = float(np.exp(rng.uniform(np.log(0.8), np.log(18.0))))
+        x = m * np.exp(rng.uniform(0.35, 0.8) * y)
+        if rng.random() < 0.5:
+            x = x - x.min() * rng.uniform(0.9, 1.0)
+        target_flat_frac = float(np.clip(rng.beta(2.2, 7.0), 0.01, 0.6))
+    else:
+        slow_baseline = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - a2 * a2)), np.zeros(n), min(0.99999, float(np.exp(-1.0 / (slow_timescale * rng.uniform(3.0, 30.0))))), 0.0, 1.0, 0.0)
+        bs = float(np.std(slow_baseline))
+        slow_baseline = slow_baseline / (bs if bs > 0 else 1.0)
+        x = rng.uniform(4.0, 30.0) + slow_baseline * rng.uniform(0.3, 6.0) + 0.05 * y
+        target_flat_frac = float(np.clip(rng.beta(2.5, 6.0), 0.01, 0.7))
+    x, _ = _pt_quantize_to_flat_fraction(rng, x, target_flat_frac)
+    x = _pt_maybe_add_stuck_holds(rng, x, 0.04, n)
+    return _pt_coerce_length_pad_last_value(x, n)
+
+def _pt_markov_intermittent_precip_series(rng, n):
+    n = int(n)
+    on_fraction = float(np.clip(np.exp(rng.uniform(np.log(0.035), np.log(0.34))), 0.005, 0.5))
+    p_stay_on = float(rng.uniform(0.6, 0.95))
+    p_turn_on = float(on_fraction * (1.0 - p_stay_on) / max(1e-06, 1.0 - on_fraction))
+    p_turn_on = float(min(0.95, max(1e-05, p_turn_on)))
+    on_mask = _pt_two_state_markov_mask(rng.random(n), p_stay_on, p_turn_on).astype(np.float64)
+    envelope_timescale = float(np.exp(rng.uniform(np.log(30.0), np.log(600.0))))
+    envelope_ar_coef = float(np.clip(np.exp(-1.0 / envelope_timescale), 0.0, 0.9999))
+    envelope = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - envelope_ar_coef * envelope_ar_coef)), np.zeros(n), envelope_ar_coef, 0.0, 1.0, 0.0)
+    es = float(np.std(envelope))
+    envelope = np.exp(rng.uniform(0.3, 1.4) * envelope / (es if es > 0 else 1.0) + _pt_slow_sine_with_end_phase(rng, n, max(200.0, n * rng.uniform(0.4, 2.0)), rng.uniform(0.0, 0.9), 0.68))
+    intensity_ar_coef = float(np.clip(rng.uniform(0.0, 0.85), 0.0, 0.99))
+    lm = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - intensity_ar_coef * intensity_ar_coef)), np.zeros(n), intensity_ar_coef, 0.0, 1.0, 0.0)
+    intensity = np.exp(rng.uniform(0.0, 1.6) + rng.uniform(0.6, 1.3) * lm)
+    out = on_mask * np.maximum(1.0, np.round(intensity * envelope))
+    if rng.random() < 0.7 and n > 500:
+        dropout_limit = n - 96 if rng.random() < 0.8 else n
+        d0 = int(rng.integers(0, max(1, dropout_limit - 150)))
+        d1 = min(dropout_limit, d0 + int(np.exp(rng.uniform(np.log(250.0), np.log(1800.0)))))
+        if d1 > d0:
+            out[d0:d1] = 0.0
+    if not np.any(out > 0.0):
+        k = 1 + int(rng.integers(0, 4))
+        fallback_idx = rng.integers(0, n, size=k)
+        out[fallback_idx] = np.maximum(1.0, np.round(np.exp(rng.uniform(0.0, 1.6, size=k))))
+    q = _pt_draw_weighted_value(rng, np.array([0.01, 0.1, 0.2, 0.001]), np.array([0.66, 0.24, 0.05, 0.05]))
+    out = out * q
+    if rng.random() < 0.15:
+        c = np.cumsum(out)
+        if rng.random() < 0.6 and n > 200:
+            m = 1 + int(rng.integers(0, 3))
+            for reset_idx in np.sort(rng.integers(n // 5, n, size=m)):
+                c[int(reset_idx):] -= c[int(reset_idx)]
+        out = _pt_round_to_step(c, q)
+    return _pt_coerce_length_pad_last_value(out, n)
+_pt_OCC_STEPS_PER_DAY = np.array([1440.0, 288.0, 720.0, 480.0, 144.0, 96.0])
+_pt_OCC_STEPS_PER_DAY_WEIGHTS = np.array([0.52, 0.3, 0.06, 0.05, 0.04, 0.03])
+_pt_OCC_JUMP_SIZE_CDF = np.array([0.6404, 0.8216, 0.8973, 0.9365, 0.9583, 0.9714, 0.9794, 0.9846])
+
+def _pt_occ_weighted_choice(rng, values, weights):
+    i = int(np.searchsorted(np.cumsum(weights), rng.random()))
+    return float(values[min(i, len(values) - 1)])
+
+def _pt_occ_log_uniform(rng, lo, hi):
+    return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+
+def _pt_occ_draw_capacity(rng, lo, hi):
+    return float(max(2.0, np.round(_pt_occ_log_uniform(rng, lo, hi))))
+
+def _pt_occ_time_of_day_weekend(rng, n, steps_per_day):
+    t = np.arange(n, dtype=np.float64) + rng.uniform(0.0, steps_per_day)
+    tod = t / steps_per_day % 1.0
+    dow = np.floor(t / steps_per_day).astype(np.int64) % 7
+    return (tod, dow >= 5)
+
+def _pt_occ_circular_bump(tod, center, width):
+    d = np.abs(tod - center)
+    d = np.minimum(d, 1.0 - d)
+    return np.exp(-0.5 * (d / width) ** 2)
+
+def _pt_occ_ar1_noise(rng, n, corr_steps, sd):
+    ar_coef = float(np.exp(-1.0 / max(corr_steps, 0.001)))
+    innovations = rng.standard_normal(n) * (sd * np.sqrt(max(1.0 - ar_coef * ar_coef, 1e-12)))
+    innovations[0] = rng.standard_normal() * sd
+    return lfilter(np.array([1.0]), np.array([1.0, -ar_coef]), innovations)
+
+@njit(cache=False, fastmath=False)
+def _pt_occ_ar1_filter(innovations, ar_coef):
+    n = innovations.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    s = innovations[0]
+    out[0] = s
+    for t in range(1, n):
+        s = ar_coef * s + innovations[t]
+        out[t] = s
+    return out
+
+@njit(cache=False, fastmath=False)
+def _pt_occ_sticky_hold(x, u, p):
+    n = x.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    out[0] = x[0]
+    for t in range(1, n):
+        out[t] = out[t - 1] if u[t] < p else x[t]
+    return out
+
+@njit(cache=False, fastmath=False)
+def _pt_occ_sticky_hold_varying(x, u, p):
+    n = x.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    out[0] = x[0]
+    for t in range(1, n):
+        out[t] = out[t - 1] if u[t] < p[t] else x[t]
+    return out
+
+@njit(cache=False, fastmath=False)
+def _pt_occ_simulate_arrivals_departures(x0, arrivals, departures, capacity, u_arrive, u_depart, arrive_exponent, depart_exponent, is_reset, reset_level):
+    n = arrivals.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    x = x0
+    for t in range(n):
+        if is_reset[t]:
+            x = reset_level[t]
+        else:
+            fill_ratio = x / capacity
+            a = arrivals[t] if u_arrive[t] < (1.0 - fill_ratio) ** arrive_exponent else 0.0
+            d = departures[t] if u_depart[t] < fill_ratio ** depart_exponent else 0.0
+            x += a - d
+            if x < 0.0:
+                x = 0.0
+            elif x > capacity:
+                x = capacity
+        out[t] = x
+    return out
