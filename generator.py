@@ -14889,3 +14889,285 @@ def _pt_discrete_levels_or_outages(rng, n):
         ok = abs_step < n
         x = np.bincount(abs_step[ok], weights=affected[ok], minlength=n)[:n]
     return x
+
+def _pt_energy_solar_wind_unit_flow(rng, n):
+    mode = _pt_pick_by_cumulative_prob(rng, ('solar', 'wind', 'unit', 'smooth', 'flow'), (0.24, 0.16, 0.2, 0.26, 0.14))
+    if _pt_ENERGY_FORCED_MODE is not None:
+        mode = _pt_ENERGY_FORCED_MODE
+    P = _pt_pick_steps_per_day(rng)
+    ck = _pt_DayClock(rng, n, P)
+    tod = ck.tod
+    if mode == 'solar':
+        capacity = _pt_energy_log_uniform(rng, 5.0, 60000.0)
+        half_daylight = rng.uniform(0.27, 0.36)
+        solar_noon = rng.uniform(0.47, 0.56)
+        d = tod - solar_noon
+        clear_sky = np.maximum(np.cos(0.5 * np.pi * d / half_daylight), 0.0) ** rng.uniform(1.0, 1.8)
+        clear_sky[np.abs(d) >= half_daylight] = 0.0
+        daily_clearness = rng.beta(rng.uniform(1.5, 4.0), rng.uniform(0.7, 2.0), ck.nd)
+        clearness = ck.interp_daily(daily_clearness)
+        cloud_noise = _pt_gaussian_lowpass_noise(rng, n, rng.uniform(0.02, 0.08) * P)
+        flicker_noise = _pt_ar1_recursive_filter(rng.standard_normal(n), 0.6) * rng.uniform(0.0, 0.08)
+        c = np.clip(clearness + (1.0 - clearness) * (rng.uniform(0.1, 0.45) * cloud_noise + flicker_noise), 0.03, 1.0)
+        x = capacity * clear_sky * c
+        if rng.random() < 0.3:
+            x = np.minimum(x, capacity * rng.uniform(0.6, 0.9))
+        return np.round(x, int(_pt_pick_by_cumulative_prob(rng, (0, 1, 2), (0.35, 0.3, 0.35))))
+    if mode == 'wind':
+        capacity = _pt_energy_log_uniform(rng, 50.0, 30000.0)
+        z = _pt_gaussian_lowpass_noise(rng, n, rng.uniform(0.15, 1.2) * P)
+        wind_speed = np.exp(rng.uniform(1.6, 2.3) + rng.uniform(0.3, 0.6) * z)
+        cut_in_speed, rated_speed = (rng.uniform(2.5, 4.0), rng.uniform(11.0, 14.0))
+        power_fraction = np.clip((wind_speed ** 3 - cut_in_speed ** 3) / (rated_speed ** 3 - cut_in_speed ** 3), 0.0, 1.0)
+        x = capacity * (rng.uniform(0.02, 0.1) + power_fraction * rng.uniform(0.7, 0.95))
+        gust_noise = _pt_ar1_recursive_filter(rng.standard_normal(n), 0.9 ** (96.0 / P)) * rng.uniform(0.02, 0.07)
+        x = x * (1.0 + gust_noise) + capacity * rng.uniform(0.0, 0.04) * _pt_time_of_day_bump(tod, rng.random(), 0.12)
+        return np.round(np.maximum(x, 0.0), int(_pt_pick_by_cumulative_prob(rng, (0, 1, 2), (0.3, 0.4, 0.3))))
+    if mode == 'unit':
+        unit_capacity = _pt_energy_log_uniform(rng, 0.5, 700.0)
+        if rng.random() < 0.2:
+            day_active = rng.random(ck.nd) < rng.uniform(0.2, 0.9)
+            s, e = (rng.uniform(0.25, 0.45), rng.uniform(0.7, 0.95))
+            on = day_active[ck.day.astype(np.intp)] & (tod >= s) & (tod < e)
+        else:
+            mean_on_steps, mean_off_steps = (rng.uniform(0.3, 6.0) * P, rng.uniform(0.2, 6.0) * P)
+            nr = int(2 * n / (mean_on_steps + mean_off_steps)) + 4
+            run_lengths = np.empty(nr, dtype=np.int64)
+            run_lengths[0::2] = rng.geometric(1.0 / mean_on_steps, (nr + 1) // 2)
+            run_lengths[1::2] = rng.geometric(1.0 / mean_off_steps, nr // 2)
+            run_states = np.zeros(nr, dtype=bool)
+            run_states[0::2] = True
+            if rng.random() < 0.5:
+                run_states = ~run_states
+            on = np.repeat(run_states, run_lengths)[int(rng.integers(0, max(1, run_lengths[0]))):][:n]
+            if on.size < n:
+                on = np.concatenate([on, np.zeros(n - on.size, dtype=bool)])
+        setpoint_levels = rng.uniform(0.55, 1.0, ck.nd * 4)
+        hs = rng.random(setpoint_levels.size) < rng.uniform(0.6, 0.95)
+        hs[0] = False
+        setpoint_levels = setpoint_levels[np.maximum.accumulate(np.where(hs, 0, np.arange(setpoint_levels.size)))]
+        sp = setpoint_levels[np.minimum((ck.dayf * 4).astype(np.intp) - int(ck.day[0]) * 4, setpoint_levels.size - 1)]
+        ramp_width = min(int(rng.integers(P // 48 + 2, P // 8 + 4)), n // 2)
+        ramped_on = on.astype(np.float64)
+        if ramp_width > 1:
+            ramped_on = np.convolve(ramped_on, np.ones(ramp_width) / ramp_width, mode='same')
+        hold_jitter = 1.0 + rng.uniform(0.0, 0.03) * rng.standard_normal(n)
+        hj = rng.random(n) < rng.uniform(0.75, 0.98)
+        hj[0] = False
+        hold_jitter = hold_jitter[np.maximum.accumulate(np.where(hj, 0, np.arange(n)))]
+        x = unit_capacity * ramped_on * sp * hold_jitter
+        if rng.random() < 0.35:
+            x += np.abs(_pt_ar1_recursive_filter(rng.standard_normal(n), 0.95)) * unit_capacity * rng.uniform(0.002, 0.01)
+        return np.round(np.maximum(x, 0.0), int(_pt_pick_by_cumulative_prob(rng, (0, 1, 2), (0.3, 0.5, 0.2))))
+    if mode == 'smooth':
+        L0 = _pt_energy_log_uniform(rng, 50.0, 40000.0)
+        kind = rng.random()
+        if kind < 0.5:
+            daytime_lift = rng.uniform(0.2, 0.6)
+            s, e = (rng.uniform(0.22, 0.32), rng.uniform(0.8, 0.95))
+            w = rng.uniform(0.02, 0.05)
+            daily_shape = daytime_lift * (1.0 / (1.0 + np.exp(-(tod - s) / w)) - 1.0 / (1.0 + np.exp(-(tod - e) / w)))
+            daily_shape += rng.uniform(0.0, 0.15) * _pt_time_of_day_bump(tod, rng.uniform(0.75, 0.83), 0.05)
+            wk = np.array([1, 1, 1, 1, 1, rng.uniform(0.8, 0.95), rng.uniform(0.72, 0.9)])
+        else:
+            daily_shape = -rng.uniform(0.3, 0.85) * _pt_time_of_day_bump(tod, rng.uniform(0.5, 0.56), rng.uniform(0.08, 0.14)) + rng.uniform(0.0, 0.25) * _pt_time_of_day_bump(tod, rng.uniform(0.75, 0.9), 0.08)
+            wk = np.array([1, 1, 1, 1, 1, rng.uniform(0.9, 1.0), rng.uniform(0.85, 1.0)])
+        level_sigma = rng.uniform(0.03, 0.15)
+        lv = np.exp(_pt_daily_ar1_log_level(rng, ck.nd, rng.uniform(0.3, 0.8), level_sigma))
+        shape_gain = ck.interp_daily(rng.uniform(0.5, 1.3, ck.nd))
+        x = L0 * ck.interp_daily(lv) * wk[ck.dow.astype(np.intp)] * (1.0 + shape_gain * daily_shape)
+        noise_rho = rng.uniform(0.97, 0.998) ** (96.0 / P)
+        x *= 1.0 + rng.uniform(0.02, 0.1) * _pt_gaussian_lowpass_noise(rng, n, rng.uniform(0.03, 0.15) * P) + rng.uniform(0.002, 0.01) * _pt_ar1_recursive_filter(rng.standard_normal(n), noise_rho) * np.sqrt(1 - noise_rho * noise_rho)
+        return np.round(x, int(_pt_pick_by_cumulative_prob(rng, (0, 1, 2), (0.3, 0.45, 0.25))))
+    capacity = _pt_energy_log_uniform(rng, 100.0, 3000.0)
+    flow_bias = rng.uniform(-0.8, 0.8)
+    flow_wander = _pt_gaussian_lowpass_noise(rng, n, rng.uniform(0.05, 0.6) * P) * rng.uniform(0.3, 0.8)
+    daily_shape = rng.uniform(0.0, 0.5) * np.sin(_pt_ENERGY_TWO_PI * tod + rng.uniform(0, _pt_ENERGY_TWO_PI))
+    hold_steps = int(_pt_pick_by_cumulative_prob(rng, (P // 24 or 1, P // 4 or 1, 1), (0.15, 0.1, 0.75)))
+    flow_fraction = flow_bias + flow_wander + daily_shape
+    ks = int(rng.poisson(n * rng.uniform(0.001, 0.008)))
+    if ks:
+        shock_impulses = np.zeros(n)
+        shock_impulses[rng.integers(0, n, ks)] = rng.normal(0.0, rng.uniform(0.08, 0.3), ks)
+        flow_fraction = flow_fraction + lfilter([1.0], [1.0, -rng.uniform(0.98, 0.998)], shock_impulses)
+    if hold_steps > 1:
+        g = np.arange(n) // hold_steps
+        flow_fraction = flow_fraction[np.minimum(g * hold_steps, n - 1)]
+        flow_fraction = lfilter([0.35], [1.0, -0.65], flow_fraction, zi=[0.65 * flow_fraction[0]])[0]
+    x = capacity * flow_fraction * rng.uniform(0.6, 1.2) + capacity * rng.uniform(0.005, 0.03) * _pt_ar1_recursive_filter(rng.standard_normal(n), 0.8)
+    flow_limits = capacity * np.array([rng.uniform(0.8, 1.0), rng.uniform(0.8, 1.0)])
+    x = np.clip(x, -flow_limits[0], flow_limits[1])
+    return np.round(x, int(_pt_pick_by_cumulative_prob(rng, (0, 1, 2), (0.1, 0.3, 0.6))))
+_pt_COUNTS_TWO_PI = 2.0 * np.pi
+_pt_FLU_SEASON_KIND_PROBS = np.array([0.2, 0.2, 0.38, 0.22])
+_pt_US_HOLIDAY_DAYS_OF_YEAR = np.array([0, 19, 47, 145, 184, 245, 284, 314, 327, 328, 358, 359, 364])
+
+def _pt_counts_log_uniform(rng, lo, hi):
+    return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+
+def _pt_knot_interpolated_noise(rng, n, knot_spacing):
+    h = max(float(knot_spacing), 1.0)
+    k = int(n / h) + 3
+    knot_values = rng.standard_normal(k)
+    knot_positions = (np.arange(n) + rng.uniform(0.0, h)) / h
+    return np.interp(knot_positions, np.arange(k, dtype=np.float64), knot_values) * 1.2247
+
+def _pt_is_us_holiday(day_numbers):
+    day_of_year = np.mod(day_numbers, 365).astype(np.int64)
+    return np.isin(day_of_year, _pt_US_HOLIDAY_DAYS_OF_YEAR)
+
+def _pt_negative_binomial_counts(rng, mean, k):
+    gamma_mean = mean * rng.gamma(k, 1.0 / k, mean.shape)
+    return rng.poisson(np.clip(gamma_mean, 0.0, 1000000000.0)).astype(np.float64)
+
+def _pt_left_pad_to_length(x, n):
+    x = np.asarray(x, dtype=np.float64)
+    if x.size >= n:
+        return x[x.size - n:]
+    out = np.empty(n)
+    out[:n - x.size] = x[0] if x.size else 0.0
+    out[n - x.size:] = x
+    return out
+
+def _pt_decaying_spike_train(rng, n, spike_prob, amp_lo, amp_hi, decay):
+    spike_mask = rng.random(n) < spike_prob
+    impulses = np.zeros(n)
+    k = int(spike_mask.sum())
+    if k:
+        impulses[spike_mask] = np.exp(rng.uniform(np.log(amp_lo), np.log(amp_hi), k))
+    return lfilter([1.0], [1.0, -decay], impulses)
+
+def _pt_annual_season_peaks(rng, days, start_doy, peak_doy, peak_jitter_sd, log_amp_lo, log_amp_hi, width_lo, width_hi):
+    n_years = int(np.ceil((days[-1] + start_doy) / 365.0)) + 2
+    out = np.zeros(days.size)
+    rise_width = rng.uniform(width_lo, width_hi)
+    fall_width = rise_width * rng.uniform(1.0, 1.6)
+    season_amp = rng.uniform(log_amp_lo, log_amp_hi)
+    for y in range(-1, n_years):
+        c = y * 365.0 + peak_doy - start_doy + rng.normal(0.0, peak_jitter_sd)
+        a = season_amp * float(np.exp(rng.normal(0.0, 0.2)))
+        lo = max(0, int(c - 5.0 * rise_width))
+        hi = min(days.size, int(c + 5.0 * fall_width) + 1)
+        if hi <= lo:
+            continue
+        u = days[lo:hi] - c
+        w = np.where(u < 0.0, rise_width, fall_width)
+        out[lo:hi] += a * np.exp(-0.5 * (u / w) ** 2)
+    return out
+
+def _pt_flu_season_positivity_pct(rng, n):
+    t = np.arange(n, dtype=np.float64)
+    if rng.random() < 0.6:
+        start_doy = float(np.mod(rng.normal(255.0, 35.0) - (n - 1), 365.0))
+    else:
+        start_doy = rng.uniform(0.0, 365.0)
+    kind = rng.choice(4, p=_pt_FLU_SEASON_KIND_PROBS)
+    if kind == 0:
+        p0 = _pt_counts_log_uniform(rng, 0.04, 0.15)
+        log_season = _pt_annual_season_peaks(rng, t, start_doy, rng.uniform(350, 395), 14.0, np.log(25.0), np.log(120.0), 28.0, 48.0)
+    elif kind == 1:
+        p0 = _pt_counts_log_uniform(rng, 0.006, 0.04)
+        log_season = _pt_annual_season_peaks(rng, t, start_doy, rng.uniform(320, 370), 12.0, np.log(15.0), np.log(150.0), 26.0, 44.0)
+    elif kind == 2:
+        p0 = _pt_counts_log_uniform(rng, 0.06, 0.2)
+        log_season = _pt_annual_season_peaks(rng, t, start_doy, rng.uniform(215, 260), 20.0, np.log(5.0), np.log(25.0), 18.0, 35.0)
+        log_season += _pt_annual_season_peaks(rng, t, start_doy, rng.uniform(355, 395), 20.0, np.log(3.0), np.log(15.0), 18.0, 40.0)
+    else:
+        p0 = rng.uniform(5.0, 8.5)
+        log_season = _pt_annual_season_peaks(rng, t, start_doy, rng.uniform(345, 385), 15.0, np.log(2.2), np.log(3.6), 35.0, 65.0)
+        log_season += 0.35 * _pt_annual_season_peaks(rng, t, start_doy, rng.uniform(190, 240), 20.0, 0.1, 0.6, 20.0, 35.0)
+    log_season += rng.uniform(0.06, 0.22) * _pt_knot_interpolated_noise(rng, n, rng.uniform(6.0, 25.0))
+    dow = (t.astype(np.int64) + int(rng.integers(0, 7))) % 7
+    positivity_dow = np.exp(rng.normal(0.0, rng.uniform(0.01, 0.06), 7))
+    expected_pct = p0 * np.exp(log_season) * positivity_dow[dow]
+    day_of_year = np.mod(t + start_doy, 365.0)
+    expected_pct *= 1.0 + rng.uniform(0.0, 0.25) * ((day_of_year > 356) | (day_of_year < 2))
+    positive_prob = np.clip(expected_pct / 100.0, 0.0, 0.7)
+    is_large_panel = rng.random() < 0.12
+    size = _pt_counts_log_uniform(rng, 80000.0, 1000000.0) if is_large_panel else _pt_counts_log_uniform(rng, 1000.0, 40000.0)
+    test_volume_dow = np.exp(rng.normal(0.0, 0.06, 7))
+    test_volume_dow[5:] *= rng.uniform(0.75, 0.95)
+    n_tests = np.maximum(1, np.round(size * test_volume_dow[dow] * np.exp(0.08 * _pt_knot_interpolated_noise(rng, n, 60.0)))).astype(np.int64)
+    k = rng.binomial(n_tests, positive_prob)
+    x = 100.0 * k / n_tests
+    if is_large_panel:
+        x = np.convolve(x, np.ones(7) / 7.0, mode='full')[:n]
+        x[:6] = x[6]
+    return np.round(x, 2)
+
+def _pt_business_day_intensity(rng, m, mu):
+    t = np.arange(m, dtype=np.float64)
+    dow = (t.astype(np.int64) + int(rng.integers(0, 7))) % 7
+    start_doy = rng.uniform(0, 365)
+    wk = np.exp(rng.normal(0.0, 0.08, 7))
+    if rng.random() < 0.4:
+        wk[0] *= rng.uniform(1.0, 1.35)
+    wk[5] = rng.uniform(0.02, 0.45)
+    wk[6] = wk[5] * rng.uniform(0.2, 1.0)
+    log_trend = rng.uniform(0.05, 0.3) * _pt_knot_interpolated_noise(rng, m, rng.uniform(20.0, 120.0))
+    log_trend += rng.normal(0.0, 0.15) * t / max(m, 1)
+    log_trend += rng.uniform(0.0, 0.15) * np.sin(_pt_COUNTS_TWO_PI * (t + start_doy) / 365.0 + rng.uniform(0, _pt_COUNTS_TWO_PI))
+    intensity = mu * wk[dow] * np.exp(log_trend)
+    holiday_mask = _pt_is_us_holiday(t + start_doy)
+    intensity[holiday_mask] *= rng.uniform(0.0, 0.3)
+    return (intensity, dow, holiday_mask)
+
+def _pt_business_day_counts(rng, n):
+    mode = rng.choice(3, p=[0.62, 0.28, 0.1])
+    if mode == 0:
+        mu = _pt_counts_log_uniform(rng, 0.5, 150.0)
+        k = _pt_counts_log_uniform(rng, 1.5, 40.0)
+        weekdays_only = rng.random() < 0.6
+        q = (5.0 / 7.0 if weekdays_only else 1.0) * (1.0 - (k / (k + mu)) ** k)
+        m = int(n / max(q, 0.08) * 1.5) + 32
+        intensity, dow, _ = _pt_business_day_intensity(rng, m, mu)
+        if weekdays_only:
+            intensity[dow >= 5] = 0.0
+        burst_mask = rng.random(m) < _pt_counts_log_uniform(rng, 0.0003, 0.01)
+        intensity[burst_mask] *= np.exp(rng.uniform(np.log(2.5), np.log(12.0), int(burst_mask.sum())))
+        c = _pt_negative_binomial_counts(rng, intensity, k)
+        c = c[c > 0]
+        if c.size < n:
+            c = np.concatenate([np.ones(n - c.size), c])
+        return c[c.size - n:]
+    if mode == 1:
+        mu = _pt_counts_log_uniform(rng, 5.0, 700.0)
+        intensity, dow, holiday_mask = _pt_business_day_intensity(rng, n + 7, mu)
+        after_holiday = np.roll(holiday_mask, 1)
+        intensity[after_holiday] *= rng.uniform(1.0, 1.6)
+        c = _pt_negative_binomial_counts(rng, intensity, _pt_counts_log_uniform(rng, 3.0, 60.0))
+        if rng.random() < 0.5:
+            is_weekday = dow < 5
+            c2 = c[is_weekday]
+            if c2.size >= n:
+                c = c2
+            else:
+                c = np.concatenate([c[:n - c2.size], c2])
+        x = _pt_left_pad_to_length(c, n)
+        if rng.random() < 0.12:
+            dropout_mask = rng.random(n) < _pt_counts_log_uniform(rng, 0.003, 0.03)
+            x[dropout_mask] = 0.0
+        if rng.random() < 0.35:
+            x[-1] = np.floor(x[-1] * rng.uniform(0.0, 0.35))
+        return x
+    txn_rate = _pt_counts_log_uniform(rng, 0.4, 8.0)
+    intensity, _, _ = _pt_business_day_intensity(rng, n, txn_rate)
+    txn_per_day = rng.poisson(intensity)
+    n_txn = int(txn_per_day.sum())
+    log_median_amount = rng.uniform(np.log(2000.0), np.log(500000.0))
+    amounts = np.exp(log_median_amount + rng.uniform(0.7, 1.8) * rng.standard_normal(n_txn))
+    txn_day = np.repeat(np.arange(n), txn_per_day)
+    x = np.bincount(txn_day, weights=amounts, minlength=n)
+    if rng.random() < 0.6 and (x > 0).sum() > 8:
+        x = _pt_left_pad_to_length(x[x > 0], n)
+    return np.round(x, 2)
+
+def _pt_harmonic_log_profile(rng, period, trough_ratio):
+    ph = np.arange(period, dtype=np.float64) / period
+    profile = np.zeros(period)
+    for h in range(1, 4):
+        profile += rng.normal(0.0, 1.0 / h) * np.cos(_pt_COUNTS_TWO_PI * h * ph + rng.uniform(0, _pt_COUNTS_TWO_PI))
+    span = profile.max() - profile.min()
+    if span > 1e-09:
+        profile = (profile - profile.max()) / span * np.log(1.0 / trough_ratio)
+    return profile
