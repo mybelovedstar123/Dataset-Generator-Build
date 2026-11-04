@@ -4192,3 +4192,100 @@ def e6_build(P, rng, L, cad, cal, cfg):
 
     fl = new_flags(n, scale_mode=0, quant_boost=0.9)
     return y, fl
+
+
+# ═══════════════ chronoforge: cf_fam_domain ═══════════════
+# Block F — energy / transport / retail / macro families.
+#
+# Three of these encode a *nonlinear map from a smooth latent to the observable*,
+# which is what actually generates the shapes and what a purely additive prior
+# cannot represent:
+#
+# * electricity load is a hockey-stick function of temperature (heating below one
+#   breakpoint, cooling above another), and the price is a convex supply stack, so
+#   a modest change in residual load produces an extreme price spike;
+# * traffic flow is non-monotone in demand — past capacity, density rises and flow
+#   *falls* along the backward-bending branch of the fundamental diagram;
+# * solar output is a clipped diurnal bell times a cloud latent, i.e. an exact zero
+#   every night and a lag-24 difference of approximately zero through it.
+
+
+# ══════════════════ F1 energy_load_price_solar ═════════════════════════════
+
+def f1_params(rng, B, cfg):
+    p = cfg["families"]["energy_load_price_solar"]
+    return {
+        "mode": categorical(rng, p["mode_mix"], B),
+        "base": logu(rng, 10.0, 5.0e4, B),
+        "temp_ell": logu(rng, 40.0, 900.0, B),
+        "temp_amp": rng.uniform(3.0, 14.0, B),
+        "t_cool": rng.uniform(16.0, 24.0, B),
+        "t_heat": rng.uniform(8.0, 16.0, B),
+        "b_cool": logu(rng, 0.005, 0.09, B),
+        "c_heat": logu(rng, 0.005, 0.09, B),
+        "weekend": np.exp(rng.normal(np.log(0.88), 0.12, B)),
+        "noise": logu(rng, 5e-3, 0.12, B),
+        "p0": logu(rng, 5.0, 200.0, B),
+        "kappa": logu(rng, 0.5, 40.0, B),
+        "theta": rng.uniform(1.5, 7.0, B),
+        "cap_q": rng.uniform(0.75, 0.97, B),
+        "negative": rng.random(B) < p["negative_price_rate"],
+        "solar_peak": logu(rng, 1.0, 5.0e3, B),
+        "cloud_ell": logu(rng, 4.0, 120.0, B),
+        "cloud_eta": logu(rng, 0.8, 3.0, B),
+        "cloud_c": rng.normal(0.55, 0.3, B),
+        "day_frac": rng.uniform(0.32, 0.55, B),
+    }
+
+
+def f1_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    pd = cad.p_day.reshape(n, 1)
+    has_day = pd >= 4.0
+    ph = t / np.where(has_day, pd, 1e9) + rng.random((n, 1))
+    frac = ph - np.floor(ph)
+
+    # latent temperature (the same construction as the thermal weather family)
+    temp = matern_gp(rng, n, L, P["temp_ell"], nu=1.5) * P["temp_amp"].reshape(n, 1) \
+        + 15.0 + np.where(has_day, 4.0 * np.sin(_cf_prims_TWO_PI * ph - 1.9), 0.0)
+
+    shape = profile_double_peak(rng, n, L, ph)
+    shape = shape / np.maximum(shape.mean(axis=1, keepdims=True), 1e-9)
+    shape = np.where(has_day, 0.55 + 0.45 * shape, 1.0)
+
+    wk = np.ones((n, 7))
+    wk[:, 5] = P["weekend"]
+    wk[:, 6] = P["weekend"] * 0.97
+    weekly = apply_dow(wk, cal)
+
+    # the hockey stick: heating below t_heat, cooling above t_cool
+    resp = (1.0 + P["b_cool"].reshape(n, 1) * np.maximum(temp - P["t_cool"].reshape(n, 1), 0.0)
+            + P["c_heat"].reshape(n, 1) * np.maximum(P["t_heat"].reshape(n, 1) - temp, 0.0))
+    load = P["base"].reshape(n, 1) * shape * weekly * resp
+    load = load * np.exp(rng.standard_normal((n, L)) * P["noise"].reshape(n, 1))
+
+    # convex supply stack -> occasional extreme spikes near capacity
+    cap = load.mean(axis=1, keepdims=True) * (1.0 + 1.4 * P["cap_q"].reshape(n, 1))
+    excess = (load - cap) / np.maximum(cap, 1e-9)
+    price = P["p0"].reshape(n, 1) + P["kappa"].reshape(n, 1) * (
+        np.exp(np.clip(P["theta"].reshape(n, 1) * excess, -30.0, 12.0)) - np.exp(-1.0))
+    neg = P["negative"].reshape(n, 1)
+    price = np.where(neg, price - P["p0"].reshape(n, 1) * 1.35, price)
+
+    # solar: clipped bell x cloud, exactly zero every night
+    bell = np.cos(np.pi * (frac - 0.5) / np.maximum(P["day_frac"].reshape(n, 1), 1e-3))
+    bell = np.maximum(bell, 0.0)
+    cz = unit_std(matern_gp(rng, n, L, P["cloud_ell"], nu=1.5))
+    clear = 1.0 - np.clip(P["cloud_eta"].reshape(n, 1) * cz
+                          + P["cloud_c"].reshape(n, 1), 0.0, 1.0)
+    solar = P["solar_peak"].reshape(n, 1) * bell * np.maximum(clear, 0.0)
+    solar = np.where(has_day, solar, np.maximum(P["solar_peak"].reshape(n, 1) * clear, 0.0))
+
+    mode = P["mode"].reshape(n, 1)
+    y = np.where(mode == 0, load, np.where(mode == 1, price, solar))
+    fl = new_flags(n, scale_mode=1, quant_boost=0.8)
+    fl["positive"] = (P["mode"] != 1)
+    fl["scale_mode"] = np.where(P["mode"] == 1, 0, 1).astype(np.int8)
+    fl["offset_pref"] = np.where(P["mode"] == 1, 3, 2).astype(np.int8)
+    return y, fl
