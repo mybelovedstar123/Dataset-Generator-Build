@@ -5852,3 +5852,110 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
     "intraday_spot_price": 0.0,
     "road_commute_counts": 0.0,
 }
+
+
+# --- RNG-stream isolation: dispatch reference -------------------------------
+#
+# The throne corpus's exact family_weights (raw values copied verbatim from
+# gen-08-11-rk4-intfrac-086-tidal-005-cw-006-v1/config.json). Dispatch first
+# assigns every row against THIS fixed reference cdf — bit-identical to the
+# source's ``rng.choice(..., p=family_weights)`` when the config weights equal
+# the reference — and then moves the minimal possible mass (a maximal
+# coupling) from the reference assignment to the ACTIVE config weights using a
+# dedicated per-chunk stream. A +2pp weight edit therefore reassigns only
+# ~the shifted mass (total-variation distance) instead of the ~18% that the
+# inverse-cdf coupling reassigns when every cumulative boundary rescales.
+_DISPATCH_REF_RAW: dict[str, float] = {
+    "trend_seasonal_ar": 0.019766081871345043,
+    "regime_shift": 0.015204678362573111,
+    "multiplicative": 0.012163742690058484,
+    "ar2": 0.18785457466340275,
+    "integrated": 0.011403508771929824,
+    "threshold_ar": 0.026000000000000002,
+    "chaotic": 0.0,
+    "spectral_gp": 0.005321637426900589,
+    "long_memory": 0.003801169590643278,
+    "ou_stochastic_vol": 0.004561403508771932,
+    "physical_sensors": 0.015964912280701765,
+    "seasonal_counts": 0.013684210526315799,
+    "intermittent": 0.002280701754385966,
+    "pulse_outlier": 0.0007602339181286553,
+    "conditional_stability": 0.153531173500612,
+    "step_level": 0.2731968541751666,
+    "vol_regime_switch": 0.0,
+    "weekly_demand": 0.0,
+    "tidal_harmonic": 0.0,
+    "flow_recession": 0.008362573099415203,
+    "epi_decay": 0.012543859649122798,
+    "grid_flow": 0.0073124999999999996,
+    "spiky_price": 0.0043875,
+    "price_shock": 0.002925,
+    "bounded_counts": 0.0,
+    "cs_flat": 0.048493421052631575,
+    "cs_drift": 0.06789078947368422,
+    "cs_countwalk": 0.048493421052631575,
+    "cs_pulse": 0.029096052631578946,
+    "sl_exact_cont": 0.0,
+    "sl_exact_int": 0.0,
+    "sl_noisy_cont": 0.0,
+    "sl_noisy_int": 0.0,
+    "rk4_flows": 0.025,
+    "tidal_constituents": 0.052631578947368425,
+    # Grafted families: zero REFERENCE weight so the reference cdf still spans
+    # all 36 families while assigning exactly the throne's 34-family
+    # distribution. Their cdf entries sit at exactly 1.0 (cumsum adds 0.0,
+    # then /= cdf[-1] — the same divisor as the 34-family cdf), so
+    # ``searchsorted(u, side="right")`` with u < 1 can never land on them:
+    # reference assignment for existing rows stays bit-identical, and only
+    # the maximal-coupling rebalance can move rows into these families.
+    "envelope_mod": 0.0,
+    "rate_counts": 0.0,
+    "dispersion_counts": 0.0,
+    "dispatch_blocks": 0.0,
+    # chronoforge grafts: same treatment — zero reference weight, cdf at 1.0
+    **{name: 0.0 for name in CF_GRAFT},
+    **{name: 0.0 for name in _ED5},
+    **{name: 0.0 for name in _POOL4},
+    **{name: 0.0 for name in _DEEP1},
+    # grafted vanta native family: zero reference weight, cdf at 1.0 (unreachable
+    # by the base searchsorted; enters only via maximal-coupling excess)
+    "cycle_profile": 0.0,
+    "sales_promo_stockout_panel": 0.0,
+    "settle_hold": 0.0,
+    "web_traffic_plateau": 0.0,
+    **{name: 0.0 for name in _LAB3},
+    "epi_season_decay": 0.0,
+    "weekday_ledger_counts": 0.0,
+    "surveillance_counts": 0.0,
+    "pull_counter_ramp": 0.0,
+    "weekly_cycle_downloads": 0.0,
+    "hourly_social_counts": 0.0,
+    "intraday_event_counts": 0.0,
+    "intraday_spot_price": 0.0,
+    "road_commute_counts": 0.0,
+}
+
+
+def _build_dispatch_ref() -> tuple[np.ndarray, np.ndarray]:
+    """Replicate Generator.__init__'s weight parse bit-for-bit on the
+    reference raw weights, then build the cdf exactly the way
+    ``Generator.choice`` builds it internally (cumsum, then /= cdf[-1])."""
+    weights = dict(_DEFAULT_WEIGHTS)
+    for key, value in _DISPATCH_REF_RAW.items():
+        if key in weights:
+            weights[key] = float(value)
+    w = np.asarray([weights[f] for f in _FAMILIES], dtype=np.float64)
+    w = w / w.sum()
+    cdf = w.cumsum()
+    cdf /= cdf[-1]
+    return w, cdf
+
+
+_DISPATCH_REF, _DISPATCH_REF_CDF = _build_dispatch_ref()
+
+# Seed-key tag for the per-chunk dispatch-coupling stream. All isolated
+# streams use fixed-length 5-tuple keys (base_seed, chunk, fam, slot, tag);
+# the dispatch stream uses fam = 999 — a sentinel no family index can take
+# now or under any near-term graft (was len(_FAMILIES), which collides as
+# soon as a 35th family is appended: fam index 34 would share the old key).
+_DISPATCH_STREAM_FAM = 999
