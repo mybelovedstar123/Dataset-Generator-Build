@@ -835,3 +835,268 @@ def warmup() -> None:
         k_template(np.linspace(0, 1, n * L).reshape(n, L), np.ones((2, 8)),
                    i32.copy(), np.zeros((n, L)))
         _WARMED = True
+
+
+# ═══════════════ chronoforge: cf_prims ═══════════════
+# Vectorised building blocks shared by the family modules.
+#
+# Everything here is written to operate on a whole *group* of rows at once with
+# per-row parameters carried as ``(n, 1)`` columns.  There are no per-series
+# Python loops in the hot path; where a loop is unavoidable it runs over a small
+# fixed number of *slots* (event slots, harmonics, mixture components), never over
+# rows.
+
+
+try:
+    from scipy.ndimage import maximum_filter1d as _max_filter
+    from scipy.ndimage import minimum_filter1d as _min_filter
+    _HAVE_NDIMAGE = True
+except Exception:  # pragma: no cover
+    _HAVE_NDIMAGE = False
+    _max_filter = _min_filter = None
+
+_cf_prims_TWO_PI = 2.0 * np.pi
+
+
+# ─────────────────────────────── draw helpers ──────────────────────────────
+
+def logu(rng: np.random.Generator, lo: float, hi: float, size) -> np.ndarray:
+    """Log-uniform draw."""
+    return np.exp(rng.uniform(np.log(lo), np.log(hi), size=size))
+
+
+def col(x: np.ndarray) -> np.ndarray:
+    """Reshape a length-n vector into an (n, 1) broadcast column."""
+    return np.asarray(x, dtype=np.float64).reshape(-1, 1)
+
+
+def categorical(rng: np.random.Generator, probs, size: int) -> np.ndarray:
+    """Vectorised categorical draw; returns int64 indices."""
+    p = np.asarray(probs, dtype=np.float64)
+    c = np.cumsum(p / p.sum())
+    u = rng.random(size)
+    return np.searchsorted(c, u, side="right").clip(0, len(p) - 1).astype(np.int64)
+
+
+def bernoulli(rng: np.random.Generator, p, size: int) -> np.ndarray:
+    return rng.random(size) < p
+
+
+def safe_std(x: np.ndarray) -> np.ndarray:
+    """Row standard deviation, floored so no downstream division can overflow.
+
+    The floor is relative as well as absolute: a *nearly* constant row (std far
+    below its own magnitude) would otherwise be amplified to infinity.  Rows that
+    trip the relative floor are degenerate by construction and get caught by the
+    sanitiser's regeneration guard.
+    """
+    s = x.std(axis=1, keepdims=True)
+    m = np.abs(x).max(axis=1, keepdims=True)
+    return np.maximum(s, np.maximum(m * 1e-12, 1e-300))
+
+
+def unit_std(x: np.ndarray) -> np.ndarray:
+    """Zero-mean, unit-std rows (never in place)."""
+    x = x - x.mean(axis=1, keepdims=True)
+    return x / safe_std(x)
+
+
+# ───────────────────────────── linear processes ────────────────────────────
+
+def ar1(rng: np.random.Generator, n: int, L: int, phi: np.ndarray,
+        sigma: np.ndarray | float = 1.0) -> np.ndarray:
+    """AR(1) with per-row phi.  Returns (n, L)."""
+    e = rng.standard_normal((n, L))
+    phi = np.asarray(phi, dtype=np.float64).reshape(n, 1)
+    e *= np.sqrt(np.maximum(1.0 - phi ** 2, 1e-6))
+    out = np.zeros((n, L))
+    k_arma(phi.copy(), np.ones(n, dtype=np.int64),
+             np.zeros((n, 1)), np.zeros(n, dtype=np.int64), e, out)
+    if np.isscalar(sigma):
+        if sigma != 1.0:
+            out *= sigma
+    else:
+        out *= np.asarray(sigma, dtype=np.float64).reshape(n, 1)
+    return out
+
+
+def ou(rng: np.random.Generator, n: int, L: int, tau: np.ndarray) -> np.ndarray:
+    """Discretised Ornstein-Uhlenbeck with correlation time ``tau`` samples."""
+    phi = np.exp(-1.0 / np.maximum(np.asarray(tau, dtype=np.float64).reshape(n, 1), 1e-3))
+    return ar1(rng, n, L, np.clip(phi, 0.0, 0.99999))
+
+
+def local_linear_trend(rng: np.random.Generator, n: int, L: int,
+                       sig_level: np.ndarray, sig_slope: np.ndarray,
+                       damp: np.ndarray | None = None) -> np.ndarray:
+    """Local-linear-trend state space; ``damp`` < 1 gives a damped trend."""
+    es = rng.standard_normal((n, L)) * np.asarray(sig_slope).reshape(n, 1)
+    el = rng.standard_normal((n, L)) * np.asarray(sig_level).reshape(n, 1)
+    if damp is None:
+        slope = np.cumsum(es, axis=1)
+    else:
+        d = np.asarray(damp, dtype=np.float64).reshape(n, 1)
+        slope = np.zeros((n, L))
+        k_arma(d.copy(), np.ones(n, dtype=np.int64), np.zeros((n, 1)),
+                 np.zeros(n, dtype=np.int64), es, slope)
+    lag = np.zeros((n, L))
+    lag[:, 1:] = slope[:, :-1]
+    return np.cumsum(lag + el, axis=1)
+
+
+# ─────────────────────────── segmentation helpers ──────────────────────────
+
+def segment_map(dwell: np.ndarray, L: int) -> tuple[np.ndarray, np.ndarray]:
+    """Map cumulative dwell times to a per-sample segment id.
+
+    ``dwell`` is (n, M) positive lengths.  Returns ``(seg_id, seg_start)`` both
+    (n, L) int64 / float64, computed with bincount + cumsum (no per-row loop).
+    """
+    n, M = dwell.shape
+    edges = np.cumsum(np.maximum(dwell, 1.0), axis=1)
+    pos = np.floor(edges).astype(np.int64)
+    valid = (pos > 0) & (pos < L)
+    rows = np.broadcast_to(np.arange(n, dtype=np.int64)[:, None], (n, M))
+    flat = (rows[valid] * L + pos[valid])
+    mark = np.bincount(flat, minlength=n * L).reshape(n, L).astype(np.int64)
+    seg_id = np.cumsum(mark, axis=1)
+    # segment start index for each sample
+    t = np.arange(L, dtype=np.float64)[None, :]
+    starts = np.where(mark > 0, t, 0.0)
+    seg_start = np.maximum.accumulate(starts, axis=1)
+    return seg_id, seg_start
+
+
+def gather_levels(levels: np.ndarray, seg_id: np.ndarray) -> np.ndarray:
+    """levels (n, M) gathered at per-sample segment ids (n, L)."""
+    M = levels.shape[1]
+    idx = np.clip(seg_id, 0, M - 1)
+    return np.take_along_axis(levels, idx, axis=1)
+
+
+def run_mask(n: int, L: int, starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Boolean mask covering runs [s, s+len) given ragged start/length lists.
+
+    ``starts`` / ``lengths`` are (n, E) arrays; non-positive lengths are ignored.
+    """
+    E = starts.shape[1]
+    s = np.clip(starts, 0, L - 1).astype(np.int64)
+    e = np.clip(starts + np.maximum(lengths, 0), 0, L).astype(np.int64)
+    live = e > s
+    rows = np.broadcast_to(np.arange(n, dtype=np.int64)[:, None], (n, E))
+    delta = np.zeros((n, L + 1), dtype=np.int64)
+    np.add.at(delta, (rows[live], s[live]), 1)
+    np.add.at(delta, (rows[live], e[live]), -1)
+    return np.cumsum(delta[:, :L], axis=1) > 0
+
+
+def event_positions(rng: np.random.Generator, n: int, L: int, count: np.ndarray,
+                    E: int) -> tuple[np.ndarray, np.ndarray]:
+    """Uniform event positions with a per-row count, padded to E slots."""
+    pos = rng.integers(0, L, size=(n, E)).astype(np.int64)
+    live = np.arange(E)[None, :] < np.asarray(count).reshape(n, 1)
+    return pos, live
+
+
+def bursty_gaps(rng: np.random.Generator, n: int, L: int, rate: np.ndarray,
+                mean_len: np.ndarray, E: int = 24) -> np.ndarray:
+    """Boolean gap mask from a bursty (LogN-length) outage process."""
+    cnt = rng.poisson(np.maximum(np.asarray(rate).reshape(n, 1) * L, 0.0), size=(n, E))
+    cnt = (cnt > 0).astype(np.int64)
+    starts = rng.integers(0, L, size=(n, E))
+    lens = np.exp(rng.normal(np.log(np.maximum(np.asarray(mean_len).reshape(n, 1), 1.0)),
+                             0.9, size=(n, E)))
+    lens = np.where(cnt > 0, lens, 0.0)
+    return run_mask(n, L, starts, lens)
+
+
+def locf(x: np.ndarray, gap: np.ndarray) -> np.ndarray:
+    """Last-observation-carried-forward over a boolean gap mask."""
+    n, L = x.shape
+    idx = np.where(gap, -1, np.arange(L)[None, :])
+    idx = np.maximum.accumulate(idx, axis=1)
+    idx = np.maximum(idx, 0)
+    return np.take_along_axis(x, idx, axis=1)
+
+
+# ─────────────────────────── periodic profile shapes ───────────────────────
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -60.0, 60.0)))
+
+
+def phase_of(L: int, period: np.ndarray, phase0: np.ndarray,
+             drift: np.ndarray | None = None,
+             period_drift: np.ndarray | None = None) -> np.ndarray:
+    """Cycle phase in [0,1) with optional slow phase drift / period drift."""
+    t = time_grid(L)[None, :]
+    p = np.maximum(np.asarray(period, dtype=np.float64).reshape(-1, 1), 1e-6)
+    if period_drift is None:
+        ph = t / p
+    else:
+        d = np.asarray(period_drift, dtype=np.float64).reshape(-1, 1)
+        # instantaneous frequency 1/p * (1 + d * t/L); phase = integral
+        ph = (t / p) * (1.0 + d * t / (2.0 * L))
+    ph = ph + np.asarray(phase0, dtype=np.float64).reshape(-1, 1)
+    if drift is not None:
+        ph = ph + np.asarray(drift, dtype=np.float64).reshape(-1, 1) * (t / L)
+    return ph
+
+
+def warp_phase(ph: np.ndarray, kappa: np.ndarray) -> np.ndarray:
+    """Circle map theta -> theta + kappa sin(theta), applied on the unit cycle."""
+    k = np.asarray(kappa, dtype=np.float64).reshape(-1, 1)
+    return ph + (k / _cf_prims_TWO_PI) * np.sin(_cf_prims_TWO_PI * ph)
+
+
+def profile_harmonic(rng, n, L, ph, H=5):
+    alpha = rng.uniform(0.7, 1.8, size=(n, 1))
+    nh = rng.integers(2, H + 1, size=(n, 1))
+    out = np.zeros((n, L))
+    for h in range(1, H + 1):
+        amp = rng.standard_normal((n, 1)) * (h ** -alpha)
+        psi = rng.uniform(0.0, _cf_prims_TWO_PI, size=(n, 1))
+        out += np.where(h <= nh, 1.0, 0.0) * amp * np.cos(_cf_prims_TWO_PI * h * ph + psi)
+    return out
+
+
+def profile_trapezoid(rng, n, L, ph):
+    a = rng.uniform(0.20, 0.35, size=(n, 1))
+    b = rng.uniform(0.68, 0.92, size=(n, 1))
+    r1 = rng.uniform(0.01, 0.06, size=(n, 1))
+    r2 = rng.uniform(0.02, 0.10, size=(n, 1))
+    f = ph - np.floor(ph)
+    y = _sigmoid((f - a) / r1) - _sigmoid((f - b) / r2)
+    notch = rng.random((n, 1)) < 0.28
+    nc = rng.uniform(0.42, 0.58, size=(n, 1))
+    nw = rng.uniform(0.02, 0.06, size=(n, 1))
+    nd = rng.uniform(0.10, 0.35, size=(n, 1))
+    y = y - np.where(notch, nd, 0.0) * np.exp(-0.5 * ((f - nc) / nw) ** 2)
+    tilt = rng.uniform(-0.25, 0.25, size=(n, 1))
+    return y * (1.0 + tilt * (f - 0.5))
+
+
+def profile_double_peak(rng, n, L, ph):
+    m1 = rng.uniform(0.25, 0.40, size=(n, 1))
+    m2 = rng.uniform(0.62, 0.80, size=(n, 1))
+    k1 = rng.uniform(8.0, 60.0, size=(n, 1))
+    k2 = rng.uniform(6.0, 40.0, size=(n, 1))
+    h2 = rng.uniform(0.4, 1.6, size=(n, 1))
+    c = np.cos(_cf_prims_TWO_PI * (ph - m1))
+    d = np.cos(_cf_prims_TWO_PI * (ph - m2))
+    return np.exp(k1 * (c - 1.0)) + h2 * np.exp(k2 * (d - 1.0))
+
+
+def profile_free_periodic(rng, n, L, ph, H=16):
+    out = np.zeros((n, L))
+    decay = rng.uniform(0.8, 2.0, size=(n, 1))
+    nh = rng.integers(8, H + 1, size=(n, 1))
+    for h in range(1, H + 1):
+        w = float(h) ** (-1.0)
+        amp = rng.standard_normal((n, 1)) * (w ** decay)
+        psi = rng.uniform(0.0, _cf_prims_TWO_PI, size=(n, 1))
+        out += np.where(h <= nh, 1.0, 0.0) * amp * np.cos(_cf_prims_TWO_PI * h * ph + psi)
+    return out
+
+
+SHAPE_PROBS = (0.40, 0.30, 0.15, 0.10, 0.05)  # harmonic / trapezoid / double / warped / freeGP
