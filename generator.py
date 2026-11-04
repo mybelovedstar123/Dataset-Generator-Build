@@ -2236,3 +2236,84 @@ def bounded_latent(rng, n, L, ell, beta, diurnal, phi_ar, ar_frac):
 def censor(z, eta, c, upper):
     """y = U * clip(eta z + c, 0, 1) — hard censoring, so both bounds are atoms."""
     return upper * np.clip(eta * z + c, 0.0, 1.0)
+
+
+# ══════════════════════════════ A1 met_thermal ═════════════════════════════
+
+def a1_params(rng, B, cfg):
+    p = cfg["families"]["met_thermal"]
+    regime = categorical(rng, p["diurnal_amp_mix"], B)
+    a_small = logu(rng, 1e-3, 0.05, B)
+    a_mid = logu(rng, 0.1, 0.6, B)
+    a_big = logu(rng, 0.6, 2.0, B)
+    amp_d = np.where(regime == 0, a_small, np.where(regime == 1, a_mid, a_big))
+    return {
+        "ell_syn": logu(rng, p["synoptic_ell"][0], p["synoptic_ell"][1], B),
+        "amp_syn": logu(rng, p["synoptic_amp"][0], p["synoptic_amp"][1], B),
+        "amp_d": amp_d,
+        "kappa": rng.uniform(0.15, 0.55, B),
+        "rho": rng.uniform(p["cloud_coupling"][0], p["cloud_coupling"][1], B),
+        "cloud_ell": logu(rng, 6.0, 200.0, B),
+        "cloud_eta": logu(rng, 0.8, 3.0, B),
+        "cloud_c": rng.normal(0.45, 0.35, B),
+        "front_rate": rng.uniform(1.0, 4.0, B) / 1000.0,
+        "front_ramp": logu(rng, 3.0, 24.0, B),
+        "front_mag": rng.normal(0.0, 1.2, B),
+        "phi_e": rng.uniform(0.2, 0.75, B),
+        "sig_e": logu(rng, p["noise_ratio"][0], p["noise_ratio"][1], B),
+        "annual": rng.random(B) < p["annual_rate"],
+        "annual_amp": rng.normal(0.0, 1.0, B),
+    }
+
+
+def a1_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    p_day = cad.p_day.reshape(n, 1)
+
+    syn = matern_gp(rng, n, L, P["ell_syn"], nu=1.5) * P["amp_syn"].reshape(n, 1)
+
+    # cloudiness latent — the same machinery as A3, which is why the diurnal
+    # amplitude envelope is physically correct rather than an arbitrary AM.
+    cz = bounded_latent(rng, n, L, P["cloud_ell"], 0.0, None,
+                        rng.uniform(0.3, 0.7, n), 0.25)
+    cloud = np.clip(P["cloud_eta"].reshape(n, 1) * cz + P["cloud_c"].reshape(n, 1),
+                    0.0, 1.0)
+
+    has_diurnal = (p_day >= 3.0)
+    per = np.where(has_diurnal, p_day, 1e9)
+    ph = t / per + rng.random((n, 1))
+    k = P["kappa"].reshape(n, 1)
+    phw = ph + (k / _cf_prims_TWO_PI) * np.sin(_cf_prims_TWO_PI * ph)
+    # asymmetric daily shape: fast morning rise, slow evening fall
+    daily = np.sin(_cf_prims_TWO_PI * phw) + 0.25 * np.sin(2.0 * _cf_prims_TWO_PI * phw + 0.9)
+    amp_t = (P["amp_d"].reshape(n, 1) * P["amp_syn"].reshape(n, 1)
+             * (1.0 - P["rho"].reshape(n, 1) * cloud))
+    diurnal = np.where(has_diurnal, daily * amp_t, 0.0)
+
+    # frontal passages: smooth monotone ramps, not steps
+    E = 6
+    cnt = rng.poisson(np.maximum(P["front_rate"].reshape(n, 1) * L, 0.0), size=(n, E))
+    pos = rng.integers(0, L, size=(n, E)).astype(np.float64)
+    mag = rng.standard_normal((n, E)) * (P["front_mag"].reshape(n, 1)
+                                         * P["amp_syn"].reshape(n, 1))
+    width = np.maximum(P["front_ramp"].reshape(n, 1)
+                       * np.exp(rng.normal(0.0, 0.4, size=(n, E))), 1.0)
+    front = np.zeros((n, L))
+    for j in range(E):
+        idx = np.nonzero(cnt[:, j] > 0)[0]
+        if idx.size == 0:
+            continue
+        u = (t - pos[idx, j:j + 1]) / width[idx, j:j + 1]
+        front[idx] += mag[idx, j:j + 1] * 0.5 * (1.0 + u / (1.0 + np.abs(u)))
+
+    eps = ar1(rng, n, L, P["phi_e"]) * (P["sig_e"].reshape(n, 1)
+                                        * P["amp_syn"].reshape(n, 1))
+
+    ann = np.where(P["annual"].reshape(n, 1),
+                   P["annual_amp"].reshape(n, 1) * P["amp_syn"].reshape(n, 1)
+                   * ((t / L) - 0.5) ** 2 * 4.0, 0.0)
+
+    y = syn + diurnal + front + eps + ann
+    fl = new_flags(n, scale_mode=0, quant_boost=0.7, quant_rel_hi=0.35)
+    return y, fl
