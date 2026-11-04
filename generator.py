@@ -12610,3 +12610,300 @@ def _surveillance_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray
     cnt = np.where(roll_rows, rolled, cnt)
 
     return np.where(is_pct, pct, cnt)
+
+
+def _pull_counter_ramp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Monotone cumulative pull / download / table-size counters at a huge base
+    level: dockerhub_library_pull_counts, potaroo_bgp_table_size, hn_max_item.
+
+    Increment rate per step = base (log-U[0.3, 6e4]) x diurnal profile (P=48
+    on 60% of rows, 24 on 40%; log-depth U[0.1, 0.6], h1 share 0.5..0.85) x
+    weekday profile (weekend U[0.45, 0.95]) x CI-calendar dips (60% of rows:
+    U[2,4]-day dips of depth U[0.3, 0.55] every U[7, 16] days) x day scatter
+    (AR(1) over days, phi U[0.2, 0.6], sd U[0.15, 0.5]) x slow rate walk (sd
+    U[0.005, 0.025] per day) x a log-linear deceleration U[-0.1, 0.08] per
+    30 days (the feeds' last-15-day rate is 0.81..1.01x the 15 days before;
+    there are NO rate steps -- the rate over the next 720 steps is the rate the
+    context shows) x step noise (AR(1) lognormal, phi U[0.3, 0.8], sd
+    U[0.15, 0.6]). Increments are Poisson at that rate (sparse rows get their
+    flats from the law itself), plus explicit flats at U[0, 1]%. Base level
+    solved from the measured level/increment ratio log-U[8e4, 4e6]. 85% of
+    rows open with a constant prefix of U[0.3, 0.55] L at the first value
+    (the validator's left-padding of a 2459-step feed: the h720 pad fraction
+    lands on the feeds' 0.59 at the median) and 90% carry a
+    U[3, 8]-day launch PLATEAU right after it, at an amplitude (clipped to
+    2..10x) sized so the excess mass is U[0.38, 0.8] of the visible context's
+    steady mass: every dockerhub feed opens its VISIBLE context with that
+    scrape-start burst (days 0-6 at 2-8x), so the target rate is ~0.64x the
+    context-mean rate (IQR 0.53-0.68) while equal to the recent rate -- the
+    lesson is "continue the recent slope, not the average slope".
+    Exempt from the tail rebase (_NO_TAIL_REBASE): a collapse inside the last
+    1024 steps is exactly the target region this family exists to teach.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    t = _time_index(L)
+    ti = np.arange(L, dtype=np.int64)
+    P = np.where(rng.random((n, 1)) < 0.6, 48, 24)
+    nd = L // 24 + 2
+    day = ti[None, :] // P                                   # (n, L) day index per row
+
+    # diurnal profile (evaluated at the row's own period)
+    prof48 = _wc_profile(rng, n, 48, 0.5, 0.85)
+    prof24 = _wc_profile(rng, n, 24, 0.5, 0.85)
+    ph = rng.integers(0, 48, size=(n, 1))
+    idx = (ti[None, :] + ph) % P
+    shape = np.where(P == 48, np.take_along_axis(prof48, idx, axis=1), np.take_along_axis(prof24, idx % 24, axis=1))
+    diur = np.exp(rng.uniform(0.1, 0.6, size=(n, 1)) * shape)
+
+    # weekday profile + CI-calendar dips + day scatter + slow walk + deceleration
+    dow = (day + rng.integers(0, 7, size=(n, 1))) % 7
+    we = rng.uniform(0.45, 0.95, size=(n, 1))
+    wk = np.where(dow >= 5, we, np.exp(rng.normal(0.0, 0.05, size=(n, 7)))[np.arange(n)[:, None], dow])
+    dd = np.arange(nd, dtype=np.float64)[None, :]
+    has_dip = rng.random((n, 1)) < 0.6
+    every = rng.uniform(7.0, 16.0, size=(n, 1))
+    dlen = rng.uniform(2.0, 4.0, size=(n, 1))
+    depth = rng.uniform(0.3, 0.55, size=(n, 1))
+    phase = rng.uniform(0.0, 16.0, size=(n, 1))
+    in_dip = np.mod(dd + phase, every) < dlen
+    dip_d = np.where(has_dip & in_dip, 1.0 - depth, 1.0)
+    scat_d = np.exp(rng.uniform(0.15, 0.5, size=(n, 1)) * _wc_ar1(rng, n, nd, rng.uniform(0.2, 0.6, size=(n, 1))))
+    walk_d = np.cumsum(rng.normal(0.0, 1.0, size=(n, nd)) * rng.uniform(0.005, 0.025, size=(n, 1)), axis=1)
+    # mild deceleration of the settled rate (the feeds' last-15-day rate is
+    # 0.81..1.01x the 15 days before): log-linear U[-0.15, 0.05] per 30 days
+    trend_d = rng.uniform(-0.1, 0.08, size=(n, 1)) / 30.0 * (dd - 0.5 * nd)
+    day_fac = dip_d * scat_d * np.exp(walk_d + trend_d)
+    day_t = np.take_along_axis(day_fac, np.minimum(day, nd - 1), axis=1)
+
+    # step noise
+    noise = np.exp(rng.uniform(0.15, 0.6, size=(n, 1)) * _wc_ar1(rng, n, L, rng.uniform(0.3, 0.8, size=(n, 1))))
+
+    base_rate = np.exp(rng.uniform(np.log(0.3), np.log(6.0e4), size=(n, 1)))
+    rate = base_rate * diur * wk * day_t * noise
+
+    # constant prefix + launch plateau. The plateau's excess mass is sized
+    # against the context the validator's h720 window will actually show
+    # (the row minus the prefix minus the 720-step target), so the target
+    # rate / visible-mean-rate ratio lands on the feeds' 0.53..0.68 band
+    # whatever the prefix length; one-day linear step-down at its end.
+    pre = rng.random((n, 1)) < 0.85
+    cut = np.where(pre, (rng.uniform(0.3, 0.55, size=(n, 1)) * L).astype(np.int64), 0)
+    burst = rng.random((n, 1)) < 0.9
+    vis = np.maximum(L - _WC_H - cut, 1).astype(np.float64)
+    blen = rng.uniform(3.0, 8.0, size=(n, 1)) * P
+    excess = rng.uniform(0.38, 0.8, size=(n, 1))
+    bamp = np.clip(1.0 + excess * vis / blen, 2.0, 10.0)
+    since = t - cut
+    bfac = np.where(burst & (since >= 0.0),
+                    1.0 + (bamp - 1.0) * np.clip(1.0 - (since - blen) / P, 0.0, 1.0), 1.0)
+    rate = np.minimum(rate * bfac, 5.0e6)
+
+    inc = rng.poisson(np.maximum(rate, 0.0)).astype(np.float64)
+    flat = rng.random((n, L)) < rng.uniform(0.0, 0.01, size=(n, 1))
+    inc = np.where(flat | (ti[None, :] < cut), 0.0, inc)
+    rel = np.exp(rng.uniform(np.log(8.0e4), np.log(4.0e6), size=(n, 1)))
+    base = np.rint(base_rate * rel)
+    return base + np.cumsum(inc, axis=1)
+
+
+"""intraday_event_counts -- coverage family for the pool class
+``intraday_event_counts_lowcorr`` (288 eval windows over 3 chain panels,
+99 series / 80 source clusters: 911 / fire / police dispatch and CAD volumes,
+crime-incident and 311 request feeds, jail bookings, naloxone/crisis calls,
+DOI / package / CVE / malware-sample registration streams and TfL
+arrival-prediction feeds).  Self-contained: ``numpy`` only, every random
+number comes from the ``rng`` argument.  Style follows the c030 isolated
+stream builders (``_weekday_ledger_counts`` etc.).
+"""
+
+
+def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
+                                emit_empty: bool = False):
+    """Row bodies WITHOUT the validator-style constant prefix (see the public
+    builder below for the docstring with the measured statistics).
+
+    With ``emit_empty`` the empty bins keep their zero counts (no max(1, .))
+    and the call returns ``(y, drops_empty, is_event)``: which rows publish
+    only their non-empty bins, and which rows are event counts at all (the
+    arrival-prediction rows are not)."""
+    if n <= 0:
+        if emit_empty:
+            return (np.empty((0, L), dtype=np.float64), np.zeros(0, dtype=bool),
+                    np.zeros(0, dtype=bool))
+        return np.empty((0, L), dtype=np.float64)
+    t = np.arange(L, dtype=np.float64)[None, :]
+    ti = np.arange(L, dtype=np.int64)[None, :]
+    two_pi = 2.0 * np.pi
+
+    def ar1(innov: np.ndarray, phi: np.ndarray, sd: np.ndarray) -> np.ndarray:
+        # causal exponential kernel by FFT: stationary AR(1) with sd ``sd``
+        K = min(L, 320)
+        ker = phi ** np.arange(K, dtype=np.float64)[None, :]
+        m = L + K
+        spec = np.fft.rfft(innov, n=m, axis=1) * np.fft.rfft(ker, n=m, axis=1)
+        x = np.fft.irfft(spec, n=m, axis=1)[:, :L]
+        return x * sd * np.sqrt(1.0 - phi * phi)
+
+    mode = rng.random((n, 1))
+    is_b = mode < 0.15            # registration / submission streams with batch bursts
+    is_c = mode >= 0.85           # bounded arrival-prediction draws
+    # else: dispatch / incident counts (0.70)
+
+    # day length in SAMPLES: hourly 24, minute 60, half-hour 48, 5-min 288, ...
+    per_tab = np.array([24.0, 60.0, 48.0, 288.0, 96.0, 144.0])
+    per_cdf = np.cumsum(np.array([0.48, 0.22, 0.14, 0.12, 0.03, 0.01]))
+    P = per_tab[np.searchsorted(per_cdf, rng.random(n) * per_cdf[-1])][:, None]
+    tau = (t + rng.uniform(0.0, 1.0, size=(n, 1)) * P) / P    # time in days
+    day = np.floor(tau)
+    frac = tau - day
+    di = day.astype(np.int64)
+
+    # daily profile: log-cosine with a second harmonic, (max-min)/mean ~ 2a.
+    # Hourly / half-hourly dispatch feeds carry a clear daily cycle: the
+    # hour-of-day profile holds 0.39 (2-15 events per bin) to 0.48 (more)
+    # of the variance and the lag-one-day autocorrelation is 0.34 / 0.50,
+    # so the amplitude starts at 0.2 rather than at a near-flat 0.08.
+    a = np.exp(rng.uniform(np.log(0.2), np.log(1.5), size=(n, 1)))
+    a = np.where(is_b, a * rng.uniform(0.15, 0.7, size=(n, 1)), a)
+    a = np.where(P >= 60.0, a * rng.uniform(0.2, 0.7, size=(n, 1)), a)   # minute/5-min feeds: tiny counts hide the cycle
+    b = rng.uniform(0.0, 0.5, size=(n, 1))
+    psi = rng.uniform(0.0, two_pi, size=(n, 1))
+    ang = two_pi * frac
+    prof = np.exp(a * (np.cos(ang) + b * np.cos(2.0 * ang + psi)))
+    prof /= prof.mean(axis=1, keepdims=True)
+    del ang
+
+    # day-of-week profile
+    sw = rng.uniform(0.01, 0.10, size=(n, 1))
+    sw = np.where(is_b, rng.uniform(0.03, 0.2, size=(n, 1)), sw)
+    wk = np.exp(rng.normal(0.0, 1.0, size=(n, 7)) * sw)
+    we_rows = rng.random((n, 1)) < 0.10
+    wk[:, 5:] *= np.where(we_rows, rng.uniform(0.5, 0.9, size=(n, 1)), 1.0)
+    wk /= wk.mean(axis=1, keepdims=True)
+    dow = (di + rng.integers(0, 7, size=(n, 1))) % 7
+    wk_t = np.take_along_axis(wk, dow, axis=1)
+    del dow
+
+    # slow level: AR(1) on daily knots, linearly interpolated inside the day
+    nk = int(L // 24) + 3
+    tau_d = np.exp(rng.uniform(np.log(0.3), np.log(3.0), size=n))
+    phi_d = np.exp(-1.0 / tau_d)
+    sd_s = rng.uniform(0.02, 0.08, size=n)
+    sd_s = np.where(is_b[:, 0], rng.uniform(0.08, 0.3, size=n), sd_s)
+    e = rng.normal(0.0, 1.0, size=(n, nk))
+    knots = np.empty((n, nk), dtype=np.float64)
+    knots[:, 0] = e[:, 0]
+    s = np.sqrt(1.0 - phi_d * phi_d)
+    for k in range(1, nk):
+        knots[:, k] = phi_d * knots[:, k - 1] + s * e[:, k]
+    knots *= sd_s[:, None]
+    # multi-week drift on the same knots (tau log-U[10,60] d)
+    tau_m = np.exp(rng.uniform(np.log(10.0), np.log(60.0), size=n))
+    phi_m = np.exp(-1.0 / tau_m)
+    sd_m = rng.uniform(0.03, 0.25, size=n)
+    e = rng.normal(0.0, 1.0, size=(n, nk))
+    drift = np.empty((n, nk), dtype=np.float64)
+    drift[:, 0] = e[:, 0]
+    s = np.sqrt(1.0 - phi_m * phi_m)
+    for k in range(1, nk):
+        drift[:, k] = phi_m * drift[:, k - 1] + s * e[:, k]
+    knots += drift * sd_m[:, None]
+    slow = (np.take_along_axis(knots, di, axis=1) * (1.0 - frac)
+            + np.take_along_axis(knots, di + 1, axis=1) * frac)
+    del tau, day, frac, di
+
+    # fast within-day clustering of the latent rate; around its hour-of-day
+    # profile a dispatch feed has a variance of about 1.4x (2-15 events per
+    # bin) to 3.8x (more) its mean, so the per-bin log noise stays <= 0.3
+    phi_f = rng.uniform(0.2, 0.7, size=(n, 1))
+    sd_f = rng.uniform(0.05, 0.3, size=(n, 1))
+    sd_f = np.where(is_b, rng.uniform(0.05, 0.35, size=(n, 1)), sd_f)
+    fast = ar1(rng.normal(0.0, 1.0, size=(n, L)), phi_f, sd_f)
+
+    m = np.exp(rng.uniform(np.log(0.8), np.log(40.0), size=(n, 1)))
+    m = np.where(P >= 60.0, np.exp(rng.uniform(np.log(0.5), np.log(8.0), size=(n, 1))), m)   # minute/5-min bins
+    m = np.where(is_b, np.exp(rng.uniform(np.log(0.5), np.log(30.0), size=(n, 1))), m)
+    # one small permanent log-step on 20% of rows (long-horizon level uncertainty)
+    st_rows = rng.random((n, 1)) < 0.2
+    st_pos = (rng.uniform(0.1, 0.95, size=(n, 1)) * L).astype(np.int64)
+    st_mag = rng.normal(0.0, 0.35, size=(n, 1))
+    step = np.where(st_rows & (ti >= st_pos), st_mag, 0.0)
+    lam = m * prof * wk_t * np.exp(slow + fast + step)
+    del prof, wk_t, slow, fast, step
+
+    # batch bursts (stream rows): x(1+B), B log-U[2,60], 70% with a 6-step decaying tail
+    pb = rng.uniform(0.005, 0.08, size=(n, 1))
+    ev = (rng.random((n, L)) < pb) & is_b
+    burst = np.where(ev, np.exp(rng.uniform(np.log(2.0), np.log(60.0), size=(n, L))), 0.0)
+    dec = rng.uniform(0.2, 0.7, size=(n, 1)) * (rng.random((n, 1)) < 0.7)
+    tail = burst.copy()
+    for k in range(1, 7):
+        tail[:, k:] += burst[:, :-k] * dec ** k
+    exc_rows = is_b & (rng.random((n, 1)) < 0.12)
+    e0 = (rng.uniform(0.05, 0.9, size=(n, 1)) * L).astype(np.int64)
+    elen = np.exp(rng.uniform(np.log(10.0), np.log(300.0), size=(n, 1)))
+    emag = np.exp(rng.uniform(np.log(3.0), np.log(30.0), size=(n, 1)))
+    exc = np.where(exc_rows & (ti >= e0) & (ti < e0 + elen), emag, 1.0)
+    lam = lam * (1.0 + tail) * exc
+    del ev, burst, tail, exc
+
+    # gamma-Poisson observation, then the feed's empty-bin drop (max(1, .))
+    r = np.exp(rng.uniform(np.log(4.0), np.log(80.0), size=(n, 1)))
+    r = np.where(is_b, np.exp(rng.uniform(np.log(4.0), np.log(40.0), size=(n, 1))), r)
+    g = rng.gamma(r, 1.0 / r, size=(n, L))
+    y = rng.poisson(np.minimum(lam * g, 1.0e6)).astype(np.float64)
+    del lam, g
+    trunc = rng.random((n, 1)) < 0.9
+    if not emit_empty:
+        y = np.where(trunc, np.maximum(y, 1.0), y)
+
+    # unit lattice (baton-rouge style): counts x a piecewise-constant unit 2..12
+    lat = np.nonzero(((~is_b) & (~is_c) & (rng.random((n, 1)) < 0.05))[:, 0])[0]
+    if lat.size:
+        nl = lat.size
+        q = 1.0 / rng.uniform(2.0, 40.0, size=(nl, 1))
+        chg = rng.random((nl, L)) < q
+        chg[:, 0] = True
+        src = np.maximum.accumulate(np.where(chg, ti, 0), axis=1)
+        unit = np.take_along_axis(rng.integers(2, 13, size=(nl, L)).astype(np.float64), src, axis=1)
+        y[lat] = y[lat] * unit
+
+    # bounded arrival-prediction rows: iid mixture (near-zero exponential +
+    # uniform up to the cap) rank-matched to a Gaussian AR(1) for lag1 0-0.4
+    idx_c = np.nonzero(is_c[:, 0])[0]
+    if idx_c.size:
+        nc = idx_c.size
+        cap = np.where(rng.random((nc, 1)) < 0.8, 1800.0,
+                       np.exp(rng.uniform(np.log(900.0), np.log(12000.0), size=(nc, 1))))
+        w = rng.uniform(0.03, 0.35, size=(nc, 1))
+        sc = cap * rng.uniform(0.03, 0.12, size=(nc, 1))
+        yi = np.where(rng.random((nc, L)) < w,
+                      rng.exponential(1.0, size=(nc, L)) * sc,
+                      rng.uniform(0.0, 1.0, size=(nc, L)) * cap)
+        yi = np.clip(np.rint(yi), 1.0, cap)
+        z = ar1(rng.normal(0.0, 1.0, size=(nc, L)), rng.uniform(0.0, 0.4, size=(nc, 1)),
+                np.ones((nc, 1)))
+        ranks = np.argsort(np.argsort(z, axis=1), axis=1)
+        y[idx_c] = np.take_along_axis(np.sort(yi, axis=1), ranks, axis=1)
+    if emit_empty:
+        is_event = ~is_c[:, 0]
+        return y, trunc[:, 0] & is_event, is_event
+    return y
+
+
+"""intraday_spot_price -- coverage family for the electricity_price_intraday
+pool class (day-ahead / market-index / hourly spot / real-time dispatch prices
+at 5-30 min and hourly cadence).  Deterministic seeded numpy only.
+"""
+
+
+def _isp_ar1(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
+    """y[t] = phi * y[t-1] + innov[t] along axis 1; phi is (n, 1).  Runs on the
+    transposed array so every step touches one contiguous vector."""
+    n, L = innov.shape
+    x = np.ascontiguousarray(innov.T)
+    p = np.reshape(phi, -1)
+    for k in range(1, L):
+        x[k] += p * x[k - 1]
+    return x.T
