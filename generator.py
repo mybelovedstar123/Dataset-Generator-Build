@@ -9860,3 +9860,292 @@ def _gamma_warp_apply(out: np.ndarray, rows: np.ndarray, gamma: np.ndarray) -> N
                 # Keep the complete original arithmetic for unmirrored and
                 # sub-floor-span rows, including exactly constant inputs.
                 out[i, t] = lo + span * (u ** g)
+
+
+def _measurement_artifacts(
+    rng: np.random.Generator,
+    block: np.ndarray,
+    *,
+    preserve_nonnegative: bool,
+    clip_nonnegative: bool | None = None,
+    repair_degenerate_rollback: bool = False,
+    preserve_integers: bool | np.ndarray = False,
+    allow_reverse: bool = True,
+    allow_range_artifacts: bool = True,
+    censor_rate: float = 0.06,
+    censor_upper_frac: float = 0.5,
+    censor_q_lo: float = 0.03,
+    censor_q_hi: float = 0.30,
+    peak_transient_rate: float = 0.0,
+    quantize_rate: float = 0.07,
+    regular_hold_rate: float = 0.04,
+    irregular_hold_rate: float = 0.0,
+    irregular_hold_prob_lo: float = 0.01,
+    irregular_hold_prob_hi: float = 0.10,
+    shock_row_rate: float = 0.0,
+    shock_prob_lo: float = 0.001,
+    shock_prob_hi: float = 0.015,
+    amp_trend_rate: float = 0.36,
+    kernel_spike_rate: float = 0.2,
+    periodic_spike_frac: float = 0.0,
+    time_warp_rate: float = 0.12,
+    global_dilation_rate: float = 0.0,
+    duty_cycle_rate: float = 0.1,
+    nonuniform_quantize_frac: float = 2.0 / 3.0,
+    preserve_pre_gamma_shape: bool = False,
+    gamma_warp_rate: float = 0.0,
+    hold_block_rate: float = 0.0,
+    post_amp_drift_rate: float = 0.0,
+    nonneg_skip_range_artifacts: float = 0.0,
+) -> np.ndarray:
+
+
+    if clip_nonnegative is None:
+        clip_nonnegative = preserve_nonnegative
+    original = np.asarray(block, dtype=np.float64)
+    # The legacy chain mutates its input. Keep a real rollback reference only
+    # when requested; the all-off control remains byte-identical to V144.
+    working = original.copy() if repair_degenerate_rollback else original
+    # TiRex-2 stage-1 / time-discretisation portables run BEFORE the existing
+    # censor/quantize/hold chain so those still see the post-augment series.
+    out = _tirex2_marginal_augments(
+        rng,
+        working,
+        amp_trend_rate=amp_trend_rate,
+        kernel_spike_rate=kernel_spike_rate,
+        periodic_spike_frac=periodic_spike_frac,
+        time_warp_rate=time_warp_rate,
+        global_dilation_rate=global_dilation_rate,
+        duty_cycle_rate=duty_cycle_rate,
+    )
+    n, L = out.shape
+
+    # 191 p46: per-row gamma power warp of the amplitude range, BEFORE
+    # censor/quantize/hold. Helps sales/energy shapes that are mostly
+    # monotone in level but need a heavier or lighter mid-range.
+    if gamma_warp_rate > 0.0:
+        # The conditional selection quantile is uniform and independent of
+        # the existing exponent draw. Reuse it; do not shift downstream RNG.
+        warp_u = rng.random(n)
+        warp_rows = np.nonzero(warp_u < gamma_warp_rate)[0]
+        if warp_rows.size:
+            gamma = rng.uniform(1.5, 3.2, size=warp_rows.size)
+            mirrored = warp_u[warp_rows] < gamma_warp_rate * 0.25
+            gamma = np.where(mirrored, -gamma, gamma)
+            # Consume the original selection/exponent draws in both arms.
+            # Other observation maps and the caller RNG stream stay intact.
+            if not preserve_pre_gamma_shape:
+                _gamma_warp_apply(
+                    out,
+                    np.ascontiguousarray(warp_rows, dtype=np.int64),
+                    np.ascontiguousarray(gamma, dtype=np.float64),
+                )
+
+    reverse = (
+        rng.random(n) < 0.06
+        if allow_reverse
+        else np.zeros(n, dtype=bool)
+    )
+    out[reverse] = out[reverse, ::-1]
+
+    if not preserve_nonnegative:
+        invert = rng.random(n) < 0.04
+        out[invert] *= -1.0
+
+    # 191 p45: when the family owns nonnegative semantics, zero the rates of
+    # censor / quantize / hold / hold-blocks. Energy (grid_flow, spiky_price,
+    # price_shock), web ops counts, and sales intermittent all land here —
+    # the domains 191 wins vs king. Signed econ families keep the full chain.
+    range_scale = (
+        0.0
+        if (nonneg_skip_range_artifacts > 0.5 and preserve_nonnegative)
+        else 1.0
+    )
+    censor_rate = censor_rate * range_scale
+    quantize_rate = quantize_rate * range_scale
+    regular_hold_rate = regular_hold_rate * range_scale
+    irregular_hold_rate = irregular_hold_rate * range_scale
+    hold_block_rate = hold_block_rate * range_scale
+
+    calibration_len = min(L, 512)
+    shocked = np.nonzero(rng.random(n) < shock_row_rate)[0]
+    if shocked.size and L > 1:
+        diff = np.diff(out[shocked, :calibration_len], axis=1)
+        center = _median_rows(diff)
+        robust_scale = 1.4826 * _median_rows(np.abs(diff - center))
+        fallback = np.maximum(np.std(diff, axis=1, keepdims=True), 1e-9)
+        robust_scale = np.where(robust_scale > 1e-9, robust_scale, fallback)
+        event_prob = rng.uniform(
+            shock_prob_lo, shock_prob_hi, size=(shocked.size, 1)
+        )
+        event_rows, event_cols = np.nonzero(
+            rng.random((shocked.size, L)) < event_prob
+        )
+        if event_rows.size:
+            favored_sign = _CHOICE_PM1[
+                rng.integers(0, 2, size=(shocked.size, 1))
+            ]
+            sign = np.where(
+                rng.random(event_rows.size) < 0.75,
+                favored_sign[event_rows, 0],
+                -favored_sign[event_rows, 0],
+            )
+            magnitude = rng.lognormal(
+                mean=np.log(4.0), sigma=0.6, size=event_rows.size
+            )
+            out[
+                shocked[event_rows], event_cols
+            ] += sign * magnitude * robust_scale[event_rows, 0]
+        if clip_nonnegative:
+            np.maximum(out, 0.0, out=out)
+
+
+    censor_rows = np.nonzero(rng.random(n) < censor_rate)[0]
+    if censor_rows.size:
+        # Same interleaved draws as the old per-row loop:
+        # uniform(q) then random() for the bound, once per selected row.
+        # rng.uniform(lo, hi) is (hi-lo)*random()+lo, so 2*N sequential
+        # random() values reproduce that stream exactly.
+        pair = rng.random(2 * censor_rows.size)
+        qs = censor_q_lo + (censor_q_hi - censor_q_lo) * pair[0::2]
+        uppers = pair[1::2] < censor_upper_frac
+        if allow_range_artifacts:
+            q_eff = np.where(uppers, 1.0 - qs, qs)
+            threshold = _quantile_rows(out[censor_rows, :calibration_len], q_eff)
+            x = out[censor_rows]
+            thr = threshold[:, None]
+            out[censor_rows] = np.where(
+                uppers[:, None], np.minimum(x, thr), np.maximum(x, thr)
+            )
+
+    quantized = np.nonzero(rng.random(n) < quantize_rate)[0]
+    if quantized.size:
+        # TiRex-2 App.F: value discretisation in uniform / quantile / power-law
+        # regimes. Uniform (legacy) keeps the prior behaviour; the other two
+        # densify levels near typical values or in the heavy tail.
+        if allow_range_artifacts:
+            x = out[quantized]
+            calibration = x[:, :calibration_len]
+            lo = calibration.min(axis=1)
+            hi = calibration.max(axis=1)
+            live = (hi - lo) >= 1e-12
+            modes = np.zeros(quantized.size, dtype=np.int64)
+            levels = np.ones(quantized.size, dtype=np.int64)
+            ps = np.empty(quantized.size, dtype=np.float64)
+            for i in np.nonzero(live)[0]:
+                # Degenerate rows still consume no extra RNG, matching the
+                # original continue-before-draw.
+                if rng.random() < nonuniform_quantize_frac:
+                    modes[i] = int(rng.integers(1, 3))
+                else:
+                    modes[i] = 0
+                levels[i] = int(rng.integers(16, 257))
+                if modes[i] == 2:
+                    ps[i] = float(rng.uniform(0.35, 0.85))
+            m0 = live & (modes == 0)
+            if m0.any():
+                lo0 = lo[m0][:, None]
+                hi0 = hi[m0][:, None]
+                step = (hi0 - lo0) / np.maximum(levels[m0] - 1, 1)[:, None]
+                x[m0] = lo0 + np.rint((np.clip(x[m0], lo0, hi0) - lo0) / step) * step
+            for i in np.nonzero(live & (modes == 1))[0]:
+                qs = np.linspace(0.0, 1.0, int(levels[i]))
+                edges = np.quantile(calibration[i], qs)
+                idx = np.searchsorted(edges, x[i], side="left")
+                idx = np.clip(idx, 0, int(levels[i]) - 1)
+                x[i] = edges[idx]
+            for i in np.nonzero(live & (modes == 2))[0]:
+                u = np.linspace(0.0, 1.0, int(levels[i])) ** ps[i]
+                edges = lo[i] + (hi[i] - lo[i]) * u
+                idx = np.searchsorted(edges, np.clip(x[i], lo[i], hi[i]), side="left")
+                idx = np.clip(idx, 0, int(levels[i]) - 1)
+                x[i] = edges[idx]
+            out[quantized] = x
+
+
+    held = np.nonzero(rng.random(n) < regular_hold_rate)[0]
+    if held.size:
+        factors = _HOLD_FACTORS[
+            _HOLD_FACTOR_CDF.searchsorted(rng.random(held.size), side="right")
+        ]
+        for factor in (2, 4, 8):
+            rows = held[factors == factor]
+            if rows.size:
+                out[rows] = np.repeat(
+                    out[rows, ::factor], factor, axis=1
+                )[:, :L]
+
+
+    irregular = np.nonzero(rng.random(n) < irregular_hold_rate)[0]
+    if irregular.size and L > 1:
+        hold_prob = rng.uniform(
+            irregular_hold_prob_lo,
+            irregular_hold_prob_hi,
+            size=(irregular.size, 1),
+        )
+        hold = rng.random((irregular.size, L)) < hold_prob
+        hold[:, 0] = False
+        source_index = np.where(
+            ~hold, np.arange(L, dtype=np.int64)[None, :], 0
+        )
+        np.maximum.accumulate(source_index, axis=1, out=source_index)
+        out[irregular] = np.take_along_axis(
+            out[irregular], source_index, axis=1
+        )
+
+    # Last of the value stages, so it sees the plateaus the holds and the
+    # quantizer just created rather than only the ones a family emitted.
+    if peak_transient_rate > 0.0 and allow_range_artifacts:
+        _relax_high_plateaus(
+            rng, out, peak_transient_rate, calibration_len
+        )
+
+    # 191 p44: random hold-blocks (copy a short prefix across a contiguous
+    # window). Gated by range_scale so nonnegative families that skip
+    # censor/quantize also skip these synthetic flats.
+    if hold_block_rate > 0.0 and L > 32:
+        for row in np.nonzero(rng.random(n) < hold_block_rate)[0]:
+            for _ in range(int(rng.integers(1, 4))):
+                length = int(rng.integers(max(8, L // 20), max(16, L // 4)))
+                start = int(rng.integers(0, max(1, L - length)))
+                out[row, start:start + length] = out[row, start]
+
+    # 191 p43: slow multiplicative amplitude drift AFTER the artifact chain.
+    # Distinct from TiRex amp_trend (which runs first and recentres about the
+    # median): this is a pure level scale so nonnegative floors stay floors.
+    if post_amp_drift_rate > 0.0 and L > 1:
+        drift_rows = np.nonzero(rng.random(n) < post_amp_drift_rate)[0]
+        if drift_rows.size:
+            by_k: dict[int, list[np.ndarray]] = {}
+            row_by_k: dict[int, list[int]] = {}
+            for row in drift_rows:
+                n_knots = int(rng.integers(3, 8))
+                knot_a = np.cumsum(rng.normal(0.0, 0.15, size=n_knots))
+                knot_a = knot_a - knot_a.mean()
+                by_k.setdefault(n_knots, []).append(knot_a)
+                row_by_k.setdefault(n_knots, []).append(int(row))
+            for n_knots, knots in by_k.items():
+                envelope = np.exp(
+                    np.clip(_interp_linspace_rows(np.stack(knots), L), -0.8, 0.8)
+                )
+                out[np.asarray(row_by_k[n_knots], dtype=np.intp)] *= envelope
+            if clip_nonnegative:
+                np.maximum(out, 0.0, out=out)
+
+    if isinstance(preserve_integers, np.ndarray):
+        if preserve_integers.dtype != np.bool_ or preserve_integers.shape != (n,):
+            raise ValueError("preserve_integers must be a bool or a per-row boolean mask")
+        integer_rows = np.flatnonzero(preserve_integers)
+        if integer_rows.size:
+            out[integer_rows] = np.rint(out[integer_rows])
+            if clip_nonnegative:
+                out[integer_rows] = np.maximum(out[integer_rows], 0.0)
+    elif preserve_integers:
+        out = np.rint(out)
+        if clip_nonnegative:
+            out = np.maximum(out, 0.0)
+
+
+    degenerate = out[:, :calibration_len].std(axis=1) < 1e-9
+    out[degenerate] = original[degenerate]
+    return out
