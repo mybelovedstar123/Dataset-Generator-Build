@@ -11288,3 +11288,210 @@ def _apply_interior_rebase_episode(
     )
     values[:, :end] = episode
     return values
+
+
+def _apply_tail_rebase(
+    rng: np.random.Generator,
+    block: np.ndarray,
+    rate: float,
+    *,
+    periodic_continue: bool = False,
+    preserve_periodic_native: bool = False,
+    _route_mode: str = "all",
+) -> np.ndarray:
+    """Teach only continuations supported by generated pre-boundary context.
+
+    A 512-sample causal prefix reserves its last 96 points for validating a
+    possible 7/12/24/48/96-step cycle or an unusually clear robust linear
+    continuation. A cycle must be non-flat, have small normalized validation
+    error, and beat persistence by at least 25 percent. A line is much stricter:
+    error at most 0.08, at most 30 percent of persistence error, and a projected
+    96-step move between 0.2 and 0.9 robust spans. Other rows retain the
+    context-conditioned persistence law from V152.
+    """
+    if rate <= 0.0:
+        return block
+    n, L = block.shape
+    if n == 0 or L < 608:
+        return block
+    selected = rng.random(n) < rate
+    back = rng.integers(256, min(721, L - 32), size=n)
+    boundary = L - back
+    offsets = np.arange(-512, 0, dtype=np.int64)[None, :]
+    pre = np.take_along_axis(block, boundary[:, None] + offsets, axis=1)
+    recent = pre[:, -192:]
+    delta = np.abs(np.diff(recent, axis=1))
+    q10, q90 = np.quantile(recent, (0.10, 0.90), axis=1)
+    peak = np.max(np.abs(recent), axis=1)
+    span = np.maximum.reduce((q90 - q10, peak * 1e-12,
+                              np.full(n, 1e-12)))
+    tol = np.maximum(peak * 1e-12, 1e-12)
+    repeat_fraction = np.mean(delta <= tol[:, None], axis=1)
+    local_move = np.quantile(delta, 0.90, axis=1) / span
+    drift = np.abs(
+        np.median(recent[:, -32:], axis=1)
+        - np.median(recent[:, :32], axis=1)
+    ) / span
+    recurring_nonflat = np.zeros(n, dtype=bool)
+    strict_linear = np.zeros(n, dtype=bool)
+    best_lag = np.full(n, 7, dtype=np.int64)
+    anchors = np.median(recent[:, -16:], axis=1)
+    if periodic_continue:
+        fit = pre[:, :-96]
+        val = pre[:, -96:]
+        fit_anchor = np.median(fit[:, -16:], axis=1)
+        hold_error = np.mean(
+            np.abs(val - fit_anchor[:, None]), axis=1
+        ) / span
+        slope = (
+            np.median(fit[:, -32:], axis=1)
+            - np.median(fit[:, -64:-32], axis=1)
+        ) / 32.0
+        linear_pred = fit_anchor[:, None] + slope[:, None] * np.arange(
+            1, 97, dtype=np.float64
+        )[None, :]
+        linear_error = np.mean(np.abs(val - linear_pred), axis=1) / span
+        projected_move = np.abs(slope) * 96.0 / span
+        strict_linear = (
+            (linear_error <= 0.08)
+            & (linear_error <= 0.30 * hold_error)
+            & (projected_move >= 0.20)
+            & (projected_move <= 0.90)
+        )
+        away_fraction = np.mean(
+            np.abs(fit - fit_anchor[:, None]) > (0.05 * span)[:, None], axis=1
+        )
+        periodic_error = np.full(n, np.inf)
+        for lag in (7, 12, 24, 48, 96):
+            cycle = fit[:, -lag:]
+            pred = np.tile(cycle, (1, (96 + lag - 1) // lag))[:, :96]
+            err = np.mean(np.abs(val - pred), axis=1) / span
+            better = err < periodic_error
+            periodic_error[better] = err[better]
+            best_lag[better] = lag
+        recurring_nonflat = (
+            (away_fraction >= 0.15)
+            & (periodic_error <= 0.12)
+            & (periodic_error <= 0.75 * hold_error)
+        )
+    long_recurring = np.zeros(n, dtype=bool)
+    long_histories = {}
+    if _LONG_CYCLE_ENABLED and periodic_continue:
+        pending = np.flatnonzero(selected & (~recurring_nonflat) & (~strict_linear)
+                                 & (boundary >= 1024))
+        if pending.size:
+            long_offsets = np.arange(-1024, 0, dtype=np.int64)[None, :]
+            long_pre = block[pending[:, None], boundary[pending, None] + long_offsets]
+            long_ok, long_lag = _validated_long_cycle(long_pre)
+            accepted = pending[long_ok]
+            long_recurring[accepted] = True
+            best_lag[accepted] = long_lag[long_ok]
+            for pos in np.flatnonzero(long_ok):
+                long_histories[int(pending[pos])] = long_pre[pos]
+    if _LONGER_CYCLE_ENABLED and periodic_continue:
+        pending = np.flatnonzero(selected & (~recurring_nonflat) & (~strict_linear)
+                                 & (~long_recurring) & (boundary >= 2048))
+        if pending.size:
+            longer_offsets = np.arange(-2048, 0, dtype=np.int64)[None, :]
+            longer_pre = block[pending[:, None], boundary[pending, None] + longer_offsets]
+            longer_ok, longer_lag = _validated_longer_cycle(longer_pre)
+            accepted = pending[longer_ok]
+            long_recurring[accepted] = True
+            best_lag[accepted] = longer_lag[longer_ok]
+            for pos in np.flatnonzero(longer_ok):
+                long_histories[int(pending[pos])] = longer_pre[pos]
+    eligible = selected & (~recurring_nonflat) & (~strict_linear) & (~long_recurring) & (
+        (repeat_fraction >= 0.35)
+        | ((local_move <= 0.03) & (drift <= 0.12))
+    )
+    hold = rng.random(n) < 0.95
+    retain = rng.uniform(0.05, 0.25, size=n)
+    periodic_rows = selected & (recurring_nonflat | long_recurring)
+    linear_rows = selected & strict_linear & (~recurring_nonflat)
+    # Fixed row parity gives a source-, target- and horizon-independent 50%
+    # mechanism dose without consuming another random draw or perturbing any
+    # downstream RNG stream. Half retain their native generated future; the
+    # other half keep V213's clipped-linear continuation.
+    native_linear_rows = linear_rows & ((np.arange(n, dtype=np.int64) & 1) == 0)
+    if _route_mode not in ("all", "periodic", "quiet"):
+        raise ValueError("invalid continuation route mode")
+    if _route_mode == "periodic":
+        eligible = np.zeros(n, dtype=bool)
+        linear_rows = np.zeros(n, dtype=bool)
+        native_linear_rows = np.zeros(n, dtype=bool)
+    elif _route_mode == "quiet":
+        periodic_rows = np.zeros(n, dtype=bool)
+        linear_rows = np.zeros(n, dtype=bool)
+        native_linear_rows = np.zeros(n, dtype=bool)
+    # A jumped, deterministic substream leaves every parent draw intact.
+    cycle_rng = np.random.Generator(rng.bit_generator.jumped())
+    for row in np.nonzero(eligible | periodic_rows | linear_rows)[0]:
+        b = int(boundary[row])
+        if periodic_rows[row]:
+            if preserve_periodic_native:
+                continue
+            lag = int(best_lag[row])
+            block[row, b:] = _empirical_cycle_tail(
+                long_histories.get(row, pre[row]), lag, L - b, cycle_rng, _CYCLE_PREDICTIVE_MODE)
+            continue
+        if linear_rows[row]:
+            if native_linear_rows[row]:
+                continue
+            slope_now = (
+                np.median(pre[row, -32:])
+                - np.median(pre[row, -64:-32])
+            ) / 32.0
+            line = anchors[row] + slope_now * np.arange(1, L - b + 1)
+            block[row, b:] = np.clip(
+                line, anchors[row] - span[row], anchors[row] + span[row]
+            )
+            continue
+        anchor = float(anchors[row])
+        if hold[row]:
+            tail = np.full(L - b, anchor)
+        else:
+            tail = anchor + float(retain[row]) * (block[row, b:] - anchor)
+        block[row, b:] = tail
+    return block
+
+
+def _apply_zero_inflation(rng: np.random.Generator, block: np.ndarray) -> np.ndarray:
+    """Clip the bottom slice of a minority of nonnegative rows to exact 0.
+
+    For each selected row, values at or below a threshold interpolated
+    between that row's own minimum and median (a random fraction per row,
+    so the zero-run length varies series to series) are set to exactly 0.
+    This creates real sustained zero-floor stretches — the shape rare-event
+    count series (dispatch calls, curtailed output) actually have — rather
+    than the merely-small-positive values the nonneg/integer prior alone
+    produces.
+    """
+    n = block.shape[0]
+    if n == 0:
+        return block
+    mask = rng.random(n) < _ZERO_INFLATE_ROW_FRAC
+    if not mask.any():
+        return block
+    sel = np.nonzero(mask)[0]
+    rows = block[sel]
+    row_min = rows.min(axis=1, keepdims=True)
+    row_med = _median_rows(rows)
+    frac = rng.uniform(
+        _ZERO_INFLATE_FLOOR_FRAC_LO, _ZERO_INFLATE_FLOOR_FRAC_HI, size=(sel.size, 1)
+    )
+    thresh = row_min + frac * np.maximum(row_med - row_min, 0.0)
+    rows = np.where(rows <= thresh, 0.0, rows)
+    block[sel] = rows
+    return block
+
+
+_SPIKE_PATTERNS_BY_CATEGORY: tuple[tuple[tuple[int, ...], ...], ...] = (
+    ((0,), (0, 1)),
+    ((0, 1, 2), (0, 0, 1)),
+    ((0, 0, 1, 1), (0, 1, 0, 2)),
+    ((0, 0, 0, 0, 0, 1, 1), (0, 0, 0, 0, 0, 1, 2)),
+)
+_SPIKE_CATEGORY_PROBS = np.array([0.75, 0.10, 0.10, 0.05])
+_SPIKE_CATEGORY_CDF = _choice_cdf(_SPIKE_CATEGORY_PROBS)
+_DUTY_PERIODS = np.array([4, 8, 12, 16, 24, 48])
+_NO_ROWS = np.empty(0, dtype=np.int64)
