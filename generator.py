@@ -2876,3 +2876,145 @@ def b5_build(P, rng, L, cad, cal, cfg):
 
     fl = new_flags(n, scale_mode=0, quant_boost=1.0)
     return y, fl
+
+
+# ═══════════════════════ B6 ops_rate_plateau ═══════════════════════════════
+
+_LADDER_MANT = np.array([1.0, 2.0, 5.0])
+
+
+def b6_params(rng, B, cfg):
+    p = cfg["families"]["ops_rate_plateau"]
+    n_lvl = rng.integers(3, 6, B)
+    exp0 = rng.integers(-2, 6, B)
+    return {
+        "n_lvl": n_lvl,
+        "exp0": exp0,
+        "mant": _LADDER_MANT[rng.integers(0, 3, (B, 5))],
+        "expo": rng.integers(0, 2, (B, 5)),
+        "switch_tau": logu(rng, p["plateau_dwell"][0], p["plateau_dwell"][1], B),
+        "phi": rng.uniform(0.8, 0.995, B),
+        "demand_cv": rng.uniform(0.15, 0.8, B),
+        "diurnal_amp": rng.uniform(0.1, 1.0, B),
+    }
+
+
+def b6_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    ph, has_day = _daily_phase(rng, n, L, cad.p_day)
+    prof = 1.0 + P["diurnal_amp"].reshape(n, 1) * np.where(has_day, np.sin(_cf_prims_TWO_PI * ph), 0.0)
+    demand = np.maximum(prof, 0.05) * np.exp(
+        ar1(rng, n, L, P["phi"]) * P["demand_cv"].reshape(n, 1))
+
+    M = 64
+    dwell = np.exp(rng.normal(np.log(P["switch_tau"]).reshape(n, 1), 0.8, size=(n, M)))
+    seg_id, _ = segment_map(np.maximum(dwell, 2.0), L)
+    ladder = P["mant"] * np.power(10.0, P["expo"] + P["exp0"].reshape(n, 1))
+    ladder = ladder / np.maximum(ladder.mean(axis=1, keepdims=True), 1e-12)
+    pick = rng.integers(0, np.maximum(P["n_lvl"].reshape(n, 1), 1), size=(n, M))
+    caps = np.take_along_axis(ladder, np.clip(pick, 0, 4), axis=1)
+    cap_t = gather_levels(caps, seg_id)
+
+    y = np.minimum(demand, cap_t)
+    extended = np.zeros(n, dtype=bool)
+    if cfg.get('_complete_native_renewals', False):
+        rr, dd, first = complete_dwell_table(
+            rng, np.maximum(dwell, 2.0), L, P['switch_tau'].reshape(n, 1),
+            np.full((n, 1), 0.8), 2.0)
+        if rr.size:
+            extended[rr] = True
+            extra_pick = rng.integers(0, np.maximum(P['n_lvl'][rr, None], 1),
+                                      size=(rr.size, dd.shape[1] - M))
+            extra_caps = np.take_along_axis(ladder[rr], np.clip(extra_pick, 0, 4), axis=1)
+            full_caps = np.concatenate((caps[rr], extra_caps), axis=1)
+            sid, _ = segment_map(dd, L)
+            fixed = np.minimum(demand[rr], gather_levels(full_caps, sid))
+            t = time_grid(L)[None, :]
+            y[rr] = np.where(t >= first[:, None], fixed, y[rr])
+
+    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.4, obs_boost=0.7)
+    if cfg.get('_complete_native_renewals', False):
+        fl['renewal_extended'] = extended
+    return y, fl
+
+
+from numba import njit as _cas1_njit
+
+@_cas1_njit(cache=False, fastmath=False, nogil=True)
+def _cas1_lindley_kernel(service, gap, initial):
+    n, length = service.shape
+    waits = np.empty_like(service)
+    for i in range(n):
+        if length == 0:
+            continue
+        waits[i, 0] = initial[i]
+        for t in range(1, length):
+            work = waits[i, t-1] + service[i, t-1] - gap[i, t]
+            waits[i, t] = max(work, 0.)
+    return waits
+
+
+def _cas1_workload_waits(service, gap, initial):
+    """gap[:,t] precedes job t; gap[:,0] is unused. +inf clears the queue."""
+    b, a = (np.asarray(x, dtype=np.float64) for x in (service, gap))
+    w = np.asarray(initial, dtype=np.float64)
+    if b.ndim != 2 or a.shape != b.shape or w.shape != (len(b),):
+        raise ValueError('Matched service/gap matrices and an initial-work vector required')
+    if (not np.isfinite(b).all() or not np.isfinite(w).all() or np.isnan(a).any()
+            or (b < 0).any() or (a < 0).any() or (w < 0).any()):
+        raise ValueError('Finite nonnegative service/work and nonnegative gaps required')
+    out = _cas1_lindley_kernel(b, a, w)
+    if not np.isfinite(out).all():
+        raise ValueError('Workload overflow; do not silently clip')
+    return out
+
+
+def _cas1_initial_workload(rng, rho, lognormal, sigma, shape, service):
+    """Ideal constant-rho M/G/1 initial workload, before subsequent time variation."""
+    rho, sigma, shape, service = (np.asarray(x, dtype=np.float64)
+                                 for x in (rho, sigma, shape, service))
+    ln = np.asarray(lognormal)
+    if rho.ndim != 1 or any(x.shape != rho.shape for x in (sigma, shape, service, ln)):
+        raise ValueError('Matching parameter vectors required')
+    if (ln.dtype.kind != 'b' or any(not np.isfinite(x).all() for x in (rho, sigma, shape, service))
+            or ((rho < 0) | (rho >= 1)).any() or (sigma < 0).any()
+            or (shape <= 1).any() or (service <= 0).any()):
+        raise ValueError('Invalid stable queue/service parameters')
+    count = rng.geometric(1.-rho) - 1
+    out = np.zeros(len(rho), dtype=np.float64)
+    for i in range(len(rho)):
+        number = int(count[i])
+        if number == 0:
+            continue
+        if ln[i]:
+            biased = service[i] * np.exp(.5*sigma[i]**2 + sigma[i]*rng.standard_normal(number))
+        else:
+            lower = service[i]*(shape[i]-1.)/shape[i]
+            biased = lower*(1.+rng.pareto(shape[i]-1., size=number))
+        out[i] = np.sum(rng.random(number)*biased)
+    if not np.isfinite(out).all():
+        raise ValueError('Initial workload overflow; do not truncate its tail')
+    return out
+
+
+def _cas1_workload_response(P, rho, obs, parent, rng):
+    """Only non-aggregate rows change; all old draws precede this child stream."""
+    rows = np.flatnonzero(~P['agg'])
+    out = parent.copy()
+    if rows.size == 0 or parent.shape[1] == 0:
+        return out
+    service = P['service'][rows]
+    initial = _cas1_initial_workload(rng, rho[rows, 0], P['lognorm'][rows],
+                                    P['ln_sig'][rows], P['pareto_a'][rows], service)
+    durations = service[:, None]*obs[rows]
+    utilization = rho[rows]
+    gap = np.full_like(durations, np.inf)
+    exponential = rng.exponential(size=durations.shape)
+    np.divide(service[:, None]*exponential, utilization, out=gap, where=utilization > 0.)
+    out[rows] = _cas1_workload_waits(durations, gap, initial) + durations
+    if not np.isfinite(out).all():
+        raise ValueError('Nonfinite response time')
+    return out
+
+
+_CAS1_WORKLOAD_ENABLED = True
