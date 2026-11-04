@@ -6956,3 +6956,298 @@ def _bounded_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     quiet = rng.random((n, 1)) < 0.35
     folded = np.where(quiet, folded, folded + rng.normal(0.0, 0.35, size=(n, L)))
     return np.clip(np.rint(folded), 0.0, cap)
+
+
+def _held_rate(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Near-constant series with 0-3 rare, grid-quantised steps.
+
+    The archetype is a policy rate: flat for months, then one 25bp move. Most
+    rows carry literally zero noise between steps, so the only calibrated
+    forecast is "the last value, with almost no width". step_level cannot teach
+    this — its jumps are too frequent and its sizes unquantised.
+    """
+    base = rng.uniform(-2.0, 8.0, size=(n, 1))
+    grid = rng.choice(np.array([0.05, 0.1, 0.25, 0.5]), size=(n, 1))
+    k = rng.integers(0, 4, size=(n, 1))                     # 0-3 steps per window
+    draw = rng.random((n, L))
+    at = draw < (_held_hazard(k, 2.0, False) / max(L, 1))
+    del draw
+    at[:, 0] = False
+    lvl = rng.choice(np.array([-2.,-1.,1.,2.]), size=(n, L))
+    lvl *= grid                                             # step sizes on the grid
+    lvl *= at                                               # zero where no step fires
+    del at
+    np.cumsum(lvl, axis=1, out=lvl)
+    lvl += base
+    exact = rng.random((n, 1)) < 0.8
+    sd = np.where(exact, 0.0, rng.uniform(0.001, 0.01, size=(n, 1)))
+    noise = rng.normal(0.0, 1.0, size=(n, L))
+    noise *= sd
+    lvl += noise
+    del noise
+    scale = np.exp(rng.uniform(np.log(0.5), np.log(200.0), size=(n, 1)))
+    lvl *= scale
+    return lvl
+
+
+def _spiky_price(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Day-ahead electricity price: daily+weekly cycle, two-sided heavy-tailed
+    spikes with short persistence, volatility regimes, occasional negatives.
+
+    The lesson is the opposite of held_rate's: a series whose recent window
+    shows spikes deserves a WIDE interval, but only then — the quiet stretches
+    between spike clusters are still narrow-interval territory.  Healthcare-plus
+    keeps that conditional lesson but uses a mild tail dose so rare energy rows
+    do not globally widen forecasts for smooth bounded domains.
+    """
+    t = _time_index(L)
+    day = rng.choice(np.array([24.0, 48.0, 96.0]), size=(n, 1))
+    amp = rng.uniform(0.2, 1.0, size=(n, 1))
+    cyc = amp * np.sin(2*np.pi*t/day + rng.uniform(0, 2*np.pi, (n, 1)))
+    cyc += 0.4*amp*np.sin(4*np.pi*t/day + rng.uniform(0, 2*np.pi, (n, 1)))
+    week = 0.3*amp*np.sin(2*np.pi*t/(day*7) + rng.uniform(0, 2*np.pi, (n, 1)))
+    lvl = _ar1_batch(rng.normal(0.0, 0.05, size=(n, L)),
+                     rng.uniform(0.995, 0.9999, size=(n, 1)))
+    hot = _ar1_batch(rng.normal(0.0, 1.0, size=(n, L)),
+                     rng.uniform(0.95, 0.995, size=(n, 1)))
+    hot = hot > np.quantile(hot, rng.uniform(0.7, 0.95), axis=1, keepdims=True)
+    spike_p = rng.uniform(0.001, 0.010, size=(n, 1)) * (1 + 3*hot)
+    hits = rng.random((n, L)) < spike_p
+    mag = rng.standard_t(5, size=(n, L)) * rng.uniform(0.3, 1.6, size=(n, 1))
+    spikes = _ar1_batch(hits * mag, rng.uniform(0.25, 0.65, size=(n, 1)))
+    out = cyc + week + lvl + spikes
+    scale = np.exp(rng.uniform(np.log(5.0), np.log(300.0), size=(n, 1)))
+    shift = rng.uniform(0.0, 2.0, size=(n, 1))
+    return (out + shift) * scale          # negatives possible when spikes dip
+
+
+def _epi_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Counts whose log-rate is piecewise linear: growth phases turning into
+    decay, times a day-of-week multiplicative pattern. Poisson/negbin draws.
+
+    Covers epidemic curves and campaign-style traffic: the decay slope is
+    readable from the context, so a calibrated model can narrow its interval
+    along the decaying tail instead of hedging against a rebound.
+    """
+    t = _time_index(L)
+    k = rng.integers(2, 6)
+    knots = np.sort(rng.uniform(0, L, size=(n, k)), axis=1)
+    slopes = rng.uniform(-0.004, 0.003, size=(n, k+1))
+    log_rate = np.zeros((n, L))
+    prev = np.zeros((n, 1))
+    for i in range(k+1):
+        lo = prev
+        hi = knots[:, i:i+1] if i < k else np.full((n, 1), float(L))
+        seg = np.clip(t, lo, hi) - lo
+        log_rate = log_rate + slopes[:, i:i+1] * seg
+        prev = hi
+    day = rng.choice(np.array([1.0, 24.0, 48.0]), size=(n, 1), p=[0.5, 0.3, 0.2])
+    period = np.where(day == 1.0, 7.0, day * 7)
+    dow = rng.uniform(0.1, 0.6, size=(n, 1)) * np.sin(
+        2*np.pi*t/period + rng.uniform(0, 2*np.pi, (n, 1)))
+    base = np.exp(rng.uniform(np.log(3.0), np.log(3000.0), size=(n, 1)))
+    lam = base * np.exp(np.clip(log_rate + dow, -8.0, 6.0))
+    np.clip(lam, 0.0, 5.0e6, out=lam)
+    over = rng.random((n, 1)) < 0.5
+    shape = rng.uniform(0.6, 4.0, size=(n, 1))
+    mixed = lam * rng.gamma(shape, 1.0/shape, size=(n, L))
+    return rng.poisson(np.where(over, mixed, lam)).astype(np.float64)
+
+
+def _sticky_station(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Small-integer, extremely sticky, capacity-reflected random walk.
+
+    Fitted to the pool's dominant profile, MEASURED from 60 GBFS
+    station_status windows of block-8730000 (65% of the pool by window count):
+    hold fraction p10/p50/p90 = 0.54/0.84/0.94; capacity 8/18/42; moves are
+    almost all +-1 with no big rebalancing jumps at 20%-of-capacity scale;
+    daily autocorrelation median ~0.0 (tides are NOT dominant); lag1 ~0.99.
+
+    The quantile lesson: the next value IS the current value with high
+    probability, and uncertainty grows only slowly with horizon - tight
+    near-term quantiles on a sticky integer walk.
+
+    High-turnover stations are the other half of the same feeds: city-centre
+    docks and 5-min snapshots of busy systems change on 15-85% of steps, often
+    by several bikes at once (P(|d|=1 | move) ~0.45-0.8), and hover around a
+    typical fill level (level sd ~0.2 of capacity, variance ratio at 256 steps
+    ~0.06-0.3) instead of drifting across the whole capacity. Half of the rows
+    outside the minute-sticky regime follow that law.
+    """
+    cap = np.exp(rng.normal(np.log(18.0), 0.55, size=(n, 1)))
+    cap = np.clip(np.rint(cap), 4.0, 80.0)
+    hold = rng.beta(3.2, 1.0, size=(n, 1)) * 0.42 + 0.53      # ~0.55..0.95
+    # Minute-cadence docks (Oslo/Trondheim/Zagreb/Divvy/Indego) hold 0.94-0.998
+    # of steps: 60% of rows draw from that regime.
+    very = rng.random((n, 1)) < 0.6
+    hold = np.where(very, 1.0 - np.exp(rng.uniform(np.log(0.002), np.log(0.06), size=(n, 1))), hold)
+    step2 = rng.uniform(0.03, 0.15, size=(n, 1))              # of the moves
+    move = rng.random((n, L)) >= hold
+    mag = np.where(rng.random((n, L)) < step2, 2.0, 1.0)
+    sgn = np.where(rng.random((n, L)) < 0.5, -1.0, 1.0)
+    # weak daily modulation for a minority of rows (measured: mostly absent)
+    t = _time_index(L)
+    period = rng.choice(np.array([96.0, 144.0, 288.0]), size=(n, 1))
+    tide = rng.random((n, 1)) < 0.3
+    bias = np.where(tide, 0.35, 0.0) * np.sin(
+        2*np.pi*t/period + rng.uniform(0, 2*np.pi, (n, 1)))
+    sgn = np.where(rng.random((n, L)) < 0.5 + bias, sgn, -sgn)
+    steps = move * mag * sgn
+    start = np.where(rng.random((n, 1)) < 0.2, rng.uniform(0.0, 0.1, size=(n, 1)),
+                     rng.uniform(0.15, 0.85, size=(n, 1)))
+    walk = start * cap + np.cumsum(steps, axis=1)
+    span = 2.0 * cap
+    out = cap - np.abs(np.mod(walk, span) - cap)              # reflect at 0/cap
+    out = np.rint(out)
+    # High-turnover docks: the change per step is a geometric number of bikes
+    # whose tail grows with turnover, and the count relaxes toward the
+    # station's usual level with a time constant that holds the level spread
+    # at 12-30% of capacity.
+    busy = ~very[:, 0] & (rng.random(n) < 0.5)
+    k = int(busy.sum())
+    if k:
+        rate = np.exp(rng.uniform(np.log(0.15), np.log(0.85), size=(k, 1)))
+        tail = np.minimum(0.06 + 0.7 * rate, 0.65)
+        size = 1.0 + np.floor(np.log(1.0 - rng.random((k, L))) / np.log(tail))
+        np.minimum(size, 12.0, out=size)
+        moved = rng.random((k, L)) < rate
+        sign = np.where(rng.random((k, L)) < 0.5, -1.0, 1.0)
+        bcap = np.exp(rng.normal(np.log(26.0), 0.45, size=(k, 1)))
+        bcap = np.clip(np.rint(bcap), 8.0, 80.0)
+        spread = rng.uniform(0.12, 0.3, size=(k, 1)) * bcap
+        second = (1.0 + tail) / (1.0 - tail) ** 2                # E[size^2]
+        relax = np.clip(2.0 * spread * spread / (rate * second), 6.0, 600.0)
+        keep = 1.0 - 1.0 / relax
+        dev = _ar1_batch(moved * size * sign, keep)
+        dev += (rng.normal(0.0, 1.0, size=(k, 1)) * spread
+                * keep ** np.arange(L, dtype=np.float64)[None, :])
+        level = rng.uniform(0.3, 0.7, size=(k, 1)) * bcap
+        out[busy] = np.clip(np.rint(level + dev), 0.0, bcap)
+    return out
+
+
+def _grid_flow(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Power-grid series: a hard 96-step daily profile, values free to go
+    negative, heavy-tailed jumps, and a very smooth carrier.
+
+    Fitted to the feeds our king actually LOSES on in the duel receipt
+    (energy_charts public_power / day_ahead_price / co2_intensity, national
+    demand): measured lag1 0.985, seasonal autocorrelation 0.79 at lag 96 for
+    33 of 49 sampled windows, kurtosis 11, 1.9% of steps beyond 3 sigma, and a
+    tenth of the windows spending most of their time BELOW zero.
+
+    The last property is why an existing family could not cover this: every
+    generator we ship is positive or symmetric around a positive level, so the
+    corpus never taught a quantile spread on the negative side of an axis that
+    real prices and cross-border flows cross constantly.
+    """
+    t = _time_index(L)
+    # 96 dominates; keep a minority on the other measured cadences
+    period = rng.choice(np.array([96.0, 96.0, 96.0, 24.0, 288.0, 48.0]), size=(n, 1))
+    prof = np.zeros((n, L))
+    for k in (1.0, 2.0, 3.0):
+        prof += (rng.uniform(0.25, 1.0, size=(n, 1)) / k) * np.sin(
+            2 * np.pi * k * t / period + rng.uniform(0, 2 * np.pi, size=(n, 1)))
+    week = 0.25 * rng.uniform(0.2, 1.0, size=(n, 1)) * np.sin(
+        2 * np.pi * t / (period * 7) + rng.uniform(0, 2 * np.pi, size=(n, 1)))
+    # smooth carrier: lag1 ~0.985 comes from the level, not from the profile
+    carrier = _ar1_batch(rng.normal(0.0, 1.0, size=(n, L)),
+                         rng.uniform(0.995, 0.9999, size=(n, 1)))
+    carrier = carrier / np.maximum(np.std(carrier, axis=1, keepdims=True), 1e-9)
+    # Heavy tails, but bounded: standard_t(3) at full weight drove kurtosis to
+    # 120 against a measured 11 — the spikes then dominate the series and the
+    # profile the model must learn disappears underneath them.
+    hit = rng.random((n, L)) < rng.uniform(0.004, 0.016, size=(n, 1))
+    mag = np.clip(rng.standard_t(4, size=(n, L)), -6.0, 6.0) * rng.uniform(0.20, 0.75, size=(n, 1))
+    spikes = _ar1_batch(hit * mag, rng.uniform(0.25, 0.70, size=(n, 1)))
+    # The daily profile is the dominant signal (measured lag-96 autocorrelation
+    # 0.79), the smooth carrier supplies lag1 0.985, noise is a garnish.
+    amp = rng.uniform(1.0, 2.4, size=(n, 1))
+    y = amp * (prof + week) + rng.uniform(0.15, 0.45, size=(n, 1)) * carrier + spikes
+    scale = np.exp(rng.uniform(np.log(3.0), np.log(900.0), size=(n, 1)))
+    # a tenth of rows live mostly below zero; the rest sit on a positive level
+    below = rng.random((n, 1)) < 0.22
+    level = np.where(below, rng.uniform(-1.2, 0.1, size=(n, 1)),
+                            rng.uniform(0.4, 3.0, size=(n, 1)))
+    return (y + level) * scale
+
+
+def _price_shock(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """A spike that MEAN-REVERTS on a known clock, not a random walk that jumps.
+
+    The second measured property of the feeds our king loses on: an excursion
+    is followed by a return, and the return has a timescale. A generator that
+    only knows "jumps happen" teaches a permanently wider interval after every
+    shock; one that knows "and it comes back in ~k steps" teaches the interval
+    to CLOSE again. Healthcare-plus keeps the clock but uses fewer, smaller,
+    faster-closing shocks to avoid teaching excess spread outside energy.
+    """
+    t = _time_index(L)
+    period = rng.choice(np.array([96.0, 96.0, 24.0, 288.0]), size=(n, 1))
+    base = rng.uniform(0.4, 1.4, size=(n, 1)) * np.sin(
+        2 * np.pi * t / period + rng.uniform(0, 2 * np.pi, size=(n, 1)))
+    # shocks arrive, then decay back to the profile with a per-row half-life
+    rate = rng.uniform(0.0015, 0.010, size=(n, 1))
+    hit = (rng.random((n, L)) < rate).astype(np.float64)
+    sign = np.where(rng.random((n, L)) < 0.62, 1.0, -1.0)      # upward-skewed
+    size = np.abs(np.clip(rng.standard_t(5, size=(n, L)), -6, 6)) * rng.uniform(0.3, 1.4, size=(n, 1))
+    decay = rng.uniform(0.50, 0.90, size=(n, 1))               # faster known clock
+    shock = _ar1_batch(hit * sign * size, decay)
+    carrier = _ar1_batch(rng.normal(0.0, 1.0, size=(n, L)),
+                         rng.uniform(0.99, 0.9995, size=(n, 1)))
+    carrier = carrier / np.maximum(np.std(carrier, axis=1, keepdims=True), 1e-9)
+    y = base + shock + rng.uniform(0.15, 0.5, size=(n, 1)) * carrier
+    scale = np.exp(rng.uniform(np.log(2.0), np.log(600.0), size=(n, 1)))
+    level = np.where(rng.random((n, 1)) < 0.18,
+                     rng.uniform(-1.0, 0.2, size=(n, 1)), rng.uniform(0.5, 3.0, size=(n, 1)))
+    return (y + level) * scale
+
+
+# Grafted from buddy777's public round-8737200 entry (their family "k21"),
+# renamed. Their insight is worth adopting whole: a harmonic family emits a
+# clean constituent sum, so the model learns the cycle and then has nothing to
+# say about the DEPARTURE from it — and at a 64-step horizon the departure is
+# the forecastable part. The construction encodes that asymmetry directly:
+# a sharp rise and a long decay built from two AR(1) passes with different
+# coefficients, volatility-clustered wind-sea on top, and a wandering datum.
+def _coastal_residual(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Coastal observation: a tidal skeleton plus the weather-driven residual.
+
+    Harmonic families emit a clean constituent sum, so a model learns the tide
+    and then has nothing to say about the departure from it. Real gauges and
+    buoys carry a non-tidal residual — multi-day storm surge with a sharp rise
+    and a long decay, wind-sea whose amplitude clusters in time, and a slowly
+    wandering datum. Those departures are the forecastable part at a 64-step
+    horizon, and they are absent from a pure-harmonic prior.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    t = _time_index(L)
+    P0 = np.exp(rng.uniform(np.log(20.0), np.log(60.0), size=(n, 1)))
+    tide = np.sin(2.0 * np.pi * t / P0 + rng.uniform(0, 2 * np.pi, size=(n, 1)))
+    tide = tide + rng.uniform(0.15, 0.7, size=(n, 1)) * np.sin(
+        2.0 * np.pi * t / (P0 * 1.9323) + rng.uniform(0, 2 * np.pi, size=(n, 1)))
+    beat = P0 * rng.uniform(12.0, 32.0, size=(n, 1))
+    tide = tide * (1.0 + rng.uniform(0.1, 0.55, size=(n, 1)) * np.sin(
+        2.0 * np.pi * t / beat + rng.uniform(0, 2 * np.pi, size=(n, 1))))
+    tidal_frac = rng.uniform(0.0, 1.0, size=(n, 1))
+    onset = rng.random((n, L)) < rng.uniform(1.5, 8.0, size=(n, 1)) / max(L, 1)
+    amp = np.exp(rng.normal(rng.uniform(-0.6, 0.9, size=(n, 1)),
+                            rng.uniform(0.4, 1.0, size=(n, 1)), size=(n, L))) * onset
+    rise = rng.uniform(0.55, 0.9, size=(n, 1))
+    fall = rng.uniform(0.97, 0.999, size=(n, 1))
+    surge = _ar1_batch(0.6 * amp, fall) - 0.55 * _ar1_batch(amp, rise)
+    logvol = _ar1_batch(rng.normal(0.0, 1.0, size=(n, L))
+                        * rng.uniform(0.05, 0.3, size=(n, 1)),
+                        rng.uniform(0.95, 0.999, size=(n, 1)))
+    sea = np.exp(np.clip(logvol, -4.0, 4.0)) * rng.normal(0.0, 1.0, size=(n, L)) \
+        * rng.uniform(0.05, 0.4, size=(n, 1))
+    datum = np.cumsum(rng.normal(0.0, 1.0, size=(n, L)), axis=1) \
+        * rng.uniform(0.0, 0.02, size=(n, 1)) / np.sqrt(max(L, 1))
+    x = tidal_frac * tide + rng.uniform(0.3, 1.6, size=(n, 1)) * surge + sea + datum
+    x = (x - x.mean(axis=1, keepdims=True)) / np.maximum(x.std(axis=1, keepdims=True), 1e-9)
+    scale = np.exp(rng.uniform(np.log(0.05), np.log(200.0), size=(n, 1)))
+    offset = rng.normal(0.0, 3.0, size=(n, 1)) * scale
+    y = x * scale + offset
+    positive = rng.random((n, 1)) < 0.45
+    return np.where(positive, np.abs(y) + 0.05 * scale, y)
