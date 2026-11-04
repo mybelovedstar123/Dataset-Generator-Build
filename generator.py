@@ -2577,3 +2577,76 @@ def _daily_phase(rng, n, L, p_day, min_res=3.0):
     pd = np.asarray(p_day).reshape(n, 1)
     has = pd >= min_res
     return np.where(has, t / np.where(has, pd, 1e9), 0.0) + rng.random((n, 1)), has
+
+
+# ═══════════════════════ B1 ops_diurnal_traffic ════════════════════════════
+
+def b1_params(rng, B, cfg):
+    p = cfg["families"]["ops_diurnal_traffic"]
+    return {
+        "base": logu(rng, 1.0, 5.0e4, B),
+        "theta_taylor": rng.uniform(p["taylor_exponent"][0], p["taylor_exponent"][1], B),
+        "cv": logu(rng, 0.03, 0.6, B),
+        "burst_on": rng.random(B) < p["burst_rate"],
+        "branch": rng.uniform(0.2, 0.85, B),
+        "burst_tau": logu(rng, 3.0, 120.0, B),
+        "mark_sig": rng.uniform(0.6, 1.6, B),
+        "burst_mu": logu(rng, 1e-4, 5e-3, B),
+        "count_emit": rng.random(B) < p["count_emit_rate"],
+        "nb_k": logu(rng, 0.5, 200.0, B),
+        "weekend": np.exp(rng.normal(np.log(0.42), 0.5, B)),
+        "sat_sun": np.exp(rng.normal(0.0, 0.25, B)),
+        "trend": rng.normal(0.0, 0.25, B),
+        "growth_on": rng.random(B) < 0.45,
+        "dst": rng.random(B) < p["dst_rate"],
+    }
+
+
+def b1_demand(P, rng, L, cad, cal, cfg):
+    """Shared demand process — also the driver for B2's controller."""
+    n = cad.n
+    t = time_grid(L)[None, :]
+    ph, has_day = _daily_phase(rng, n, L, cad.p_day)
+    # Civil-time operational feeds shift by an hour twice a year; the weather
+    # families deliberately do NOT, because that source requests UTC.
+    ph = ph + np.where(P["dst"].reshape(n, 1), dst_shift(rng, cal, 1.0), 0.0)
+    prof = profile_trapezoid(rng, n, L, ph)
+    prof = np.where(has_day, prof, 0.0)
+    prof = prof - prof.min(axis=1, keepdims=True)
+    m = np.maximum(prof.mean(axis=1, keepdims=True), 1e-9)
+    shape = 0.25 + 0.75 * prof / m
+
+    wk = np.ones((n, 7))
+    wk[:, 5] = P["weekend"]
+    wk[:, 6] = P["weekend"] * P["sat_sun"]
+    weekly = apply_dow(wk, cal)
+
+    trend = np.where(P["growth_on"].reshape(n, 1),
+                     np.exp(P["trend"].reshape(n, 1) * t / L), 1.0)
+
+    lam = P["base"].reshape(n, 1) * shape * weekly * trend
+
+    # bursts arrive when traffic is high: immigrant rate proportional to lambda
+    mu = (P["burst_mu"].reshape(n, 1) * shape
+          * np.where(P["burst_on"].reshape(n, 1), 1.0, 0.0))
+    _, cnt = hawkes(rng, n, L, np.ascontiguousarray(mu), P["branch"], P["burst_tau"])
+    marks = cnt * np.exp(rng.normal(0.0, P["mark_sig"].reshape(n, 1), size=(n, L)))
+    burst = decay_convolve(marks, P["burst_tau"])
+    lam = lam * (1.0 + 2.5 * burst)
+    return np.maximum(lam, 0.0)
+
+
+def b1_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    lam = b1_demand(P, rng, L, cad, cal, cfg)
+    # Taylor's law heteroscedasticity: sigma proportional to lambda^theta
+    z = rng.standard_normal((n, L))
+    sig = P["cv"].reshape(n, 1) * np.power(np.maximum(lam, 1e-12),
+                                           P["theta_taylor"].reshape(n, 1))
+    y = np.maximum(lam + sig * z, 0.0)
+    ci = P["count_emit"].reshape(n, 1)
+    counts = nb_counts(rng, lam, P["nb_k"])
+    y = np.where(ci, counts, y)
+    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.8)
+    fl["integer"] = P["count_emit"]
+    return y, fl
