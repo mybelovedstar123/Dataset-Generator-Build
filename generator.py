@@ -17526,3 +17526,302 @@ class _pt_Generator(DataGenerator):
                 x = x + (np.round(offset) if float(np.all(x == np.round(x))) else offset)
             np.clip(x, -3e+37, 3e+37, out=x)
             yield x
+
+
+# ═════════════════════════════ the generator ═════════════════════════════════
+# Probability that a row gets a partner-family second channel, and the
+
+# ---- Own-code teaching partner families (pandemic-to-endemic sums, syndromic
+# percent feeds, exchange traffic, sub-daily profiles, tides, rain, river stage,
+# counters, generic dynamics, held levels). ----
+import math  # noqa: E402
+from numba import njit  # noqa: E402
+
+_T_YEAR = 365.25
+_T_MASK32 = 0xFFFFFFFF
+
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _t_ar1(innov, phi):
+    n, L = innov.shape
+    out = np.empty((n, L))
+    for i in range(n):
+        p = phi[i]
+        prev = 0.0
+        for t in range(L):
+            prev = p * prev + innov[i, t]
+            out[i, t] = prev
+    return out
+
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _t_bump_kernel(cen, amp, wl, wr, p_l, p_r, flat, out):
+    """out[i, j] += expm1(a * max(1 - |d/w|^p, 0)) on each wave's own support only."""
+    n, K = cen.shape
+    W = out.shape[1]
+    for i in range(n):
+        for k in range(K):
+            a = amp[i, k]
+            if a <= 0.0:
+                continue
+            c = cen[i, k]
+            fl = flat[i, k]
+            j0 = int(math.floor(c - wl[i, k]))
+            j1 = int(math.ceil(c + wr[i, k] + fl)) + 1
+            if j0 < 0:
+                j0 = 0
+            if j1 > W:
+                j1 = W
+            for j in range(j0, j1):
+                d = j - c
+                if d > 0.0:
+                    d = d - fl
+                    if d < 0.0:
+                        d = 0.0
+                    x = (d / wr[i, k]) ** p_r[i, k]
+                else:
+                    x = (-d / wl[i, k]) ** p_l[i, k]
+                if x < 1.0:
+                    out[i, j] += math.expm1(a * (1.0 - x))
+    return out
+
+
+def _t_bumps_fast(W, cen, amp, rise, fall, p_l, p_r, flat):
+    """Same bump sum as _t_bumps on a width-W grid whose column j is time j."""
+    root = np.sqrt(np.log(5.0) / np.maximum(amp, 1e-6))
+    f = np.ascontiguousarray
+    out = np.zeros((cen.shape[0], int(W)))
+    return _t_bump_kernel(f(cen, dtype=np.float64), f(amp, dtype=np.float64), f(rise / root, dtype=np.float64),
+                          f(fall / root, dtype=np.float64), f(p_l, dtype=np.float64), f(p_r, dtype=np.float64),
+                          f(flat, dtype=np.float64), out)
+
+
+def _t_ar1_rows(rng, n, L, phi, sd):
+    """Stationary unit-scaled AR(1) rows times per-row sd (phi, sd: (n,) arrays)."""
+    e = rng.standard_normal((n, L))
+    e *= (sd * np.sqrt(np.maximum(1.0 - phi * phi, 1e-12)))[:, None]
+    return _t_ar1(e, np.ascontiguousarray(phi, dtype=np.float64))
+
+
+def _t_pad_left(x, S):
+    """Keep the last S[i] points of row i and repeat its first kept value before them."""
+    n, L = x.shape
+    S = np.clip(np.asarray(S, dtype=np.int64).reshape(-1), 64, L)
+    start = L - S
+    col = np.arange(L)[None, :]
+    first = x[np.arange(n), start][:, None]
+    return np.where(col < start[:, None], first, x)
+
+
+def _t_eval_len(rng, n, lo=260.0):
+    """Series lengths following the eval pool's context+horizon CDF."""
+    u = rng.random(n)
+    return np.interp(u, [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.0],
+                     [lo, 520.0, 1000.0, 2300.0, 3500.0, 4096.0, 4096.0])
+
+
+def _t_bumps(t, cen, amp, rise, fall, p_l, p_r, flat):
+    """sum_k expm1(a_k * max(1 - |d/w|^p, 0)), flat top of flat_k days; computed on support only."""
+    n, K = cen.shape
+    L = t.shape[-1]
+    out = np.zeros((n, L))
+    root = np.sqrt(np.log(5.0) / np.maximum(amp, 1e-6))
+    wl_all = rise / root
+    wr_all = fall / root
+    for k in range(K):
+        c = cen[:, k:k + 1]
+        wl = wl_all[:, k:k + 1]
+        wr = wr_all[:, k:k + 1]
+        fl = flat[:, k:k + 1]
+        j0 = max(int(np.floor((c - wl).min())), 0)
+        j1 = min(int(np.ceil((c + wr + fl).max())) + 1, L)
+        if j1 <= j0:
+            continue
+        d = t[:, j0:j1] - c
+        d = np.where(d > 0.0, np.maximum(d - fl, 0.0), d)
+        left = d < 0.0
+        x = np.abs(d) / np.where(left, wl, wr)
+        x = np.power(x, np.where(left, p_l[:, k:k + 1], p_r[:, k:k + 1]))
+        out[:, j0:j1] += np.expm1(amp[:, k:k + 1] * np.maximum(1.0 - x, 0.0))
+    return out
+
+
+def _t_weekday(rng, n, L, sd=0.08, we_lo=0.55, we_hi=0.95):
+    prof = np.exp(rng.normal(0.0, sd, size=(n, 7)))
+    prof[:, 5:] *= rng.uniform(we_lo, we_hi, size=(n, 1))
+    prof /= prof.mean(axis=1, keepdims=True)
+    ph = rng.integers(0, 7, size=(n, 1))
+    return np.take_along_axis(prof, (np.arange(L)[None, :] + ph) % 7, axis=1)
+
+
+def _t_nb(rng, lam, r):
+    """Negative-binomial counts with mean lam and shape r (gamma-Poisson)."""
+    g = rng.gamma(np.broadcast_to(r, lam.shape), 1.0) / r
+    return rng.poisson(np.minimum(lam * g, 1e8)).astype(np.float64)
+
+
+# --------------------------------------------------------------------------- #
+# 1. pandemic -> endemic hospitalisation feeds (rki / ukhsa / nys covid)
+# --------------------------------------------------------------------------- #
+def _t_covid_waves(rng, n, L):
+    """Big pandemic-era waves, then small seasonal endemic waves on deep troughs.
+
+    Pandemic MULTIPLIES WAVE AMPLITUDES, not the floor, so every trough stays deep;
+    the endemic envelope shrinks year on year; the row ends at the live edge with
+    right-truncated reporting on 65% of rows. Observed as 7-day rolling integer SUMS
+    (60%), daily counts (20%) or 7-day incidence per 100k at a 0.01 tick (20%).
+    Built on a grid aligned at each row's onset (column j = day j of the record),
+    then right-aligned into the (n, L) block, the pre-onset span padded with the
+    first observed value (the validator's left pad).
+    """
+    S = rng.integers(1700, 2751, size=n)
+    W = int(S.max())
+    tau = np.arange(W, dtype=np.float64)[None, :]
+    P = rng.uniform(1000.0, 1450.0, size=n)
+    seasonal = rng.random(n) < 0.65
+    winter = rng.uniform(0.0, _T_YEAR, size=n)
+    K = 40
+    gap_p = rng.uniform(55.0, 170.0, size=(n, K))
+    gap_i = rng.uniform(110.0, 330.0, size=(n, K))
+    jit_s = rng.normal(0.0, 22.0, size=(n, K))
+    cen = np.empty((n, K))
+    cur = rng.uniform(10.0, 60.0, size=n)
+    for k in range(K):
+        cen[:, k] = cur
+        nxt_w = winter + _T_YEAR * np.ceil((cur + 150.0 - winter) / _T_YEAR) + jit_s[:, k]
+        cur = np.where(cur < P, cur + gap_p[:, k], np.where(seasonal, nxt_w, cur + gap_i[:, k]))
+    live = cen < (S[:, None] + 200.0)
+    in_pand = cen < P[:, None]
+    scale_p = rng.uniform(np.log(30.0), np.log(800.0), size=(n, 1))
+    amp_p = (scale_p + rng.normal(0.0, 0.45, size=(n, K))
+             + np.where(cen < 300.0, np.log(rng.uniform(0.1, 0.9, size=(n, K))), 0.0))
+    yrs_e = np.maximum(cen - P[:, None], 0.0) / _T_YEAR
+    amp_e = (scale_p + rng.uniform(np.log(0.15), np.log(0.80), size=(n, 1))
+             + rng.normal(0.0, 0.35, size=(n, K)) - rng.uniform(0.0, 0.35, size=(n, 1)) * yrs_e)
+    amp = np.clip(np.where(in_pand, amp_p, amp_e), np.log(1.5), np.log(6000.0))
+    amp = np.where(live, amp, 0.0)
+    rise = np.where(in_pand, rng.uniform(22.0, 60.0, size=(n, K)), rng.uniform(12.0, 40.0, size=(n, K)))
+    fall = np.where(in_pand, rng.uniform(35.0, 110.0, size=(n, K)), rng.uniform(20.0, 75.0, size=(n, K)))
+    sharp = rng.random((n, K)) < 0.75
+    p_l = np.where(sharp, rng.uniform(0.8, 1.5, size=(n, K)), 2.0)
+    p_r = np.where(sharp, rng.uniform(0.7, 1.4, size=(n, K)), 2.0)
+    flat = np.where((~in_pand) & (rng.random((n, K)) < 0.5), rng.uniform(8.0, 50.0, size=(n, K)), 0.0)
+    # a broad elevated plateau late in the pandemic era on 75% of rows (Omicron-like
+    # overlapping waves): it lifts that year's troughs to 10-30% of the pandemic scale
+    has_pl = rng.random(n) < 0.75
+    pl_c = (P - rng.uniform(120.0, 260.0, size=n))[:, None]
+    pl_a = np.where(has_pl[:, None], scale_p + rng.uniform(np.log(0.10), np.log(0.30), size=(n, 1)), 0.0)
+    pl_r = rng.uniform(40.0, 90.0, size=(n, 1))
+    pl_f = rng.uniform(60.0, 140.0, size=(n, 1))
+    pl_fl = rng.uniform(200.0, 330.0, size=(n, 1))
+    # summer waves (endemic era, half the seasonal rows) ride as extra columns
+    summer = (seasonal & (rng.random(n) < 0.5))[:, None] & ~in_pand & live
+    c2 = cen + rng.uniform(150.0, 230.0, size=(n, K))
+    a2 = np.where(summer, np.maximum(amp + np.log(rng.uniform(0.2, 0.8, size=(n, K))), np.log(1.0001)), 0.0)
+    two = np.full((n, 1), 2.0)
+    ex = _t_bumps_fast(W, np.concatenate([cen, c2, pl_c - pl_fl], 1), np.concatenate([amp, a2, pl_a], 1),
+                       np.concatenate([rise, rise, pl_r], 1), np.concatenate([fall, fall, pl_f], 1),
+                       np.concatenate([p_l, p_l, two], 1), np.concatenate([p_r, p_r, two], 1),
+                       np.concatenate([flat, np.zeros((n, K)), pl_fl], 1))
+    wob = _t_ar1_rows(rng, n, W, np.exp(-1.0 / rng.uniform(5.0, 20.0, size=n)), rng.uniform(0.05, 0.2, size=n))
+    floor = np.exp(rng.uniform(np.log(0.01), np.log(1.5), size=(n, 1)))
+    lam = floor * (1.0 + ex * np.exp(wob)) * _t_weekday(rng, n, W)
+    cnt = _t_nb(rng, lam, np.exp(rng.uniform(np.log(4.0), np.log(60.0), size=(n, 1))))
+    fade = rng.random(n) < 0.65
+    Kf = rng.integers(14, 111, size=n)
+    gam = rng.uniform(0.3, 1.5, size=n)
+    stop = rng.random(n) < 0.45
+    Z = rng.integers(10, 151, size=n)
+    for i in np.flatnonzero(fade):
+        k = int(Kf[i])
+        e = int(S[i])
+        keep = np.clip((np.arange(k, 0, -1) - 0.5) / k, 0.0, 1.0) ** gam[i]
+        cnt[i, e - k:e] = rng.binomial(cnt[i, e - k:e].astype(np.int64), keep).astype(np.float64)
+        if stop[i]:
+            cnt[i, e - int(Z[i]):e] = 0.0
+    cs = np.cumsum(cnt, axis=1)
+    s7 = cs.copy()
+    s7[:, 7:] = cs[:, 7:] - cs[:, :-7]
+    kind = rng.random((n, 1))
+    pop = np.exp(rng.uniform(np.log(3e5), np.log(2e7), size=(n, 1)))
+    inc = np.rint(s7 / pop * 1e5 / 0.01) * 0.01
+    obs = np.where(kind < 0.60, s7, np.where(kind < 0.80, cnt, inc))
+    out = np.zeros((n, L))
+    for i in range(n):
+        e = int(S[i])
+        out[i, L - e:] = obs[i, :e]
+        out[i, :L - e] = obs[i, 0]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 2. syndromic percent-of-visits feeds (cdc_nssp rsv / flu / covid / ari)
+# --------------------------------------------------------------------------- #
+def _t_pct_feed(rng, n, L):
+    """Short daily feeds of the % of ED visits for one pathogen: phase-locked winter
+    waves over a pathogen-specific trough, numerator NB over a visit count, 0.01 tick,
+    troughs reaching 0 for sharp pathogens. Records of 380-1500 days, left-padded.
+    Built on the last W columns only (W = longest history in the group)."""
+    S = np.exp(rng.uniform(np.log(380.0), np.log(1500.0), size=n)).astype(np.int64)
+    W = int(S.max())
+    kind = rng.random(n)
+    sharp = kind < 0.5                      # rsv / flu
+    covid = (kind >= 0.5) & (kind < 0.75)   # two waves a year, moderate trough
+    trough = np.exp(np.where(sharp, rng.uniform(np.log(0.01), np.log(0.4), size=n),
+                    np.where(covid, rng.uniform(np.log(0.1), np.log(1.5), size=n),
+                             rng.uniform(np.log(1.0), np.log(12.0), size=n))))
+    a_row = np.where(sharp, rng.uniform(np.log(4.0), np.log(40.0), size=n),
+            np.where(covid, rng.uniform(np.log(2.0), np.log(8.0), size=n),
+                     rng.uniform(np.log(1.3), np.log(3.0), size=n)))
+    K = int(W // _T_YEAR) + 3
+    phase = rng.uniform(0.0, _T_YEAR, size=(n, 1))
+    kk = np.arange(K, dtype=np.float64)[None, :]
+    cen = phase + _T_YEAR * (kk - 1.0) + rng.normal(0.0, 12.0, size=(n, K))
+    amp = np.maximum(a_row[:, None] + rng.normal(0.0, 0.3, size=(n, K)), np.log(1.05))
+    rise = rng.uniform(20.0, 55.0, size=(n, K))
+    fall = rng.uniform(25.0, 75.0, size=(n, K))
+    p_l = rng.uniform(0.8, 1.6, size=(n, K))
+    p_r = rng.uniform(0.7, 1.5, size=(n, K))
+    c2 = cen + rng.uniform(160.0, 220.0, size=(n, K))
+    a2 = np.where(covid[:, None], np.maximum(amp + np.log(rng.uniform(0.4, 1.0, size=(n, K))), np.log(1.05)), 0.0)
+    z = np.zeros((n, K))
+    ex = _t_bumps_fast(W, np.concatenate([cen, c2], 1), np.concatenate([amp, a2], 1),
+                       np.concatenate([rise, rise], 1), np.concatenate([fall, fall], 1),
+                       np.concatenate([p_l, p_l], 1), np.concatenate([p_r, p_r], 1),
+                       np.concatenate([z, z], 1))
+    noise = _t_ar1_rows(rng, n, W, rng.uniform(0.3, 0.9, size=n), rng.uniform(0.03, 0.15, size=n))
+    pct = np.minimum(trough[:, None] * (1.0 + ex) * np.exp(noise), 60.0)
+    visits = np.rint(np.exp(rng.uniform(np.log(300.0), np.log(30000.0), size=(n, 1)))
+                     * _t_weekday(rng, n, W, 0.05, 0.8, 1.0))
+    num = _t_nb(rng, pct / 100.0 * visits, np.exp(rng.uniform(np.log(8.0), np.log(80.0), size=(n, 1))))
+    obs = np.rint(num / np.maximum(visits, 1.0) * 100.0 / 0.01) * 0.01
+    out = np.empty((n, L))
+    for i in range(n):
+        e = int(S[i])
+        out[i, L - e:] = obs[i, W - e:]
+        out[i, :L - e] = obs[i, W - e]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 3. exchange / backbone traffic with a phase-locked daily cycle (ixp_* 5-min)
+# --------------------------------------------------------------------------- #
+def _t_period_profile(rng, n, P, H, h1_always=2, p_more=0.6):
+    """(n, Pmax) one-period Fourier profiles; row i uses its first P[i] columns."""
+    Pm = int(P.max())
+    u = np.arange(Pm, dtype=np.float64)[None, :] / P[:, None]
+    prof = np.zeros((n, Pm))
+    for h in range(1, H + 1):
+        on = rng.random((n, 1)) < (1.0 if h <= h1_always else p_more)
+        a = rng.normal(0.0, 1.0 / h, size=(n, 1)) * on
+        b = rng.normal(0.0, 1.0 / h, size=(n, 1)) * on
+        prof += a * np.cos(2.0 * np.pi * h * u) + b * np.sin(2.0 * np.pi * h * u)
+    return prof
+
+
+def _t_tile_profile(prof, P, L, rng):
+    """Row i: prof[i, (j + phase_i) mod P_i] for j < L."""
+    n = prof.shape[0]
+    Pi = P.astype(np.int64)
+    idx = (np.arange(L)[None, :] + rng.integers(0, 1 << 30, size=(n, 1))) % Pi[:, None]
+    return np.take_along_axis(prof, idx, axis=1)
