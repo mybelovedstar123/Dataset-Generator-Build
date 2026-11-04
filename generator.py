@@ -16298,3 +16298,300 @@ def _pt_interconnector_net_flow(rng, n):
         x = x * np.repeat(st, run_lengths).astype(np.float64)
     return _pt_maybe_quantize_to_grid(rng, np.asarray(x, dtype=np.float64), 0.55, 150.0, 80000.0, 0.65)
 _pt_LADDER_CANDIDATE_VALUES = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 19.0, 20.0, 22.0, 23.0, 24.0, 25.0, 26.0, 29.0, 30.0, 32.0, 36.0, 40.0, 43.0, 45.0, 46.0, 50.0, 56.0, 57.0, 60.0, 64.0, 75.0, 80.0, 90.0, 98.0, 100.0, 110.0, 114.0, 125.0, 145.0, 150.0, 175.0, 200.0, 250.0, 300.0, 400.0, 500.0])
+
+def _pt_count_ladder_or_spot_price(rng, n):
+    ladder = rng.random() < 0.33
+    if _pt_FORCED_SUBMODE is not None:
+        ladder = _pt_FORCED_SUBMODE == 'ladder'
+    if ladder:
+        K = int(rng.integers(20, 78))
+        beta = float(rng.uniform(0.2, 1.05))
+        rung_prior = _pt_LADDER_CANDIDATE_VALUES ** (-beta)
+        rung_prior = rung_prior / rung_prior.sum()
+        picked_idx = rng.choice(_pt_LADDER_CANDIDATE_VALUES.size, size=min(K, _pt_LADDER_CANDIDATE_VALUES.size), replace=False, p=rung_prior)
+        rungs = _pt_LADDER_CANDIDATE_VALUES[picked_idx]
+        if K > _pt_LADDER_CANDIDATE_VALUES.size:
+            extra_rungs = np.round(np.exp(rng.uniform(0.0, np.log(float(rungs.max()) + 1.0), K - _pt_LADDER_CANDIDATE_VALUES.size)))
+            rungs = np.concatenate([rungs, np.maximum(extra_rungs, 1.0)])
+        rungs = np.unique(rungs)
+        w = rungs ** (-beta) * np.exp(rng.normal(0.0, 0.85, rungs.size))
+        w = w / w.sum()
+        w = 0.78 * w + 0.22 / rungs.size
+        w = np.cumsum(w / w.sum())
+        change_prob = float(rng.uniform(0.58, 0.88))
+        is_change = rng.random(n) < change_prob
+        is_change[0] = True
+        m = int(is_change.sum())
+        rung_idx = np.searchsorted(w, rng.random(m) * (1.0 - 1e-12))
+        new_values = rungs[np.minimum(rung_idx, rungs.size - 1)]
+        x = new_values[np.cumsum(is_change) - 1]
+        if rng.random() < 0.6:
+            nb = int(rng.poisson(n * float(rng.uniform(0.002, 0.012))))
+            high_rungs = rungs[rungs >= np.median(rungs)]
+            for _ in range(min(nb, 25)):
+                ln = int(min(n, 2 + rng.geometric(float(rng.uniform(0.04, 0.4)))))
+                seg_start = int(rng.integers(0, max(1, n - ln + 1)))
+                x[seg_start:seg_start + ln] = high_rungs[int(rng.integers(0, high_rungs.size))]
+        unit_scale = float(_pt_pick_weighted_option(rng, (1.0, 1.0, 2.0, 5.0, 10.0), (0.55, 0.15, 0.12, 0.1, 0.08)))
+        return np.asarray(x, dtype=np.float64) * unit_scale
+    P = _pt_sample_daily_period(rng)
+    tod, day, nd = _pt_split_time_of_day(rng, n, P)
+    d0 = day - day[0]
+    L = _pt_power_log_uniform(rng, 6.0, 260.0)
+    morning_amp = float(rng.uniform(0.0, 0.55))
+    evening_amp = float(rng.uniform(0.05, 1.0))
+    midday_dip_amp = float(rng.uniform(0.0, 0.95))
+    morning_phase = float(rng.uniform(0.22, 0.42))
+    evening_phase = float(rng.uniform(0.66, 0.9))
+    midday_phase = float(rng.uniform(0.44, 0.6))
+
+    def daily_bump(c, width):
+        dd = tod - c
+        dd -= np.round(dd)
+        return np.exp(-0.5 * (dd / width) ** 2)
+    diurnal_log = morning_amp * daily_bump(morning_phase, rng.uniform(0.04, 0.1)) + evening_amp * daily_bump(evening_phase, rng.uniform(0.05, 0.12)) - midday_dip_amp * daily_bump(midday_phase, rng.uniform(0.07, 0.16))
+    daily_log_effect = _pt_daily_ar1_factor(rng, nd, float(rng.uniform(0.35, 0.92)), float(rng.uniform(0.06, 0.32)))[d0]
+    wk = np.exp(rng.normal(0.0, 0.1, 7))
+    wk[5] *= float(rng.uniform(0.75, 0.98))
+    wk[6] *= float(rng.uniform(0.7, 0.95))
+    daily_log_effect = daily_log_effect + np.log(wk[(d0 + int(rng.integers(0, 7))) % 7])
+    volatile = rng.random() < 0.3
+    ar_coef = float(rng.uniform(0.6, 0.93)) if volatile else float(rng.uniform(0.93, 0.998))
+    log_noise = float(rng.uniform(0.03, 0.32)) * _pt_twice_filtered_ar1_noise(rng, n, -1.0 / np.log(ar_coef))
+    slow_log_drift = float(rng.uniform(0.0, 0.2)) * _pt_ar1_noise_by_timescale(rng, n, float(rng.uniform(3.0, 40.0)) * P)
+    log_noise = log_noise + float(rng.uniform(0.04, 0.26) if volatile else rng.uniform(0.0, 0.018)) * rng.standard_normal(n)
+    if rng.random() < 0.35:
+        log_noise = log_noise * (1.0 + float(rng.uniform(0.3, 1.6)) * np.arange(n) / max(n - 1, 1))
+    x = L * np.exp(diurnal_log + daily_log_effect + log_noise + slow_log_drift)
+    spike_rate = float(rng.uniform(5e-06, 0.0016))
+    n_spikes = int(rng.poisson(n * spike_rate))
+    for _ in range(min(n_spikes, 30)):
+        ln = int(min(n, 1 + rng.geometric(float(rng.uniform(0.25, 0.75)))))
+        seg_start = int(rng.integers(0, max(1, n - ln + 1)))
+        spike_peak = float(np.exp(rng.uniform(1.4, 3.4) if rng.random() < 0.25 else rng.uniform(0.3, 1.5)))
+        spike_profile = spike_peak ** (1.0 - np.arange(ln) / max(ln, 1))
+        x[seg_start:seg_start + ln] *= spike_profile[:n - seg_start]
+    if rng.random() < 0.13:
+        solar_dip_depth = float(np.median(x)) * float(rng.uniform(0.7, 1.4))
+        x = x - solar_dip_depth * daily_bump(midday_phase, float(rng.uniform(0.02, 0.065)))
+        np.maximum(x, -float(np.median(np.abs(x))) * float(rng.uniform(0.02, 0.35)), out=x)
+    elif rng.random() < 0.3:
+        np.maximum(x, float(np.median(x)) * float(rng.uniform(0.0001, 0.03)), out=x)
+    ph = float(rng.uniform(0.0, 0.36)) if rng.random() < 0.25 else float(rng.uniform(0.0, 0.07))
+    if ph > 0.01:
+        hold_threshold = float(np.sqrt(2.0) * _pt_erfinv_approx(1.0 - 2.0 * ph))
+        hold_mask = _pt_ar1_noise_by_timescale(rng, n, float(rng.uniform(1.2, 5.0))) > hold_threshold
+        hold_mask[0] = False
+        x = x[np.maximum.accumulate(np.where(hold_mask, 0, np.arange(n)))]
+    x = np.asarray(x, dtype=np.float64)
+    n_decimals = int(_pt_pick_weighted_option(rng, (3, 2, 1, 0), (0.45, 0.45, 0.08, 0.02)))
+    return np.round(x, n_decimals)
+_pt_SEASON_PERIOD_CANDIDATES = np.array([96, 24, 288, 7, 48, 144, 60], dtype=np.int64)
+_pt_SEASON_PERIOD_WEIGHTS = np.array([0.378, 0.223, 0.118, 0.097, 0.088, 0.05, 0.046])
+_pt_SEASON_PERIOD_WEIGHTS = _pt_SEASON_PERIOD_WEIGHTS / _pt_SEASON_PERIOD_WEIGHTS.sum()
+_pt_QUANT_STEP_DECADES = np.array([0.0001, 0.001, 0.01, 0.1, 1.0, 10.0])
+_pt_LOG_QUANT_STEP_DECADES = np.log(_pt_QUANT_STEP_DECADES)
+_pt_QUANT_STEP_DECADE_WEIGHTS = np.array([0.03, 0.23, 0.22, 0.41, 0.1, 0.01])
+_pt_QUANT_STEP_MULTIPLIERS = np.array([2.0, 2.5, 5.0])
+_pt_QUANT_STEP_MULTIPLIER_WEIGHTS = np.array([0.4, 0.2, 0.4])
+_pt_QUANT_STEP_MULTIPLIER_PROB = 0.12
+_pt_QUANT_SKIP_PROB = 0.06
+
+def _pt_draw_weighted_value(rng, values, weights):
+    i = int(np.searchsorted(np.cumsum(weights), rng.random(), side='right'))
+    if i >= len(values):
+        i = len(values) - 1
+    return values[i]
+
+def _pt_nearest_decade_step(step):
+    if not np.isfinite(step) or step <= 0.0:
+        return (0, float(_pt_QUANT_STEP_DECADES[0]))
+    i = int(np.argmin(np.abs(_pt_LOG_QUANT_STEP_DECADES - np.log(step))))
+    return (i, float(_pt_QUANT_STEP_DECADES[i]))
+
+def _pt_round_to_step(x, q):
+    return np.round(x / q) * q
+
+def _pt_outlier_contaminated_noise(rng, n, scale):
+    e = rng.standard_normal(n)
+    outlier_gain = rng.uniform(5.0, 35.0)
+    m = rng.random(n) < rng.uniform(0.05, 0.2)
+    e[m] *= outlier_gain
+    return scale * e
+
+def _pt_zero_diff_fraction(x):
+    if x.shape[0] < 2:
+        return 0.0
+    return float(np.mean(np.diff(x) == 0.0))
+
+def _pt_is_rounded_to_constant(y, x):
+    return float(np.std(x)) > 0.0 and float(np.std(y)) == 0.0
+
+def _pt_quantize_to_flat_fraction(rng, x, target_flat_frac):
+    if rng.random() < _pt_QUANT_SKIP_PROB:
+        return (x, None)
+    d = np.abs(np.diff(x))
+    if d.size < 8:
+        return (x, None)
+    d = d[np.isfinite(d)]
+    if d.size < 8 or d.max() <= 0.0:
+        return (x, None)
+    h = float(min(0.97, max(0.0, target_flat_frac)))
+    q0 = float(np.quantile(d, h)) * 1.25 if h > 0.0 else float(np.quantile(d, 0.02))
+    value_span = float(np.max(x) - np.min(x))
+    if value_span > 0.0:
+        q0 = min(q0, 0.2 * value_span)
+    if q0 <= 0.0:
+        q0 = float(np.median(d[d > 0.0])) if np.any(d > 0.0) else 1.0
+    quant_step = float(_pt_draw_weighted_value(rng, _pt_QUANT_STEP_DECADES, _pt_QUANT_STEP_DECADE_WEIGHTS))
+    if rng.random() < _pt_QUANT_STEP_MULTIPLIER_PROB:
+        quant_step = quant_step * float(_pt_draw_weighted_value(rng, _pt_QUANT_STEP_MULTIPLIERS, _pt_QUANT_STEP_MULTIPLIER_WEIGHTS))
+    rescale_factor = quant_step / q0
+    scaled_median = float(np.median(np.abs(x))) * rescale_factor
+    if 0.02 <= scaled_median <= 3000.0 and np.isfinite(rescale_factor) and (rescale_factor > 0.0):
+        y = _pt_round_to_step(x * rescale_factor, quant_step)
+        h1 = _pt_zero_diff_fraction(y)
+        if abs(h1 - h) > 0.05:
+            g0 = float(np.quantile(d, min(0.97, max(0.01, h1))))
+            if g0 > 0.0:
+                scale_correction = q0 / g0
+                scale_correction = float(min(8.0, max(0.125, scale_correction)))
+                y2 = _pt_round_to_step(x * (rescale_factor / scale_correction), quant_step)
+                if abs(_pt_zero_diff_fraction(y2) - h) < abs(h1 - h):
+                    return (x, None) if _pt_is_rounded_to_constant(y2, x) else (y2, quant_step)
+        return (x, None) if _pt_is_rounded_to_constant(y, x) else (y, quant_step)
+    i0, _ = _pt_nearest_decade_step(q0)
+    best_quantized = None
+    best_error = None
+    for i in (i0 - 1, i0, i0 + 1):
+        if i < 0 or i >= _pt_QUANT_STEP_DECADES.shape[0]:
+            continue
+        q = float(_pt_QUANT_STEP_DECADES[i])
+        y = _pt_round_to_step(x, q)
+        e = abs(_pt_zero_diff_fraction(y) - h)
+        if best_error is None or e < best_error:
+            best_error, best_quantized, best_step = (e, y, q)
+    if best_quantized is None:
+        return (x, None)
+    if rng.random() < _pt_QUANT_STEP_MULTIPLIER_PROB:
+        q = best_step * float(_pt_draw_weighted_value(rng, _pt_QUANT_STEP_MULTIPLIERS, _pt_QUANT_STEP_MULTIPLIER_WEIGHTS))
+        y = _pt_round_to_step(x, q)
+        return (x, None) if _pt_is_rounded_to_constant(y, x) else (y, q)
+    return (x, None) if _pt_is_rounded_to_constant(best_quantized, x) else (best_quantized, best_step)
+
+@njit(cache=False, fastmath=False)
+def _pt_rise_decay_pulse_filter(u, rise_coef, decay_coef, tail_coef, tail_weight):
+    n = u.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    s1 = 0.0
+    s2 = 0.0
+    sb = 0.0
+    for t in range(n):
+        ut = u[t]
+        s1 = rise_coef * s1 + (1.0 - rise_coef) * ut
+        s2 = decay_coef * s2 + (1.0 - decay_coef) * s1
+        sb = tail_coef * sb + (1.0 - tail_coef) * ut
+        out[t] = s2 + tail_weight * sb
+    return out
+
+@njit(cache=False, fastmath=False)
+def _pt_weighted_dual_ar1_sum(e1, e2, a1, a2, w1, w2):
+    n = e1.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    s1 = 0.0
+    s2 = 0.0
+    for t in range(n):
+        s1 = a1 * s1 + e1[t]
+        s2 = a2 * s2 + e2[t]
+        out[t] = w1 * s1 + w2 * s2
+    return out
+
+@njit(cache=False, fastmath=False)
+def _pt_leaky_integrate_ar1_velocity(e, velocity_ar_coef, mean_reversion):
+    n = e.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    v = 0.0
+    x = 0.0
+    for t in range(n):
+        v = velocity_ar_coef * v + e[t]
+        x = x + v - mean_reversion * x
+        out[t] = x
+    return out
+
+@njit(cache=False, fastmath=False)
+def _pt_freeze_segments_at_prior_value(x, seg_starts, seg_lengths):
+    n = x.shape[0]
+    for k in range(seg_starts.shape[0]):
+        s = seg_starts[k]
+        if s < 1 or s >= n:
+            continue
+        v = x[s - 1]
+        e = s + seg_lengths[k]
+        if e > n:
+            e = n
+        for t in range(s, e):
+            x[t] = v
+    return x
+
+@njit(cache=False, fastmath=False)
+def _pt_two_state_markov_mask(u, p_stay_on, p_turn_on):
+    n = u.shape[0]
+    m = np.zeros(n, dtype=np.uint8)
+    w = 0
+    for t in range(n):
+        p = p_stay_on if w == 1 else p_turn_on
+        w = 1 if u[t] < p else 0
+        m[t] = w
+    return m
+
+@njit(cache=False, fastmath=False)
+def _pt_sum_period_harmonics(n, period, amplitudes, phases):
+    out = np.zeros(n, dtype=np.float64)
+    two_pi = 6.283185307179586
+    for h in range(amplitudes.shape[0]):
+        w = two_pi * (h + 1) / period
+        a = amplitudes[h]
+        p = phases[h]
+        for t in range(n):
+            out[t] += a * np.sin(w * t + p)
+    return out
+
+def _pt_pick_period_min_three_cycles(rng, n):
+    ok = _pt_SEASON_PERIOD_CANDIDATES[_pt_SEASON_PERIOD_CANDIDATES * 3 <= n]
+    if ok.size == 0:
+        return int(max(4, n // 4))
+    p = _pt_SEASON_PERIOD_WEIGHTS[_pt_SEASON_PERIOD_CANDIDATES * 3 <= n]
+    p = p / p.sum()
+    return int(ok[int(np.searchsorted(np.cumsum(p), rng.random(), side='right').clip(0, ok.size - 1))])
+
+def _pt_maybe_add_stuck_holds(rng, x, hold_prob, n):
+    if rng.random() >= hold_prob:
+        return x
+    k = 1 + int(rng.integers(0, 3))
+    hi = max(60.0, min(600.0, n * 0.3))
+    hold_lengths = np.exp(rng.uniform(np.log(50.0), np.log(hi), size=k))
+    hold_starts = rng.integers(max(1, n // 20), n, size=k).astype(np.int64)
+    if rng.random() < 0.2:
+        hold_starts[0] = np.int64(max(1, n - int(hold_lengths[0])))
+    return _pt_freeze_segments_at_prior_value(x, hold_starts, hold_lengths.astype(np.int64))
+
+def _pt_slow_sine_with_end_phase(rng, n, period, amplitude, p_falling_end):
+    t = np.arange(n, dtype=np.float64)
+    w = 2.0 * np.pi / max(2.0, period)
+    if rng.random() < p_falling_end:
+        end_phase = rng.uniform(0.5 * np.pi, 1.5 * np.pi)
+    else:
+        end_phase = rng.uniform(-0.5 * np.pi, 0.5 * np.pi)
+    phase_offset = end_phase - w * (n - 1)
+    return amplitude * np.sin(w * t + phase_offset)
+
+def _pt_coerce_length_pad_last_value(x, n):
+    x = np.asarray(x, dtype=np.float64).ravel()
+    if x.shape[0] != n:
+        if x.shape[0] > n:
+            x = x[:n]
+        else:
+            x = np.concatenate([x, np.full(n - x.shape[0], x[-1] if x.size else 0.0)])
+    if not np.all(np.isfinite(x)):
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.ascontiguousarray(x, dtype=np.float64)
