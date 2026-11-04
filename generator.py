@@ -2498,3 +2498,64 @@ def a4_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.5,
                    quant_rel_hi=0.4)
     return s, fl
+
+
+# ═══════════════════════ A5 wet_dry_intermittent ═══════════════════════════
+
+def a5_params(rng, B, cfg):
+    p = cfg["families"]["wet_dry_intermittent"]
+    return {
+        "d_dry": logu(rng, p["dry_dwell"][0], p["dry_dwell"][1], B),
+        "d_wet": logu(rng, p["wet_dwell"][0], p["wet_dwell"][1], B),
+        "k_int": rng.uniform(p["intensity_shape"][0], p["intensity_shape"][1], B),
+        "theta": logu(rng, 0.2, 20.0, B),
+        "start_wet": rng.random(B) < 0.15,
+        "bell": rng.random(B) < 0.7,
+    }
+
+
+def a5_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    M = 96
+    dry = np.exp(rng.normal(np.log(P["d_dry"]).reshape(n, 1), 1.1, size=(n, M)))
+    wet = np.exp(rng.normal(np.log(P["d_wet"]).reshape(n, 1), 0.8, size=(n, M)))
+    dwell = np.empty((n, M))
+    sw = P["start_wet"].reshape(n, 1)
+    even = (np.arange(M)[None, :] % 2) == 0
+    dwell = np.where(even ^ sw, dry, wet)
+    dwell = np.maximum(dwell, 1.0)
+
+    seg_id, seg_start = segment_map(dwell, L)
+    seg_len = gather_levels(dwell, seg_id)
+    is_wet = ((seg_id % 2) == 1) ^ sw
+
+    t = time_grid(L)[None, :]
+    pos = (t - seg_start) / np.maximum(seg_len, 1.0)
+    env = np.where(P["bell"].reshape(n, 1), np.sin(np.pi * np.clip(pos, 0.0, 1.0)), 1.0)
+
+    k = np.maximum(P["k_int"].reshape(n, 1), 1e-2)
+    inten = rng.gamma(np.broadcast_to(k, (n, L))) * P["theta"].reshape(n, 1)
+    y = np.where(is_wet, inten * env, 0.0)
+
+    extended = np.zeros(n, dtype=bool)
+    if cfg.get('_complete_native_renewals', False):
+        med = np.column_stack((np.where(P['start_wet'], P['d_wet'], P['d_dry']),
+                               np.where(P['start_wet'], P['d_dry'], P['d_wet'])))
+        sig = np.column_stack((np.where(P['start_wet'], 0.8, 1.1),
+                               np.where(P['start_wet'], 1.1, 0.8)))
+        rr, dd, first = complete_dwell_table(rng, dwell, L, med, sig, 1.0)
+        if rr.size:
+            extended[rr] = True
+            sid, start = segment_map(dd, L)
+            slen = gather_levels(dd, sid)
+            wet_now = ((sid % 2) == 1) ^ sw[rr]
+            progress = (t - start) / np.maximum(slen, 1.0)
+            env_now = np.where(P['bell'][rr, None], np.sin(np.pi * np.clip(progress, 0.0, 1.0)), 1.0)
+            fixed = np.where(wet_now, inten[rr] * env_now, 0.0)
+            y[rr] = np.where(t >= first[:, None], fixed, y[rr])
+
+    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=1.2,
+                   quant_rel_hi=0.3, allow_agg=True)
+    if cfg.get('_complete_native_renewals', False):
+        fl['renewal_extended'] = extended
+    return y, fl
