@@ -4289,3 +4289,68 @@ def f1_build(P, rng, L, cad, cal, cfg):
     fl["scale_mode"] = np.where(P["mode"] == 1, 0, 1).astype(np.int8)
     fl["offset_pref"] = np.where(P["mode"] == 1, 3, 2).astype(np.int8)
     return y, fl
+
+
+# ═══════════════════════════ F2 transport_flow ═════════════════════════════
+
+def f2_params(rng, B, cfg):
+    p = cfg["families"]["transport_flow"]
+    return {
+        "base": logu(rng, 5.0, 5.0e3, B),
+        "weekend": np.exp(rng.normal(np.log(0.55), 0.35, B)),
+        "capacity": rng.uniform(p["capacity_ratio"][0], p["capacity_ratio"][1], B),
+        "jam_slope": rng.uniform(0.3, 1.4, B),
+        "nb_k": logu(rng, 1.0, 300.0, B),
+        "count_emit": rng.random(B) < 0.6,
+        "inc_tau": logu(rng, 600.0, 6000.0, B),
+        "inc_drop": rng.uniform(0.25, 0.8, B),
+        "inc_recover": logu(rng, 20.0, 200.0, B),
+        "noise": logu(rng, 0.02, 0.35, B),
+    }
+
+
+def f2_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    pd = cad.p_day.reshape(n, 1)
+    has_day = pd >= 4.0
+    ph = t / np.where(has_day, pd, 1e9) + rng.random((n, 1))
+
+    weekday = profile_double_peak(rng, n, L, ph)
+    weekend_shape = np.exp(20.0 * (np.cos(_cf_prims_TWO_PI * (ph - 0.55)) - 1.0))
+    is_we = cal.is_weekend
+    shape = np.where(is_we, weekend_shape * P["weekend"].reshape(n, 1), weekday)
+    shape = np.where(has_day, shape, 1.0)
+    shape = shape / np.maximum(shape.mean(axis=1, keepdims=True), 1e-9)
+
+    demand = P["base"].reshape(n, 1) * shape * np.exp(
+        ar1(rng, n, L, np.full(n, 0.97)) * P["noise"].reshape(n, 1))
+
+    # fundamental diagram: flow rises to capacity, then FALLS as density grows
+    cap = P["capacity"].reshape(n, 1) * P["base"].reshape(n, 1)
+    over = np.maximum(demand - cap, 0.0)
+    flow = np.minimum(demand, cap) - P["jam_slope"].reshape(n, 1) * over \
+        / (1.0 + over / np.maximum(cap, 1e-9))
+    flow = np.maximum(flow, 0.0)
+
+    # incidents: sharp drop, queue build, slow recovery ramp
+    E = 6
+    hit = rng.random((n, E)) < (L / (P["inc_tau"].reshape(n, 1) * E))
+    pos = rng.integers(0, L, size=(n, E)).astype(np.float64)
+    drop = np.zeros((n, L))
+    for j in range(E):
+        idx = np.nonzero(hit[:, j])[0]
+        if idx.size == 0:
+            continue
+        p0 = pos[idx, j:j + 1]
+        dt = np.maximum(t - p0, 0.0)
+        shape_j = np.exp(-dt / P["inc_recover"][idx].reshape(-1, 1))
+        drop[idx] += np.where(t >= p0,
+                              P["inc_drop"][idx].reshape(-1, 1) * shape_j, 0.0)
+    flow = flow * np.maximum(1.0 - np.minimum(drop, 0.95), 0.02)
+
+    counts = nb_counts(rng, flow, P["nb_k"])
+    y = np.where(P["count_emit"].reshape(n, 1), counts, flow)
+    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.7)
+    fl["integer"] = P["count_emit"]
+    return y, fl
