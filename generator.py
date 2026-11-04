@@ -4510,3 +4510,191 @@ def f4_build(P, rng, L, cad, cal, cfg):
     y = stair + P["level0"].reshape(n, 1)
     fl = new_flags(n, scale_mode=0, offset_pref=1, quant_boost=1.5, quant_rel_hi=0.4)
     return y, fl
+
+
+# ═══════════════ chronoforge: cf_registry ═══════════════
+# Family registry and the batch builder.
+#
+# Thirty-two dispatch slots in six blocks.  Every slot carries a non-zero weight:
+# there are no dead families held at weight zero, because a family that cannot
+# earn its weight should be deleted rather than shipped as ballast.
+#
+# The key structural decision here is **per-family stream isolation**.  Family
+# ``f``'s per-row parameters are drawn as a *dense* batch draw of size ``B`` from
+# its own stream and then indexed by the group's row positions — not drawn at
+# group size.  Consequences:
+#
+# * changing family ``f``'s weight changes only *which* rows are family ``f``;
+#   every other family's rows stay byte-identical and, for a given row index,
+#   ``f``'s own parameters are unchanged;
+# * changing family ``f``'s code changes nothing outside ``f``;
+# * adding a family at a new slot perturbs nothing.
+#
+# That makes every weight and parameter A/B a genuinely paired comparison against
+# a noisy downstream metric, which is worth far more than the handful of
+# microseconds per series it costs.
+
+
+from typing import Callable, NamedTuple
+
+
+class Family(NamedTuple):
+    name: str
+    block: str
+    params: Callable
+    build: Callable
+
+
+FAMILIES: tuple[Family, ...] = (
+    # ── Block A: meteorological / geophysical ──
+    Family("met_thermal", "A", a1_params, a1_build),
+    Family("met_pressure_smooth", "A", a2_params, a2_build),
+    Family("met_bounded_atom", "A", a3_params, a3_build),
+    Family("met_wind_speed", "A", a4_params, a4_build),
+    Family("wet_dry_intermittent", "A", a5_params, a5_build),
+    # ── Block B: operational telemetry / web-cloudops ──
+    Family("ops_diurnal_traffic", "B", b1_params, b1_build),
+    Family("ops_saturating_feedback", "B", b2_params, b2_build),
+    Family("ops_counter_reset", "B", b3_params, b3_build),
+    Family("ops_latency_queue", "B", b4_params, b4_build),
+    Family("ops_deploy_transient", "B", b5_params, b5_build),
+    Family("ops_rate_plateau", "B", b6_params, b6_build),
+    # ── Block C: healthcare / epidemiological / administrative ──
+    Family("epi_renewal", "C", c1_params, c1_build),
+    Family("admin_reporting_counts", "C", c2_params, c2_build),
+    Family("physio_quasiperiodic", "C", c3_params, c3_build),
+    Family("clinical_bounded_vitals", "C", c4_params, c4_build),
+    # ── Block D: persistence / regime core (D1 has five dormant modes) ──
+    Family("regime_dwell_flat", "D", d1_params,
+           d1_build_factory(DORMANT_FLAT)),
+    Family("regime_dwell_microdrift", "D", d1_params,
+           d1_build_factory(DORMANT_MICRO)),
+    Family("regime_dwell_intcounter", "D", d1_params,
+           d1_build_factory(DORMANT_COUNTER)),
+    Family("regime_dwell_zerosparse", "D", d1_params,
+           d1_build_factory(DORMANT_ZERO)),
+    Family("regime_dwell_transitional", "D", d1_params,
+           d1_build_factory(DORMANT_TRANS)),
+    Family("level_ladder_staircase", "D", d2_params, d2_build),
+    Family("smooth_drift_extrapolable", "D", d3_params, d3_build),
+    # ── Block E: stochastic backbone ──
+    Family("arma_sarima", "E", e1_params, e1_build),
+    Family("garch_leverage", "E", e2_params, e2_build),
+    Family("hawkes_marked", "E", e3_params, e3_build),
+    Family("chaotic_delay", "E", e4_params, e4_build),
+    Family("spectral_kernel_zoo", "E", e5_params, e5_build),
+    Family("changepoint_composite", "E", e6_params, e6_build),
+    # ── Block F: energy / transport / retail / macro ──
+    Family("energy_load_price_solar", "F", f1_params, f1_build),
+    Family("transport_flow", "F", f2_params, f2_build),
+    Family("retail_promo_intermittent", "F", f3_params, f3_build),
+    Family("econ_release_staircase", "F", f4_params, f4_build),
+)
+
+FAMILY_INDEX = {f.name: i for i, f in enumerate(FAMILIES)}
+
+
+def family_weight_vector(cfg) -> np.ndarray:
+    w = np.array([float(cfg["family_weights"][f.name]) for f in FAMILIES],
+                 dtype=np.float64)
+    if not np.isfinite(w).all() or (w < 0).any() or w.sum() <= 0:
+        raise ValueError("family_weights must be finite, non-negative and non-zero")
+    return w / w.sum()
+
+
+def coarse_pref_vector(cfg) -> np.ndarray:
+    return np.array([float(cfg["family_coarse_pref"][f.name]) for f in FAMILIES],
+                    dtype=np.float64)
+
+
+# ─────────────────────────────── batch schedule ────────────────────────────
+
+def batch_size(b: int, cfg) -> int:
+    """Batch size as a function of the batch index alone.
+
+    It must never depend on ``n_series``: that is what makes ``generate(k)`` a
+    byte-exact prefix of ``generate(K)`` for every ``k <= K``.  The final batch
+    is generated in full and truncated only on emit, so its contents are
+    unchanged by the request size.
+    """
+    ramp = cfg["batch_schedule"]["ramp"]
+    if b < len(ramp):
+        return int(ramp[b])
+    return int(cfg["batch_schedule"]["steady"])
+
+
+def batches_for(n_series: int, cfg) -> int:
+    ramp = [int(x) for x in cfg["batch_schedule"]["ramp"]]
+    steady = int(cfg["batch_schedule"]["steady"])
+    total = 0
+    for i, s in enumerate(ramp):
+        total += s
+        if total >= n_series:
+            return i + 1
+    remain = n_series - total
+    return len(ramp) + (remain + steady - 1) // steady
+
+
+# ───────────────────────────────── the builder ─────────────────────────────
+
+def build_batch(seed_hi: int, seed_lo: int, b: int, cfg: dict,
+                weights: np.ndarray, coarse: np.ndarray):
+    """Build batch ``b``: returns ``(values (B, L), emit_lengths (B,))``.
+
+    Series are generated at the full internal length and cropped to the row's
+    ladder length on emit, so the ladder costs nothing in vectorisation while
+    still exposing the model to the 256-4096 context regime the evaluation
+    actually spans.
+    """
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore",
+                     under="ignore"):
+        return _build_batch(seed_hi, seed_lo, b, cfg, weights, coarse)
+
+
+def _build_batch(seed_hi, seed_lo, b, cfg, weights, coarse):
+    L = int(cfg["internal_length"])
+    B = batch_size(b, cfg)
+
+    r_assign = stream(seed_hi, seed_lo, b, STAGE_ASSIGN)
+    fam = categorical(r_assign, weights, B)
+    cad = draw_cadence(r_assign, B, coarse[fam], cfg)
+
+    r_cal = stream(seed_hi, seed_lo, b, STAGE_CALENDAR)
+    cal = draw_calendar(r_cal, B, L, cad.p_day)
+
+    out = np.zeros((B, L), dtype=np.float64)
+    flags = new_flags(B)
+
+    for f, spec in enumerate(FAMILIES):
+        rows = np.nonzero(fam == f)[0]
+        if rows.size == 0:
+            continue
+        r_par = stream(seed_hi, seed_lo, b, STAGE_FAMILY_PARAM + f)
+        dense = spec.params(r_par, B, cfg)
+        sub = {k: v[rows] for k, v in dense.items()}
+        r_bulk = stream(seed_hi, seed_lo, b, STAGE_FAMILY_BULK + f)
+        y, fl = spec.build(sub, r_bulk, L, cad.take(rows), cal.take(rows), cfg)
+        out[rows] = y
+        for k in flags:
+            flags[k][rows] = fl[k]
+
+    # Families that emit genuine counts are recorded before the observation layer
+    # can widen ``integer`` to mean "on some lattice"; the scale stage leaves
+    # counts at their own natural level so the integer lattice survives.
+    flags["count"] = flags["integer"].copy()
+
+    # Scale first, then observe: a real feed is measured at its physical scale
+    # and only then reported with a granularity, a sensor range and a glitch
+    # process in those same physical units.  Rounding before scaling would make
+    # every "round human tick" and every clip level an accident of the family's
+    # internal normalisation.
+    out = apply_scale(stream(seed_hi, seed_lo, b, STAGE_SCALE), out, flags, cfg)
+    out = apply_observation(stream(seed_hi, seed_lo, b, STAGE_OBSERVE),
+                            out, flags, cfg)
+    out = apply_aggregation(stream(seed_hi, seed_lo, b, STAGE_AGGREGATE),
+                            out, flags, cad, cfg)
+    starts = (L - cad.length).astype(np.int64)
+    out = apply_count_prior(stream(seed_hi, seed_lo, b, STAGE_COUNT), out, flags, cfg)
+    out = sanitise(stream(seed_hi, seed_lo, b, STAGE_SANITISE),
+                   out, flags, starts, cfg)
+    return out, cad.length.astype(np.int64)
