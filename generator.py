@@ -11795,3 +11795,268 @@ def _empirical_cycle_tail(history, lag, length, rng, mode):
     return cycles[selected, phases]
 
 _LONG_CYCLE_ENABLED = True
+_LONG_CYCLE_LAGS = tuple(range(97, 257))
+
+def _long_cycle_predict(history, lag, length):
+    """Preserve phase relative to the next unseen sample, including partial cycles."""
+    history = np.asarray(history, dtype=float)
+    if history.ndim != 2 or lag < 1 or length < 1 or lag > history.shape[1]:
+        raise ValueError('Need a 2-D history, available positive lag and length')
+    count = min(7, history.shape[1] // lag)
+    count -= int(count % 2 == 0)
+    cycles = history[:, -count * lag:].reshape(len(history), count, lag)
+    template = np.partition(cycles, count // 2, axis=1)[:, count // 2, :]
+    return template[:, np.arange(length) % lag]
+
+def _long_cycle_validation(history, observed, lag, span):
+    anchor = np.median(history[:, -16:], axis=1)
+    error = np.mean(np.abs(observed - _long_cycle_predict(history, lag, observed.shape[1])), axis=1) / span
+    hold = np.mean(np.abs(observed - anchor[:, None]), axis=1) / span
+    away = np.mean(np.abs(history - anchor[:, None]) > .05 * span[:, None], axis=1)
+    accepted = (error <= .12) & (error <= .75 * hold) & (away >= .15)
+    return error, accepted
+
+def _validated_long_cycle(context):
+    return _validated_cycle_menu(context, 512, 256, _LONG_CYCLE_LAGS[0], _LONG_CYCLE_LAGS[-1] + 1)
+
+_LONGER_CYCLE_ENABLED = True
+_LONGER_CYCLE_LAGS = tuple(range(257, 513))
+
+@lru_cache(maxsize=2)
+def _cycle_menu_groups(fit_points, validation_points, lag_low, lag_stop):
+    lags = np.arange(lag_low, lag_stop, dtype=np.int64)
+    counts = np.minimum(7, fit_points // lags)
+    counts -= counts % 2 == 0
+    groups = []
+    for count in np.unique(counts):
+        positions = np.flatnonzero(counts == count)
+        lag = lags[positions]
+        indices = (fit_points - count * lag[:, None, None]
+                   + np.arange(count)[None, :, None] * lag[:, None, None]
+                   + np.arange(validation_points)[None, None, :] % lag[:, None, None])
+        positions.flags.writeable = False
+        indices.flags.writeable = False
+        groups.append((positions, indices, int(count)))
+    return tuple(groups)
+
+@njit(cache=False, nogil=True)
+def _pairwise_leaf(a, lo, n):
+    # NumPy's float64 pairwise-summation leaf (n <= 128), so fused means stay bit-identical.
+    if n < 8:
+        res = 0.0
+        for i in range(n):
+            res += a[lo + i]
+        return res
+    r0 = a[lo]
+    r1 = a[lo + 1]
+    r2 = a[lo + 2]
+    r3 = a[lo + 3]
+    r4 = a[lo + 4]
+    r5 = a[lo + 5]
+    r6 = a[lo + 6]
+    r7 = a[lo + 7]
+    i = 8
+    m = n - (n % 8)
+    while i < m:
+        r0 += a[lo + i]
+        r1 += a[lo + i + 1]
+        r2 += a[lo + i + 2]
+        r3 += a[lo + i + 3]
+        r4 += a[lo + i + 4]
+        r5 += a[lo + i + 5]
+        r6 += a[lo + i + 6]
+        r7 += a[lo + i + 7]
+        i += 8
+    res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7))
+    while i < n:
+        res += a[lo + i]
+        i += 1
+    return res
+
+
+@njit(cache=False, nogil=True)
+def _pairwise_sum(a, n):
+    # NumPy splits n > 128 at n//2 rounded down to a multiple of 8: 256 -> 128+128, 512 -> 256+256.
+    if n <= 128:
+        return _pairwise_leaf(a, 0, n)
+    if n == 256:
+        return _pairwise_leaf(a, 0, 128) + _pairwise_leaf(a, 128, 128)
+    if n == 512:
+        return ((_pairwise_leaf(a, 0, 128) + _pairwise_leaf(a, 128, 128))
+                + (_pairwise_leaf(a, 256, 128) + _pairwise_leaf(a, 384, 128)))
+    raise ValueError("unsupported validation length")
+
+
+@njit(cache=False, nogil=True)
+def _cycle_menu_errors(history, observed, span, limit, lags, cols, count, fit_points, errors):
+    # errors[r, lag] is exact whenever it can pass (<= limit[r]); a lag whose
+    # pairwise partial sum already exceeds the limit is stored as +inf, which
+    # cannot change the argmin of a passing row or the pass flags.
+    rows = history.shape[0]
+    points = observed.shape[1]
+    leaves = points // 128
+    median = np.empty(points, dtype=np.float64)
+    diff = np.empty(points, dtype=np.float64)
+    buf = np.empty(count, dtype=np.float64)
+    mid = count // 2
+    for r in range(rows):
+        if not limit[r] >= 0.0:
+            for j in range(lags.shape[0]):
+                errors[r, cols[j]] = np.inf
+            continue
+        for j in range(lags.shape[0]):
+            lag = lags[j]
+            base = fit_points - count * lag
+            done = 0
+            partial = 0.0
+            left = 0.0
+            aborted = False
+            for leaf in range(leaves):
+                lo = leaf * 128
+                hi = lo + 128
+                need = hi if hi < lag else lag
+                while done < need:
+                    for c in range(count):
+                        x = history[r, base + done + c * lag]
+                        k = c
+                        while k > 0 and buf[k - 1] > x:
+                            buf[k] = buf[k - 1]
+                            k -= 1
+                        buf[k] = x
+                    median[done] = buf[mid]
+                    done += 1
+                for v in range(lo, hi):
+                    diff[v] = abs(observed[r, v] - median[v % lag])
+                value = _pairwise_leaf(diff, lo, 128)
+                if leaves == 2:
+                    bound = value if leaf == 0 else partial + value
+                    partial = value if leaf == 0 else partial
+                else:
+                    if leaf == 0:
+                        partial = value
+                        bound = value
+                    elif leaf == 1:
+                        partial = partial + value
+                        bound = partial
+                    elif leaf == 2:
+                        left = value
+                        bound = partial
+                    else:
+                        bound = partial + (left + value)
+                if leaf < leaves - 1 and ((0.0 + bound) / points) / span[r] > limit[r]:
+                    aborted = True
+                    break
+                if leaf == leaves - 1:
+                    errors[r, cols[j]] = ((0.0 + bound) / points) / span[r]
+            if aborted:
+                errors[r, cols[j]] = np.inf
+
+
+def _cycle_menu_first_validation(context, span, fit_points, validation_points, lag_low, lag_stop):
+    history = np.ascontiguousarray(context[:, :fit_points])
+    observed = np.ascontiguousarray(context[:, fit_points:fit_points + validation_points])
+    if validation_points not in (256, 512):
+        raise ValueError("unsupported validation length")
+    errors = np.empty((len(context), lag_stop - lag_low), dtype=np.float64)
+    lags_all = np.arange(lag_low, lag_stop, dtype=np.int64)
+    span = np.ascontiguousarray(span, dtype=np.float64)
+    anchor = np.median(history[:, -16:], axis=1)
+    hold = np.mean(np.abs(observed - anchor[:, None]), axis=1) / span
+    away = np.mean(np.abs(history - anchor[:, None]) > .05 * span[:, None], axis=1)
+    limit = np.where(away >= .15, np.minimum(.12, .75 * hold), -1.0)
+    for positions, indices, count in _cycle_menu_groups(fit_points, validation_points, lag_low, lag_stop):
+        _cycle_menu_errors(history, observed, span, limit, lags_all[positions],
+                           np.ascontiguousarray(positions, dtype=np.int64), count, fit_points, errors)
+    passes = (errors <= .12) & (errors <= .75 * hold[:, None]) & (away[:, None] >= .15)
+    return errors, passes
+
+def _validated_cycle_menu(context, fit_points, validation_points, lag_low, lag_stop):
+    context = np.asarray(context, dtype=np.float64)
+    if context.ndim != 2 or context.shape[1] != fit_points + 2 * validation_points or not np.isfinite(context).all():
+        raise ValueError('Need finite contexts with the declared fit and validation lengths')
+    lo, hi = np.quantile(context, (.1, .9), axis=1)
+    span = np.maximum.reduce((hi - lo, np.abs(context).max(axis=1) * 1e-12,
+                              np.full(len(context), 1e-12)))
+    errors, passes = _cycle_menu_first_validation(context, span, fit_points, validation_points, lag_low, lag_stop)
+    valid = errors < np.inf
+    positions = np.argmin(np.where(valid, errors, np.inf), axis=1)
+    picked = lag_low + positions
+    first_pass = passes[np.arange(len(context)), positions] & valid.any(axis=1)
+    second_pass = np.zeros(len(context), dtype=bool)
+    boundary = fit_points + validation_points
+    for lag in np.unique(picked):
+        rows = np.flatnonzero(picked == lag)
+        _, passed = _long_cycle_validation(context[rows, :boundary], context[rows, boundary:], int(lag), span[rows])
+        second_pass[rows] = passed
+    return first_pass & second_pass, picked
+
+def _validated_longer_cycle(context):
+    return _validated_cycle_menu(context, 1024, 512, _LONGER_CYCLE_LAGS[0], _LONGER_CYCLE_LAGS[-1] + 1)
+
+
+_TIDAL_NATIVE_PERIODIC_ENABLED = True
+
+
+_HARRY_TIDAL_GAMMA_BYPASS = True
+
+
+_HARRY_I029_GRID_FLOW_GAMMA_BYPASS = True
+
+
+# Native sigmoid sensor support; other sensor modes retain the host treatment.
+_CAS1_BOUNDED_SENSOR_ENABLED = True
+_physical_sensors.with_metadata = partial(_physical_sensors, native_metadata=True)
+
+# Cas1 route-isolation arm: fixed V463 opportunities, periodic only.
+# Station and traffic families keep V444's clock: no time warp or dilation on them.
+_V444_CLOCK_FAMILIES = frozenset({
+    "sticky_station", "capacity_counts", "conditional_stability", "cs_flat", "cs_drift",
+    "cs_countwalk", "cs_pulse", "transport_flow", "transport_flow_tail", "heavy_traffic_counts",
+    "econ_release_staircase", "level_ladder_staircase", "regime_dwell_flat",
+    "regime_dwell_intcounter", "dispatch_price", "spiky_price", "price_shock",
+})
+_CAS1_INTERIOR_REBASE_RATE = 0.0
+_CAS1_INTERIOR_REBASE_STAGE = 0xCA5101
+_CAS1_INTERIOR_REBASE_ENDPOINTS = (1536, 2304, 2816)
+_CAS1_INTERIOR_REBASE_ROUTE = 'periodic'
+
+
+# --------------------------------------------------------------------
+# Grafted from the c3 lineage: the families serving the two domains we
+# still beat this king on (healthcare, web_cloudops). Append-only.
+# --------------------------------------------------------------------
+
+_HC_YEAR = 365.0
+
+
+_WC_HARM = np.arange(1, 5, dtype=np.float64)
+
+
+_WC_H = 720          # the validator's longest scored horizon (h720 window)
+
+
+def _wc_profile(rng: np.random.Generator, n: int, period: int, h1_lo: float, h1_hi: float) -> np.ndarray:
+    """``(n, period)`` zero-mean unit-sd Fourier daily profiles with the first
+    harmonic carrying a share of the power drawn in [h1_lo, h1_hi]."""
+    k = _WC_HARM[None, :, None]
+    amp = rng.uniform(0.15, 1.0, size=(n, 4, 1)) * (k ** -rng.uniform(0.6, 1.6, size=(n, 1, 1)))
+    share = rng.uniform(h1_lo, h1_hi, size=(n, 1, 1))
+    rest = np.sqrt((amp[:, 1:, :] ** 2).sum(axis=1, keepdims=True)) + 1e-12
+    amp = np.concatenate([np.sqrt(share / (1.0 - share)) * rest, amp[:, 1:, :]], axis=1)
+    ph = rng.uniform(0.0, 2.0 * np.pi, size=(n, 4, 1))
+    u = 2.0 * np.pi * np.arange(period, dtype=np.float64)[None, None, :] / period
+    p = (amp * np.sin(k * u + ph)).sum(axis=1)
+    p -= p.mean(axis=1, keepdims=True)
+    return p / (p.std(axis=1, keepdims=True) + 1e-12)
+
+
+def _wc_ar1(rng: np.random.Generator, n: int, m: int, phi: np.ndarray) -> np.ndarray:
+    """Unit-variance stationary AR(1) rows ``(n, m)`` with per-row ``phi``."""
+    e = rng.standard_normal((n, m))
+    a = np.empty((n, m), dtype=np.float64)
+    a[:, 0] = e[:, 0]
+    p = phi[:, 0]
+    q = np.sqrt(np.maximum(1.0 - p * p, 0.0))
+    for k in range(1, m):
+        a[:, k] = p * a[:, k - 1] + q * e[:, k]
+    return a
