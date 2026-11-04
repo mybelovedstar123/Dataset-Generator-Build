@@ -19254,3 +19254,95 @@ class Generator(DataGenerator):
                 yield x
         finally:
             it0.close(); it1.close()
+
+# ═══════════════ fork: retargeted band of extra second channels ═══════════════
+# The published generator above is the parent class: every record it yields is kept, in order and unchanged.
+# A record it leaves univariate draws an independent coin under this fork's own tag; on success, when the
+# record's recent tail is not quiet (king 87's tail-rebase eligibility test on its last 192 points), one row of
+# an independently seeded teach stream with its own family mix (emergency-visit shares, exchange traffic and
+# web counters, season onsets) is stacked under it as channel 1, with the parent's coupling and keep test.
+_BAND_Q = 0.32
+_BAND_TAG = 0x71A2B3C4
+_BAND_TEACH_XOR = 0x71A2B3C8
+_BAND_MIX = {"ixp_traffic": 0.30, "signed_flow": 0.0, "web_counter": 0.30, "season_onset": 0.10,
+             "sparse_counts": 0.0, "ed_visit_share": 0.30}
+_FORK_DEDUP_TAG = 1110103
+
+
+def _k87_quiet(r):
+    # king 87's quiet rule (the tail-rebase eligibility test) on the row's last 192 points.
+    recent = np.asarray(r[-192:], dtype=np.float64)
+    if recent.size < 64:
+        return False
+    d = np.abs(np.diff(recent))
+    q10, q90 = np.quantile(recent, (0.10, 0.90)); peak = float(np.max(np.abs(recent)))
+    span = max(float(q90 - q10), peak * 1e-12, 1e-12); tol = max(peak * 1e-12, 1e-12)
+    if float(np.mean(d <= tol)) >= 0.35:
+        return True
+    drift = abs(float(np.median(recent[-32:]) - np.median(recent[:32]))) / span
+    return float(np.quantile(d, 0.90)) / span <= 0.03 and drift <= 0.12
+
+
+def _band_weights():
+    w = np.array([float(_BAND_MIX.get(name, 0.0)) for name, _ in _TEACH_FAMILIES], dtype=np.float64)
+    return w / w.sum()
+
+
+class _BandTeachStream(_TeachStream):
+    """The teach stream with this fork's own family weights (same batching, same per-family RNG keys)."""
+
+    def __init__(self, seed, weights):
+        super().__init__(seed)
+        self._w = weights
+
+    def next(self):
+        if self._pos >= _TEACH_BATCH:
+            self._buf, _ = _teach_batch(self._seed, self._b, 4096, _TEACH_FAMILIES, self._w)
+            self._b += 1
+            self._pos = 0
+        row = self._buf[self._pos]
+        self._pos += 1
+        return np.array(row)
+
+
+_PublishedGenerator = Generator
+
+
+class Generator(_PublishedGenerator):
+    """The published records unchanged; a retargeted band of second channels on non-quiet univariate records."""
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        self._bteach = _BandTeachStream((self._seed ^ _BAND_TEACH_XOR) & ((1 << 64) - 1), _band_weights())
+
+    @property
+    def name(self) -> str:
+        return "k86-fork/b2"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if _BAND_Q > 0.0 and np.ndim(x) == 1:
+                    v = np.random.default_rng(np.random.SeedSequence([self._seed, _BAND_TAG], spawn_key=(i,))).random()
+                    if v < _BAND_Q and not _k87_quiet(x):
+                        y = np.asarray(self._bteach.next(), dtype=np.float64)
+                        a = np.asarray(x, dtype=np.float64).reshape(1, -1); b = y.reshape(-1, y.shape[-1])
+                        L = min(a.shape[-1], b.shape[-1])
+                        z = np.concatenate([a[:, a.shape[-1] - L:], b[:, b.shape[-1] - L:]], axis=0)
+                        if _CPL > 0.0 and z.shape[0] == 2:
+                            d0 = np.diff(z[0]); s0 = float(np.std(d0)); d1 = np.diff(z[1]); s1 = float(np.std(d1))
+                            if s0 > 0.0 and s1 > 0.0 and np.isfinite(s0) and np.isfinite(s1):
+                                zz = np.concatenate([[0.0], np.clip((d0 - d0.mean()) / s0, -6.0, 6.0)])
+                                p = int(np.argmax(z[1] != z[1][0]))
+                                zz[:p] = 0.0
+                                z = np.stack([z[0], z[1] + (_CPL * s1) * zz])
+                        if (np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12))
+                                and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12)):
+                            x = np.ascontiguousarray(z)
+                yield x
+        finally:
+            base.close()
