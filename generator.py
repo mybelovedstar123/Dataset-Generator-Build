@@ -2744,3 +2744,56 @@ def b3_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.5, quant_boost=0.3)
     fl["integer"] = P["integer"] & (~P["revise"])
     return out, fl
+
+
+# ═══════════════════════ B4 ops_latency_queue ══════════════════════════════
+
+def b4_params(rng, B, cfg):
+    p = cfg["families"]["ops_latency_queue"]
+    return {
+        "rho_mu": rng.normal(-0.8, 1.0, B),
+        "rho_phi": rng.uniform(0.85, 0.999, B),
+        "rho_sig": rng.uniform(0.2, 1.2, B),
+        "service": logu(rng, 1e-3, 100.0, B),
+        "lognorm": rng.random(B) < p["lognormal_rate"],
+        "ln_sig": rng.uniform(0.4, 1.3, B),
+        "pareto_a": rng.uniform(1.6, 3.5, B),
+        "agg": rng.random(B) < p["percentile_rate"],
+        "agg_m": rng.integers(8, 201, B),
+    }
+
+
+def b4_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    lr = ar1(rng, n, L, P["rho_phi"]) * P["rho_sig"].reshape(n, 1) \
+        + P["rho_mu"].reshape(n, 1)
+    rho = 1.0 / (1.0 + np.exp(-np.clip(lr, -30.0, 30.0)))
+    rho = np.clip(rho, 0.0, 0.9995)
+    mean = P["service"].reshape(n, 1) * (1.0 + rho / (1.0 - rho))
+    mean = np.minimum(mean, P["service"].reshape(n, 1) * 1e4)
+
+    ln = np.exp(rng.normal(0.0, P["ln_sig"].reshape(n, 1), size=(n, L))
+                - 0.5 * P["ln_sig"].reshape(n, 1) ** 2)
+    u = np.maximum(rng.random((n, L)), 1e-12)
+    a = P["pareto_a"].reshape(n, 1)
+    par = np.power(u, -1.0 / a) * (a - 1.0) / a
+    obs = np.where(P["lognorm"].reshape(n, 1), ln, par)
+    y = mean * obs
+
+    # a percentile aggregate has a Gumbel-shaped marginal, quite different from
+    # the mean series it is computed from
+    if P["agg"].any():
+        m = np.maximum(P["agg_m"].reshape(n, 1).astype(np.float64), 2.0)
+        um = np.maximum(rng.random((n, L)), 1e-12)
+        gmax = mean * np.where(P["lognorm"].reshape(n, 1),
+                               np.exp(P["ln_sig"].reshape(n, 1)
+                                      * np.sqrt(2.0 * np.log(m))),
+                               np.power(np.power(um, 1.0 / m), -1.0 / a))
+        y = np.where(P["agg"].reshape(n, 1), gmax, y)
+
+    if _CAS1_WORKLOAD_ENABLED:
+        y = _cas1_workload_response(P, rho, obs, y,
+            np.random.Generator(rng.bit_generator.jumped()))
+
+    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.9)
+    return y, fl
