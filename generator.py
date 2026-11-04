@@ -9644,3 +9644,219 @@ def _median_rows(a: np.ndarray) -> np.ndarray:
     largest = part[:, -1]
     result = np.where(np.isnan(largest), largest, result)
     return result[:, None]
+
+
+@lru_cache(maxsize=4)
+def _time_index(L: int) -> np.ndarray:
+    """Shared read-only ``arange(L)`` row vector.
+
+    Nearly every builder opens by rebuilding this, and at n=1 the allocation is
+    a measurable share of the row. Read-only so an accidental in-place write
+    fails loudly instead of corrupting every later row.
+    """
+    t = np.arange(L, dtype=np.float64)[None, :]
+    t.flags.writeable = False
+    return t
+
+
+@lru_cache(maxsize=4)
+def _seasonal_basis(L: int) -> tuple[np.ndarray, np.ndarray]:
+
+    angle = (
+        2.0
+        * np.pi
+        * np.arange(L, dtype=np.float64)[None, :]
+        / _SEASONAL_PERIODS[:, None]
+    )
+    return np.sin(angle), np.cos(angle)
+
+
+def _seasonal(rng: np.random.Generator, n: int, L: int, k_max: int = 3) -> np.ndarray:
+
+    t = _time_index(L)
+    sin_basis, cos_basis = _seasonal_basis(L)
+    k = rng.integers(1, k_max + 1, size=n)
+    pair = _SEASONAL_PAIRS[
+        rng.integers(0, len(_SEASONAL_PAIRS), size=n)
+    ]
+    use_pair = rng.random(n) < 0.35
+    out = np.zeros((n, L), dtype=np.float64)
+    for j in range(k_max):
+        active = np.nonzero(k > j)[0]
+        per = _SEASONAL_PERIODS[
+            _SEASONAL_PROBS_CDF.searchsorted(rng.random(n), side="right")
+        ]
+        if j < 2:
+            per = np.where(use_pair, pair[:, j], per)
+        per = per[:, None]
+        amp = rng.uniform(0.2, 2.0, size=n)[:, None]
+        phase = rng.uniform(0.0, 2.0 * np.pi, size=n)[:, None]
+
+
+        basis_idx = np.searchsorted(_SEASONAL_PERIODS, per[active, 0])
+        component = amp[active] * (
+            sin_basis[basis_idx] * np.cos(phase[active])
+            + cos_basis[basis_idx] * np.sin(phase[active])
+        )
+
+
+        modulated = np.nonzero((k > j) & (rng.random(n) < 0.35))[0]
+        if modulated.size:
+
+            modulated_local = np.searchsorted(active, modulated)
+            modulated_arg = (
+                2.0 * np.pi * t / per[modulated] + phase[modulated]
+            )
+            m_per = np.clip(
+                per[modulated] * rng.uniform(
+                    4.0, 12.0, size=(modulated.size, 1)
+                ),
+                32.0,
+                2.0 * L,
+            )
+            m_phase = rng.uniform(
+                0.0, 2.0 * np.pi, size=(modulated.size, 1)
+            )
+            slow = np.sin(2.0 * np.pi * t / m_per + m_phase)
+            amp_mod = 1.0 + rng.uniform(
+                0.05, 0.45, size=(modulated.size, 1)
+            ) * slow
+            phase_mod = rng.uniform(
+                0.05, 0.75, size=(modulated.size, 1)
+            ) * np.sin(2.0 * np.pi * t / (1.7 * m_per) - m_phase)
+            component[modulated_local] = (
+                amp[modulated]
+                * amp_mod
+                * np.sin(modulated_arg + phase_mod)
+            )
+        out[active] += component
+    return out
+
+
+def _sparse_jumps(rng: np.random.Generator, n: int, L: int, rate: float, scale) -> np.ndarray:
+
+
+    mask = rng.random((n, L)) < rate
+    mask[:, 0] = False
+    rows, cols = np.nonzero(mask)
+    jumps = np.zeros((n, L), dtype=np.float64)
+    if rows.size == 0:
+        return jumps
+
+
+    s = np.asarray(scale, dtype=np.float64)
+    event_scale = s if s.ndim == 0 else s.reshape(n)[rows]
+    jumps[rows, cols] = rng.normal(0.0, 1.0, size=rows.size) * event_scale
+    return jumps
+
+
+def _relax_high_plateaus(
+    rng: np.random.Generator, out: np.ndarray, rate: float,
+    calibration_len: int,
+) -> None:
+    """Let a row's peaks decay instead of sitting flat at the maximum.
+
+    Every other lever in this round adds exact repeats, because that is what the
+    evidence supports. This one removes them, from the one place the pool says
+    they do not belong. Held samples in the pool cluster hard at the bottom of a
+    series' range and are entirely absent from the top of it: the top-decile lift
+    is 0.00 for web_cloudops, healthcare and energy alike, so those series never
+    repeat a value near their maximum. Our corpus repeats near its maximum as
+    readily as anywhere else, at a lift of 0.94, which trains the model to expect
+    a peak to hold when the real thing relaxes immediately. Peaks are where the
+    forecast error concentrates, so it is an expensive place to be wrong.
+
+    Rows are excluded when a large share of their samples already sit in the top
+    decile. That is capacity saturation -- a full dock, a link at line rate --
+    where the plateau is the physics and transport does show it, at a top-decile
+    lift of 0.96. What is left are the spiky rows, where a flat maximum is an
+    artefact of our own hold and quantize stages.
+
+    The relaxation is exponential from the first repeated sample, so the peak
+    keeps its onset and loses only the flat shoulder behind it.
+
+    DORMANT, and the measurement is the reason: 74% of rows pass the saturation
+    guard but the median one holds a single relaxable sample and the mean row only
+    1.4% of them, because top-decile repeats are rare in absolute terms however
+    unbalanced the lift looks. There is not enough mass here to move a score
+    against a 0.0027 seed-noise floor, so no arm of this round sets the rate. It
+    stays wired and verified as a no-op at 0.0 so the next round need not
+    rediscover this; biasing the censor's bound turned out to remove far more
+    ceiling plateau than this can, taking the corpus lift from 0.94 to 0.79 on its
+    own.
+    """
+    n, L = out.shape
+    if L < 3:
+        return
+    rows = np.nonzero(rng.random(n) < rate)[0]
+    if rows.size == 0:
+        return
+    x = out[rows]
+    lo = x[:, :calibration_len].min(axis=1, keepdims=True)
+    span = x[:, :calibration_len].max(axis=1, keepdims=True) - lo
+    high = x >= lo + 0.9 * span
+    # Saturated rows keep their plateaus; 0.15 is above nature's and transport's
+    # typical top-decile occupancy and below that of a clipped or docked series.
+    live = (span[:, 0] > 1e-12) & (high.mean(axis=1) < 0.15)
+    if not live.any():
+        return
+    held = np.zeros_like(x, dtype=bool)
+    held[:, 1:] = np.diff(x, axis=1) == 0.0
+    mark = held & high & live[:, None]
+    idx = np.arange(L, dtype=np.int64)
+    # Distance back to the last sample that is not a high repeat, so k counts
+    # 1, 2, 3 ... along a plateau and is exactly 0 everywhere else. The decay
+    # term then vanishes off the plateaus without needing a mask.
+    anchor = np.where(~mark, idx[None, :], 0)
+    np.maximum.accumulate(anchor, axis=1, out=anchor)
+    k = idx[None, :] - anchor
+    amplitude = rng.uniform(0.05, 0.25, size=(rows.size, 1)) * span
+    lam = rng.uniform(0.30, 1.20, size=(rows.size, 1))
+    out[rows] = x - amplitude * (1.0 - np.exp(-lam * k))
+
+
+@njit(cache=False, fastmath=False)
+def _gamma_warp_apply(out: np.ndarray, rows: np.ndarray, gamma: np.ndarray) -> None:
+    """In-place per-row gamma warp; bit-identical to the vectorized NumPy form."""
+    for r in range(rows.size):
+        i = rows[r]
+        g = gamma[r]
+        mirrored = g < 0.0
+        if mirrored:
+            g = -g
+        lo = out[i, 0]
+        hi = out[i, 0]
+        L = out.shape[1]
+        for t in range(1, L):
+            v = out[i, t]
+            if v < lo:
+                lo = v
+            if v > hi:
+                hi = v
+        span = hi - lo
+        if span < 1e-12:
+            span = 1e-12
+        for t in range(L):
+            u = (out[i, t] - lo) / span
+            if u < 0.0:
+                u = 0.0
+            elif u > 1.0:
+                u = 1.0
+            if mirrored and hi - lo >= 1e-12:
+                if u <= 0.0:
+                    out[i, t] = lo
+                elif u >= 1.0:
+                    out[i, t] = hi
+                else:
+                    value = lo + span * (1.0 - (1.0 - u) ** g)
+                    # Cancellation can overshoot hi by an ULP when the power
+                    # rounds to zero. Enforce the mathematical range exactly.
+                    if value < lo:
+                        value = lo
+                    elif value > hi:
+                        value = hi
+                    out[i, t] = value
+            else:
+                # Keep the complete original arithmetic for unmirrored and
+                # sub-floor-span rows, including exactly constant inputs.
+                out[i, t] = lo + span * (u ** g)
