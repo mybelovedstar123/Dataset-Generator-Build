@@ -8412,3 +8412,936 @@ def _parse_temporal_integrity(value: Any) -> dict[str, bool]:
             raise ValueError("temporal_integrity flags must be booleans")
         out[key] = flag
     return out
+
+
+class _BaseGenerator(DataGenerator):
+
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        cfg_path = Path(config_dir) / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else {}
+        self._cfg = cfg
+        self._renewal_persistence = _parse_renewal_persistence(cfg.get("renewal_persistence", {}))
+        self._support_contract = _parse_support_contract(cfg.get("support_contract", {}))
+        self._temporal_integrity = _parse_temporal_integrity(cfg.get("temporal_integrity", {}))
+        if any(self._temporal_integrity.values()):
+            native = cfg.get("chronoforge", _CF_CFG) if self._temporal_integrity["instance_config"] else _CF_CFG
+            if not isinstance(native, dict):
+                raise ValueError("chronoforge must be an object")
+            native = dict(native)
+            native["_complete_native_renewals"] = self._temporal_integrity["complete_renewals"]
+            native["_native_integer_flags"] = self._temporal_integrity["native_integer_flags"]
+            self._cf_builders = tuple(_cf_builder(name, native) for name in CF_GRAFT)
+        else:
+            self._cf_builders = CF_BUILDERS
+        self._seed = int(seed)
+        self._min_len = int(cfg.get("min_length", 64))
+        self._max_len = int(cfg.get("max_length", 4096))
+        if self._min_len < 1 or self._max_len < self._min_len:
+            raise ValueError(f"invalid length band [{self._min_len}, {self._max_len}]")
+        weights = dict(_DEFAULT_WEIGHTS)
+        for k, v in dict(cfg.get("family_weights", {})).items():
+            if k in weights:
+                weights[k] = float(v)
+        w = np.asarray([weights[f] for f in _FAMILIES], dtype=np.float64)
+        if not np.all(np.isfinite(w)) or w.min() < 0 or w.sum() <= 0:
+            raise ValueError("family_weights must be finite, non-negative, and not all zero")
+        self._weights = w / w.sum()
+        curriculum = dict(cfg.get("curriculum", {}))
+        self._curriculum_enabled = bool(curriculum.get("enabled", False))
+        self._expected_budget_fraction = float(
+            curriculum.get("expected_budget_fraction", 1.0)
+        )
+        if (
+            not np.isfinite(self._expected_budget_fraction)
+            or not 0.0 < self._expected_budget_fraction <= 1.0
+        ):
+            raise ValueError("curriculum.expected_budget_fraction must be in (0, 1]")
+        self._curriculum_start = float(curriculum.get("start_fraction", 0.10))
+        self._curriculum_end = float(curriculum.get("end_fraction", 0.70))
+        if not 0.0 <= self._curriculum_start < self._curriculum_end <= 1.0:
+            raise ValueError(
+                "curriculum fractions must satisfy 0 <= start_fraction < end_fraction <= 1"
+            )
+        start_weights = dict(weights)
+        for k, v in dict(curriculum.get("start_family_weights", {})).items():
+            if k in start_weights:
+                start_weights[k] = float(v)
+        start_w = np.asarray([start_weights[f] for f in _FAMILIES], dtype=np.float64)
+        if (
+            not np.all(np.isfinite(start_w))
+            or start_w.min() < 0
+            or start_w.sum() <= 0
+        ):
+            raise ValueError(
+                "curriculum.start_family_weights must be finite, non-negative, "
+                "and not all zero"
+            )
+        self._start_weights = start_w / start_w.sum()
+
+        (
+            self._domain_mix_enabled,
+            self._domain_weights,
+            self._domain_start_weights,
+        ) = parse_domain_mix(cfg, _FAMILIES)
+        self._domain_pool_indices = (
+            build_domain_pool_indices(_FAMILIES)
+            if self._domain_mix_enabled
+            else None
+        )
+
+        self._tr_hi_frac = float(cfg.get("tr_hi_frac", 0.25))
+        self._prefetch_depth = int(cfg.get("prefetch_depth", 2))
+        if not 1 <= self._prefetch_depth <= 4:
+            raise ValueError("prefetch_depth must be in [1, 4]")
+        augment = dict(cfg.get("augment", {}))
+        observation = dict(cfg.get("observation", {}))
+        self._parameters = {
+            "tr_exc_lo": float(cfg.get("tr_exc_lo", 0.4)),
+            "tr_exc_hi": float(cfg.get("tr_exc_hi", 3.0)),
+            "gr_exc_lo": float(cfg.get("gr_exc_lo", 0.3)),
+            "gr_exc_hi": float(cfg.get("gr_exc_hi", 2.0)),
+            "sa_clean_frac": float(cfg.get("sa_clean_frac", 0.4)),
+            "sa_clean_lo": float(cfg.get("sa_clean_lo", 0.02)),
+            "sa_clean_hi": float(cfg.get("sa_clean_hi", 0.12)),
+            "integrated_heavy_frac": float(
+                cfg.get("integrated_heavy_frac", 0.25)
+            ),
+            "integrated_sv_frac": float(cfg.get("integrated_sv_frac", 0.30)),
+            # Defaults reproduce the pre-existing hardcoded behaviour exactly, so
+            # a config that omits them emits the same bytes as the parent.
+            "tsmixup_source_alpha": float(cfg.get("tsmixup_source_alpha", 1.0)),
+            "tsmixup_mean_scale": float(cfg.get("tsmixup_mean_scale", 0.0)),
+            "step_level_jumps_lo": float(cfg.get("step_level_jumps_lo", 1.0)),
+            "step_level_jumps_hi": float(cfg.get("step_level_jumps_hi", 8.0)),
+            "step_level_exact_frac": float(cfg.get("step_level_exact_frac", 0.6)),
+            "step_level_noise_lo": float(cfg.get("step_level_noise_lo", 0.002)),
+            "step_level_noise_hi": float(cfg.get("step_level_noise_hi", 0.03)),
+            "cs_calm_noise": float(cfg.get("cs_calm_noise", 0.0)),
+            "nonneg_integer_min_std": float(
+                cfg.get("nonneg_integer_min_std", 0.0)
+            ),
+            "nonneg_integer_min_std_frac": float(
+                cfg.get("nonneg_integer_min_std_frac", 1.0)
+            ),
+            "nonneg_integer_frac": float(
+                cfg.get("nonneg_integer_frac", _NONNEG_INTEGER_FRAC)
+            ),
+            "flat_level_spread": float(cfg.get("flat_level_spread", 0.0)),
+            "lm_beta_lo": float(cfg.get("lm_beta_lo", -0.6)),
+            "lm_beta_hi": float(cfg.get("lm_beta_hi", 2.4)),
+            "tail_rebase_rate": float(cfg.get("tail_rebase_rate", 0.0)),
+            "observation.censor_rate": float(observation.get("censor_rate", 0.06)),
+            "observation.censor_upper_frac": float(
+                observation.get("censor_upper_frac", 0.5)
+            ),
+            "observation.censor_q_lo": float(
+                observation.get("censor_q_lo", 0.03)
+            ),
+            "observation.censor_q_hi": float(
+                observation.get("censor_q_hi", 0.30)
+            ),
+            "observation.peak_transient_rate": float(
+                observation.get("peak_transient_rate", 0.0)
+            ),
+            "observation.quantize_rate": float(
+                observation.get("quantize_rate", 0.07)
+            ),
+            "observation.regular_hold_rate": float(
+                observation.get("regular_hold_rate", 0.04)
+            ),
+            "observation.irregular_hold_rate": float(
+                observation.get("irregular_hold_rate", 0.0)
+            ),
+            "observation.irregular_hold_prob_lo": float(
+                observation.get("irregular_hold_prob_lo", 0.01)
+            ),
+            "observation.irregular_hold_prob_hi": float(
+                observation.get("irregular_hold_prob_hi", 0.10)
+            ),
+            "observation.shock_row_rate": float(
+                observation.get("shock_row_rate", 0.0)
+            ),
+            "observation.shock_prob_lo": float(
+                observation.get("shock_prob_lo", 0.001)
+            ),
+            "observation.shock_prob_hi": float(
+                observation.get("shock_prob_hi", 0.015)
+            ),
+            "augment.tsmixup": float(augment.get("tsmixup", 0.0)),
+            "augment.pad_prefix": float(augment.get("pad_prefix", 0.0)),
+            "observation.amp_trend_rate": float(
+                observation.get("amp_trend_rate", 0.36)
+            ),
+            "observation.kernel_spike_rate": float(
+                observation.get("kernel_spike_rate", 0.20)
+            ),
+            "observation.periodic_spike_frac": float(
+                observation.get("periodic_spike_frac", 0.0)
+            ),
+            "observation.time_warp_rate": float(
+                observation.get("time_warp_rate", 0.12)
+            ),
+            "observation.global_dilation_rate": float(
+                observation.get("global_dilation_rate", 0.0)
+            ),
+            "observation.duty_cycle_rate": float(
+                observation.get("duty_cycle_rate", 0.10)
+            ),
+            "observation.nonuniform_quantize_frac": float(
+                observation.get("nonuniform_quantize_frac", 2.0 / 3.0)
+            ),
+            # 191 observation grafts (UID 191 / generators/191 p43–p46).
+            # Defaults 0 keep the stock v10 path bit-identical until config
+            # turns them on.
+            "observation.gamma_warp_rate": float(
+                observation.get("gamma_warp_rate", 0.0)
+            ),
+            "observation.hold_block_rate": float(
+                observation.get("hold_block_rate", 0.0)
+            ),
+            "observation.post_amp_drift_rate": float(
+                observation.get("post_amp_drift_rate", 0.0)
+            ),
+            "observation.nonneg_skip_range_artifacts": float(
+                observation.get("nonneg_skip_range_artifacts", 0.0)
+            ),
+        }
+        start_parameters = dict(curriculum.get("start_parameters", {}))
+        start_observation = dict(start_parameters.pop("observation", {}))
+        start_augment = dict(start_parameters.pop("augment", {}))
+        known_top_level = {
+            key for key in self._parameters if "." not in key
+        }
+        unknown = set(start_parameters) - known_top_level
+        unknown.update(
+            f"observation.{key}"
+            for key in start_observation
+            if f"observation.{key}" not in self._parameters
+        )
+        unknown.update(
+            f"augment.{key}"
+            for key in start_augment
+            if f"augment.{key}" not in self._parameters
+        )
+        if unknown:
+            names = ", ".join(sorted(unknown))
+            raise ValueError(f"unknown curriculum.start_parameters: {names}")
+        self._start_parameters = dict(self._parameters)
+        for key, value in start_parameters.items():
+            self._start_parameters[key] = float(value)
+        for key, value in start_observation.items():
+            self._start_parameters[f"observation.{key}"] = float(value)
+        for key, value in start_augment.items():
+            self._start_parameters[f"augment.{key}"] = float(value)
+        _validate_parameters(self._parameters, "final parameters")
+        _validate_parameters(
+            self._start_parameters, "curriculum.start_parameters"
+        )
+    @property
+    def name(self) -> str:
+        return str(self._cfg.get("name", "cascade-heat3-fast-learn-curriculum"))
+
+    def _blend_at(self, token_progress: float) -> float:
+        """Return the shared smoothstep blend for weights and difficulty."""
+        if not self._curriculum_enabled:
+            return 1.0
+        position = (token_progress - self._curriculum_start) / (
+            self._curriculum_end - self._curriculum_start
+        )
+        position = float(np.clip(position, 0.0, 1.0))
+        return position * position * (3.0 - 2.0 * position)
+
+    def _weights_at(self, token_progress: float) -> np.ndarray:
+        """Blend easy-to-final family weights with a smoothstep schedule."""
+        blend = self._blend_at(token_progress)
+        if blend >= 1.0:
+            return self._weights
+        if blend <= 0.0:
+            return self._start_weights
+        return (1.0 - blend) * self._start_weights + blend * self._weights
+
+    def _domain_weights_at(self, token_progress: float) -> np.ndarray | None:
+        """Blend easy-to-final domain shares when domain_mix is enabled."""
+        if not self._domain_mix_enabled:
+            return None
+        blend = self._blend_at(token_progress)
+        if blend >= 1.0:
+            return self._domain_weights
+        if blend <= 0.0:
+            return self._domain_start_weights
+        return (1.0 - blend) * self._domain_start_weights + blend * self._domain_weights
+
+    def _parameters_at(self, token_progress: float) -> dict[str, float]:
+        """Blend all within-family, observation, and augmentation settings."""
+        blend = self._blend_at(token_progress)
+        if blend >= 1.0:
+            return dict(self._parameters)
+        if blend <= 0.0:
+            return dict(self._start_parameters)
+        return {
+            key: (1.0 - blend) * self._start_parameters[key]
+            + blend * final_value
+            for key, final_value in self._parameters.items()
+        }
+
+    def _progress_at(self, emitted_points: float, target_points: int) -> float:
+        """Calibrate nominal point progress to expected heat consumption."""
+        return emitted_points / (target_points * self._expected_budget_fraction)
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+
+
+        if n_series <= 0:
+            return
+        rng = np.random.default_rng(self._seed)
+        max_len = self._max_len
+        # stream_cpu requests token_budget // min_length + 2 rows. Recover the
+        # budget so this fixed-length generator follows trainer token progress.
+        target_points = max(1, max(n_series - 2, 1) * self._min_len)
+
+
+        queue: Queue[object] = Queue(maxsize=self._prefetch_depth)
+        stop = Event()
+        consumed = Event()
+        done = object()
+
+        def put(item: object) -> bool:
+            while not stop.is_set():
+                try:
+                    queue.put(item, timeout=0.1)
+                    return True
+                except Full:
+                    continue
+            return False
+
+        def produce() -> None:
+            try:
+                produced = 0
+                emitted_points = 0
+                base_seed = self._seed
+                # Running chunk counter: every isolated stream below is keyed
+                # (base_seed, chunk_index, fam, slot, tag) so an edit anywhere
+                # can only touch the rows its own stream feeds.
+                chunk_index = 0
+                while produced < n_series and not stop.is_set():
+
+
+                    batch_size = chunk_batch_size(produced)
+                    lengths = rng.integers(
+                        self._min_len, max_len + 1, size=batch_size
+                    )
+                    take = min(batch_size, n_series - produced)
+                    chunk_points = int(lengths[:take].sum())
+                    midpoint_progress = self._progress_at(
+                        emitted_points + 0.5 * chunk_points, target_points
+                    )
+                    family_weights = self._weights_at(midpoint_progress)
+                    parameters = self._parameters_at(midpoint_progress)
+                    builders = (
+                        partial(
+                            _trend_seasonal_ar,
+                            hi_frac=self._tr_hi_frac,
+                            exc_lo=parameters["tr_exc_lo"],
+                            exc_hi=parameters["tr_exc_hi"],
+                            clean_frac=parameters["sa_clean_frac"],
+                            clean_lo=parameters["sa_clean_lo"],
+                            clean_hi=parameters["sa_clean_hi"],
+                        ),
+                        _regime_shift,
+                        partial(
+                            _multiplicative,
+                            hi_frac=self._tr_hi_frac,
+                            exc_lo=parameters["gr_exc_lo"],
+                            exc_hi=parameters["gr_exc_hi"],
+                        ),
+                        _ar2,
+                        partial(
+                            _integrated,
+                            heavy_frac=parameters["integrated_heavy_frac"],
+                            sv_frac=parameters["integrated_sv_frac"],
+                        ),
+                        _threshold_ar,
+                        _chaotic,
+                        _spectral_gp,
+                        partial(
+                            _long_memory,
+                            beta_lo=parameters["lm_beta_lo"],
+                            beta_hi_end=parameters["lm_beta_hi"],
+                        ),
+                        _ou_stochastic_vol,
+                        _physical_sensors,
+                        _seasonal_counts,
+                        _intermittent,
+                        _pulse_outlier,
+                        partial(
+                            _conditional_stability,
+                            calm_noise=parameters["cs_calm_noise"],
+                        ),
+                        partial(
+                            _step_level,
+                            jumps_lo=parameters["step_level_jumps_lo"],
+                            jumps_hi=parameters["step_level_jumps_hi"],
+                            exact_frac=parameters["step_level_exact_frac"],
+                            noise_lo=parameters["step_level_noise_lo"],
+                            noise_hi=parameters["step_level_noise_hi"],
+                        ),
+                        _vol_regime_switch,
+                        _weekly_demand,
+                        _tidal_harmonic,
+                        _flow_recession,
+                        _bounded_counts,
+                        _held_rate,
+                        _spiky_price,
+                        _epi_decay,
+                        _sticky_station,
+                        _grid_flow,
+                        _price_shock,
+                        _coastal_residual,
+                        partial(_cs_flat, calm_noise=parameters["cs_calm_noise"]),
+                        partial(_cs_drift, calm_noise=parameters["cs_calm_noise"]),
+                        _cs_countwalk,
+                        _cs_pulse,
+                        _rk4_chaotic,
+                        _tidal_constituents,
+                        _envelope_mod,
+                        _rate_counts,
+                        _dispersion_counts,
+                        _dispatch_blocks,
+                        # grafted chronoforge builders, same order as CF_GRAFT
+                        *self._cf_builders,
+                        # grafted vanta native builder, LAST index (== cycle_profile)
+                        _cycle_profile,
+                        _transport_flow_tail,
+                        _capacity_counts,
+                        _overdispersed_counts,
+                        _reported_epi_counts,
+                        _retail_promo_tail,
+                        _heavy_traffic_counts,
+                        _sparse_admin_counts,
+                        _storm_outage_counts,
+                        _gauge_rain,
+                        _store_sales_panel,
+                        _web_session_attr,
+                        _broadband_path_attr,
+                        _cluster_job_attr,
+                        _sales_promo_stockout_panel,
+                        _settle_hold,
+                        _web_traffic_plateau,
+                        _biz_day_counts,
+                        _weekly_web_counts,
+                        _dispatch_price,
+                        _epi_season_decay,
+                        _weekday_ledger_counts,
+                        _surveillance_counts,
+                        _pull_counter_ramp,
+                        _weekly_cycle_downloads,
+                        _hourly_social_counts,
+                        _intraday_event_counts,
+                        _intraday_spot_price,
+                        _road_commute_counts,
+                    )
+                    current_observation = {
+                        key.removeprefix("observation."): value
+                        for key, value in parameters.items()
+                        if key.startswith("observation.")
+                    }
+                    domain_weights = self._domain_weights_at(midpoint_progress)
+                    if domain_weights is not None:
+                        fam_ids = dispatch_domain_mix(
+                            base_seed,
+                            chunk_index,
+                            batch_size,
+                            domain_weights,
+                            family_weights,
+                            self._domain_pool_indices,
+                        )
+                    else:
+                        # Flat family dispatch (legacy path). The master stream
+                        # consumes exactly what the source's ``rng.choice`` did:
+                        # one ``rng.random(batch_size)`` call (verified
+                        # bit-identical, including end state).
+                        dispatch_u = rng.random(batch_size)
+                        fam_base = _DISPATCH_REF_CDF.searchsorted(
+                            dispatch_u, side="right"
+                        )
+                        if np.array_equal(family_weights, _DISPATCH_REF):
+                            fam_ids = fam_base
+                        else:
+                            excess = np.maximum(
+                                family_weights - _DISPATCH_REF, 0.0
+                            )
+                            excess_total = excess.sum()
+                            if excess_total <= 0.0:
+                                fam_ids = fam_base
+                            else:
+                                dispatch_rng = np.random.default_rng(
+                                    np.random.SeedSequence(
+                                        (base_seed, chunk_index,
+                                         _DISPATCH_STREAM_FAM, 0, 0)
+                                    )
+                                )
+                                keep_u = dispatch_rng.random(batch_size)
+                                move_u = dispatch_rng.random(batch_size)
+                                keep_prob = np.where(
+                                    _DISPATCH_REF > 0.0,
+                                    np.minimum(
+                                        np.divide(
+                                            family_weights,
+                                            _DISPATCH_REF,
+                                            out=np.ones_like(family_weights),
+                                            where=_DISPATCH_REF > 0.0,
+                                        ),
+                                        1.0,
+                                    ),
+                                    1.0,
+                                )
+                                excess_cdf = np.cumsum(excess / excess_total)
+                                excess_cdf /= excess_cdf[-1]
+                                released = keep_u >= keep_prob[fam_base]
+                                fam_ids = fam_base.copy()
+                                fam_ids[released] = excess_cdf.searchsorted(
+                                    move_u[released], side="right"
+                                )
+                    # Seed words for the whole chunk in one vectorised pass,
+                    # keyed (base_seed, chunk_index, fam, slot, tag). The block
+                    # loop below draws only the anchor slot of each family
+                    # group, so most of these words go unused; deriving them all
+                    # is one vectorised call per tag and cheaper than selecting
+                    # the ~34 anchors out of it.
+                    slots = np.arange(batch_size, dtype=np.int64)
+                    # Tag 3 belongs to the tail rebase and is derived only when
+                    # that mechanism is on, so the default path pays nothing for
+                    # it. Tags are independent keys, so adding one cannot perturb
+                    # streams 0-2.
+                    tags = (0, 1, 2, 3) if parameters["tail_rebase_rate"] > 0.0 \
+                        else (0, 1, 2)
+                    stream_words = []
+                    for tag in tags:
+                        cols = _ss_columns(
+                            [base_seed, chunk_index, fam_ids, slots, tag],
+                            batch_size,
+                        )
+                        stream_words.append(
+                            None if cols is None else _pcg64_seed_words(cols)
+                        )
+                    n_tags = len(tags)
+
+                    def _stream(tag: int, slot: int, fam: int):
+                        words = stream_words[tag]
+                        if words is None:
+                            return np.random.default_rng(
+                                np.random.SeedSequence(
+                                    (base_seed, chunk_index, fam, slot, tag)
+                                )
+                            )
+                        return _row_pool(n_tags).seeded(tag, *words[slot])
+
+                    chunk: list[np.ndarray | None] = [None] * batch_size
+                    # Each family group writes disjoint slots; no shared RNG.
+                    support_protected = np.zeros(batch_size, dtype=bool)
+                    native_no_pad = np.zeros(batch_size, dtype=bool)
+
+                    def _build_family_group(fam: int, idx: np.ndarray) -> None:
+                        family = _FAMILIES[fam]
+                        preserve_nonnegative = family in {
+                            "sticky_station",
+                            "epi_decay",
+                            "multiplicative",
+                            "physical_sensors",
+                            "seasonal_counts",
+                            "intermittent",
+                            # These families intentionally encode signed prices,
+                            # cross-border flow reversals, and below-zero grid
+                            # regimes. The global nonnegative/integer prior
+                            # otherwise shifts 85% of their rows and rounds 70%
+                            # of those rows, erasing the energy-specific signal.
+                            "grid_flow",
+                            "spiky_price",
+                            "price_shock",
+                            # Sea level is signed about a site datum; rounding
+                            # or zero-clipping it erases the constituent
+                            # structure this family exists to teach.
+                            "tidal_constituents",
+                            # Persistent physical levels (stage / hydrograph /
+                            # smooth load). The global integer prior otherwise
+                            # rounds away the continuous recession and the
+                            # 5-min load carrier this family now owns.
+                            "flow_recession",
+                            # Doubly-stochastic counts/rates: the family owns
+                            # its count semantics (exact-zero runs, Poisson /
+                            # Gamma / Lognormal draws); the global nonneg-
+                            # integer prior would re-round and zero-inflate
+                            # what the observation law already encodes.
+                            "rate_counts",
+                            # The whole point of this family is that its Fano
+                            # factor is exactly what was requested. The global
+                            # prior would shift the level and re-round, which
+                            # changes variance and mean independently and so
+                            # destroys the one statistic it exists to control.
+                            "dispersion_counts",
+                            # Off is exactly zero and on holds a level; the
+                            # global prior would shift the floor off zero and
+                            # re-round the held levels, dissolving both.
+                            "dispatch_blocks",
+                            # Grafted chronoforge families that are non-negative
+                            # by construction and own their count / bound
+                            # semantics (traffic counts, counter resets, queue
+                            # latency, rate plateaus, epidemic renewal counts,
+                            # admin reporting counts, bounded vitals). The two
+                            # signed grafts (ops_deploy_transient,
+                            # physio_quasiperiodic) deliberately go through the
+                            # global prior: healthcare / web_cloudops in the
+                            # eval pool are never negative.
+                            "ops_diurnal_traffic",
+                            "ops_saturating_feedback",
+                            "ops_counter_reset",
+                            "ops_latency_queue",
+                            "ops_rate_plateau",
+                            "epi_renewal",
+                            "admin_reporting_counts",
+                            "clinical_bounded_vitals",
+                            # later grafts that are non-negative by construction
+                            "met_bounded_atom", "met_wind_speed",
+                            "wet_dry_intermittent", "regime_dwell_zerosparse",
+                            "hawkes_marked", "transport_flow",
+                            "retail_promo_intermittent",
+                            # combo1: energy_load_price_solar carries signed
+                            # prices / below-zero load; exempt it from the global
+                            # nonneg/int prior so the energy signal survives.
+                            "energy_load_price_solar",
+                            # Moment-matched count/gauge laws own their
+                            # zeros, integer rounding and tick spacing.
+                            "heavy_traffic_counts",
+                            "sparse_admin_counts",
+                            "storm_outage_counts",
+                            "gauge_rain",
+                            "store_sales_panel",
+                            "sales_promo_stockout_panel",
+                            "web_session_attr",
+                            "broadband_path_attr",
+                            "cluster_job_attr",
+                            "settle_hold",
+                            "web_traffic_plateau",
+                            "biz_day_counts",
+                            "weekly_web_counts",
+                            "weekly_demand",
+                        }
+                        clean = family in _CLEAN
+                        preserve_integers = family in {
+                            "sticky_station",
+                            "epi_decay",
+                            "seasonal_counts",
+                            "intermittent",
+                            "rate_counts",
+                            "dispersion_counts",
+                            "dispatch_blocks",
+                            # grafts that already emit integer counts
+                            "epi_renewal",
+                            "admin_reporting_counts",
+                            "ops_counter_reset",
+                            "ops_diurnal_traffic",
+                            "retail_promo_intermittent",
+                            "heavy_traffic_counts",
+                            "sparse_admin_counts",
+                            "storm_outage_counts",
+                            "sales_promo_stockout_panel",
+                            "web_session_attr",
+                            "cluster_job_attr",
+                            "web_traffic_plateau",
+                            "biz_day_counts",
+                            "weekly_web_counts",
+                        }
+                        allow_reverse = family in {
+                            "trend_seasonal_ar",
+                            "multiplicative",
+                            "spectral_gp",
+                            "long_memory",
+                        }
+                        allow_range_artifacts = family != "integrated"
+                        # Per-FAMILY-GROUP streams: one stream per
+                        # (chunk, family, tag) rather than one per row, and the
+                        # whole group built and post-processed as a single
+                        # (rows, L) block.
+                        #
+                        # The observation pipeline costs 343us for one row and
+                        # 129us per row at 64 rows a call. The work per row is
+                        # the same either way; what amortises is the row
+                        # selection draws, the calibration medians and ufunc
+                        # dispatch, all of which run once per call instead of
+                        # once per row. Spending the 13.32B-token budget inside
+                        # the hour needs 3.70M points/s and per-row dispatch
+                        # leaves the corpus short of it, so that 2.66x is the
+                        # difference between using the budget and leaving
+                        # tokens on the table.
+                        #
+                        # The cost is coarser isolation than 08-14-3: an edit to
+                        # one stage now moves every row of every family that
+                        # reaches it, not a single row. 08-14-3 keeps the
+                        # per-row keying and stays the reference for bisecting a
+                        # regression to one stage of one family.
+                        anchor = int(idx[0])
+                        policy = self._support_contract
+                        builder = builders[fam]
+                        metadata_builder = getattr(builder, "with_metadata", None)
+                        flags = None
+                        if metadata_builder is not None and (
+                            policy["restore_bounded_native"] or policy["guard_mixing"]
+                            or self._temporal_integrity["native_integer_flags"]
+                        ):
+                            block, flags = metadata_builder(
+                                _stream(0, anchor, fam), int(idx.size), max_len
+                            )
+                        else:
+                            block = builder(_stream(0, anchor, fam), int(idx.size), max_len)
+                        bounded_mask = _native_bounded_mask(flags, int(idx.size))
+                        if (preserve_integers and flags is not None
+                                and self._temporal_integrity["native_integer_flags"]):
+                            preserve_integers = np.asarray(flags["integer"], dtype=bool)
+                            if preserve_integers.shape != (idx.size,):
+                                raise ValueError("native integer flags must have one value per row")
+                        restore_mask = bounded_mask & policy["restore_bounded_native"]
+                        # Native bounded rows retain their complete emission law:
+                        # clipping an already distorted row is not equivalent.
+                        native_rows = block[restore_mask].copy() if restore_mask.any() else None
+                        signed_family = family in _NATIVE_SIGNED_FAMILIES
+                        clip_nonnegative = preserve_nonnegative and not (
+                            policy["restore_signed"] and signed_family
+                        )
+                        if policy["guard_mixing"]:
+                            support_protected[idx] = bounded_mask | signed_family
+                        native_no_pad[idx] = restore_mask
+                        if clean:
+                            block = _sanitize(block)
+                        else:
+                            block = _sanitize(
+                                _measurement_artifacts(
+                                    _stream(1, anchor, fam),
+                                    block,
+                                    preserve_nonnegative=preserve_nonnegative,
+                                    clip_nonnegative=clip_nonnegative,
+                                    repair_degenerate_rollback=policy["repair_degenerate_rollback"],
+                                    preserve_integers=preserve_integers,
+                                    allow_reverse=allow_reverse,
+                                    allow_range_artifacts=allow_range_artifacts,
+                                    preserve_pre_gamma_shape=(
+                                        (_HARRY_TIDAL_GAMMA_BYPASS
+                                         and family == "tidal_constituents")
+                                        or (_HARRY_I029_GRID_FLOW_GAMMA_BYPASS
+                                            and family == "grid_flow")
+                                    ),
+                                    **(dict(current_observation, time_warp_rate=0.0,
+                                            global_dilation_rate=0.0)
+                                       if family in _V444_CLOCK_FAMILIES
+                                       else current_observation),
+                                )
+                            )
+                        if not preserve_nonnegative:
+                            post_rng = _stream(2, anchor, fam)
+                            block = _apply_nonneg_integer_prior(
+                                post_rng, block,
+                                integer_min_std=parameters[
+                                    "nonneg_integer_min_std"
+                                ],
+                                integer_min_std_frac=parameters[
+                                    "nonneg_integer_min_std_frac"
+                                ],
+                                integer_frac=parameters[
+                                    "nonneg_integer_frac"
+                                ],
+                                flat_level_spread=parameters[
+                                    "flat_level_spread"
+                                ],
+                            )
+                            block = _apply_zero_inflation(post_rng, block)
+                        # Outside the preserve_nonnegative guard on purpose: a
+                        # recalibration hits a signed price series and a count
+                        # series alike, and the families exempt from the global
+                        # prior are exactly the ones that own their level.
+                        if (parameters["tail_rebase_rate"] > 0.0
+                                and family not in ("ops_counter_reset", "pull_counter_ramp", "epi_season_decay", "surveillance_counts",
+                                           "epi_renewal", "reported_epi_counts", "epi_decay")):
+                            block = _apply_tail_rebase(
+                                _stream(3, anchor, fam), block,
+                                parameters["tail_rebase_rate"],
+                                periodic_continue=True,
+                                preserve_periodic_native=(
+                                    _TIDAL_NATIVE_PERIODIC_ENABLED
+                                    and family == "tidal_constituents"
+                                ),
+                            )
+                        block = _apply_unique_idea(
+                            family, block, base_seed, chunk_index, fam
+                        )
+                        if clip_nonnegative:
+                            np.maximum(block, 0.0, out=block)
+                        if native_rows is not None:
+                            block[restore_mask] = native_rows
+                        block = _flow_reporting_memory(
+                            block, family, base_seed, chunk_index, fam,
+                            int(idx[0]), 8, 'rolling', 0.5)
+                        for k in range(int(idx.size)):
+                            slot = int(idx[k])
+                            length = int(lengths[slot])
+                            chunk[slot] = np.ascontiguousarray(
+                                block[k, :length], dtype=np.float64
+                            )
+
+                    groups = []
+                    for fam in range(len(_FAMILIES)):
+                        fam_idx = np.nonzero(fam_ids == fam)[0]
+                        if fam_idx.size:
+                            groups.append((fam, fam_idx))
+                    if _PRODUCER_WORKERS > 1 and len(groups) > 1:
+                        _run_family_groups(_build_family_group, groups)
+                    else:
+                        for fam, fam_idx in groups:
+                            _build_family_group(fam, fam_idx)
+
+
+                    if self._min_len == max_len:
+                        mix_rate = parameters["augment.tsmixup"]
+                        mixed = np.nonzero(rng.random(batch_size) < mix_rate)[0]
+                        mix_alpha = parameters["tsmixup_source_alpha"]
+                        mix_scaled = parameters["tsmixup_mean_scale"] >= 0.5
+                        for series_i in mixed:
+                            source = chunk[series_i]
+                            if source is None:
+                                continue
+                            n_other = int(rng.integers(1, 3))
+                            others = rng.integers(0, batch_size, size=n_other)
+                            # Concentration on the source component only. The draw
+                            # count is unchanged, so the stream advances the same
+                            # way whatever the concentration is.
+                            alpha = np.ones(n_other + 1)
+                            alpha[0] = mix_alpha
+                            weights = rng.dirichlet(alpha)
+                            if self._support_contract["guard_mixing"] and not _mixup_support_compatible(
+                                support_protected, int(series_i), others
+                            ):
+                                continue
+                            parts = [source]
+                            valid = True
+                            for other_i in others:
+                                other = chunk[int(other_i)]
+                                if other is None:
+                                    valid = False
+                                    break
+                                parts.append(other)
+                            if not valid:
+                                continue
+                            if mix_scaled:
+                                # Chronos TSMixup mixes *mean-scaled* series. Our
+                                # families draw amplitude over three orders of
+                                # magnitude, so combining raw series lets the
+                                # largest component swamp the rest and the mixture
+                                # carries only its pattern. Scale each component to
+                                # unit mean absolute value, combine, then restore
+                                # the source's scale: the observation pipeline's
+                                # integer rounding is not scale-invariant, so the
+                                # result has to come back to the source amplitude.
+                                unit = []
+                                for part in parts:
+                                    s = float(np.mean(np.abs(part)))
+                                    unit.append(part / s if s > 1e-12 else part)
+                                source_scale = float(np.mean(np.abs(source)))
+                                combined = weights[0] * unit[0]
+                                for j, part in enumerate(unit[1:]):
+                                    combined = combined + weights[j + 1] * part
+                                if source_scale > 1e-12:
+                                    combined = combined * source_scale
+                            else:
+                                combined = weights[0] * parts[0]
+                                for j, part in enumerate(parts[1:]):
+                                    combined = combined + weights[j + 1] * part
+                            chunk[series_i] = _sanitize(combined)
+
+
+                    pad_rate = parameters["augment.pad_prefix"]
+                    padded = np.nonzero(rng.random(batch_size) < pad_rate)[0]
+                    for series_i in padded:
+                        series = chunk[series_i]
+                        if series is None or series.size < 8:
+                            continue
+                        cut = int(rng.integers(series.size // 8, 3 * series.size // 4))
+                        if native_no_pad[series_i]:
+                            continue
+                        series[:cut] = series[cut]
+                    # Native small-mixture replacement sees the FINAL emitted
+                    # length, after TSMixup and prefix padding. No later stage
+                    # can re-corrupt its support, noise law or quiet regimes.
+                    if self._renewal_persistence["rate"] > 0.0:
+                        _apply_renewal_persistence(
+                            chunk, fam_ids, base_seed, chunk_index,
+                            self._renewal_persistence,
+                        )
+                    # Run after every parent augmentation so the finite episode
+                    # cannot perturb TSMixup, padding, renewal, or V449's
+                    # terminal-tail classifier through a downstream statistic.
+                    if _CAS1_INTERIOR_REBASE_RATE > 0.0:
+                        for fam, fam_idx in groups:
+                            family = _FAMILIES[fam]
+                            if family == "ops_counter_reset":
+                                continue
+                            parent_rows = np.stack(
+                                [chunk[int(i)] for i in fam_idx]
+                            )
+                            rows = parent_rows.copy()
+                            for episode_i, endpoint in enumerate(
+                                    _CAS1_INTERIOR_REBASE_ENDPOINTS):
+                                episode_rng = np.random.default_rng(
+                                    np.random.SeedSequence(
+                                        (base_seed, chunk_index, fam,
+                                         _CAS1_INTERIOR_REBASE_STAGE + episode_i)
+                                    )
+                                )
+                                proposed = _apply_interior_rebase_episode(
+                                    episode_rng, parent_rows.copy(),
+                                    _CAS1_INTERIOR_REBASE_RATE,
+                                    endpoint=endpoint,
+                                    periodic_continue=True,
+                                    preserve_periodic_native=(
+                                        _TIDAL_NATIVE_PERIODIC_ENABLED
+                                        and family == "tidal_constituents"
+                                    ),
+                                    route_mode=_CAS1_INTERIOR_REBASE_ROUTE,
+                                )
+                                changed = proposed != parent_rows
+                                rows[changed] = proposed[changed]
+                            for k, slot in enumerate(fam_idx):
+                                chunk[int(slot)] = rows[k]
+                    if not put((chunk, take)):
+                        return
+                    while not stop.is_set():
+                        if consumed.wait(timeout=0.1):
+                            consumed.clear()
+                            break
+                    if stop.is_set():
+                        return
+                    produced += take
+                    emitted_points += chunk_points
+                    chunk_index += 1
+            except BaseException as exc:
+                put(exc)
+            finally:
+                put(done)
+
+        producer = Thread(target=produce, name="cascade-generator", daemon=True)
+        producer.start()
+        try:
+            while True:
+                item = queue.get()
+                if item is done:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                chunk, take = item
+                for arr in chunk[:take]:
+
+                    if arr is None:
+                        raise RuntimeError("internal: unfilled series slot")
+                    yield arr
+                consumed.set()
+        finally:
+            stop.set()
+            producer.join(timeout=1.0)
