@@ -1778,3 +1778,36 @@ def revision_ramp(rng: np.random.Generator, x: np.ndarray, n_last: np.ndarray,
     w = np.clip(1.0 - age / k, 0.0, 1.0)
     d = np.asarray(depth).reshape(n, 1)
     return x * (1.0 - w * d)
+
+
+# ═══════════════ chronoforge: cf_observe ═══════════════
+# Observation layer, scale/offset, structured aggregation, sanitiser.
+#
+# One shared, family-gated stage runs after every family has produced its rows.
+# The stages are applied in a fixed order and each one is gated by the per-row
+# capability flags the family returned, so a bounded process never gets an outlier
+# spike outside its bounds and an integer count is never rounded onto a
+# non-integer tick.  Every stage operates on the *selected rows only* — the gate
+# is an index set, not a mask over a full-batch computation.
+#
+# Two deliberate omissions relative to the competitive field:
+#
+# * **no global time reversal.**  It is applied there to symmetric families; the
+#   gain is marginal and it mis-teaches causality on anything with an asymmetric
+#   response, which is most of what we generate.
+# * **no tail-concentrated regime break.**  Injecting breaks into the last
+#   64-1024 samples of a fixed fraction of series teaches a positional artefact
+#   over patch index and inflates predictive width everywhere.  Our breaks carry a
+#   uniform hazard modulated by *observable* volatility precursors instead.
+#
+# The rounding stage is the third departure, and the most consequential: it fires
+# only when the series' standard deviation is at least ``round_min_ticks`` ticks.
+# Blind rounding of unit-scale continuous families is what collapses a nominal
+# AR(2)/GP/1-f corpus onto a three-to-five-level staircase.
+
+
+MAX_PEAK = 1.0e12
+
+
+def _rows(mask):
+    return np.nonzero(mask)[0]
