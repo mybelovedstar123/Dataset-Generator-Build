@@ -17825,3 +17825,287 @@ def _t_tile_profile(prof, P, L, rng):
     Pi = P.astype(np.int64)
     idx = (np.arange(L)[None, :] + rng.integers(0, 1 << 30, size=(n, 1))) % Pi[:, None]
     return np.take_along_axis(prof, idx, axis=1)
+
+
+def _t_ixp_cycle(rng, n, L):
+    t = np.arange(L, dtype=np.float64)[None, :]
+    P = np.where(rng.random(n) < 0.9, 288.0, 1440.0)
+    pp = _t_period_profile(rng, n, P, 4)
+    span = np.array([np.ptp(pp[i, :int(P[i])]) for i in range(n)])
+    pp /= np.maximum(span, 1e-9)[:, None]
+    prof = _t_tile_profile(pp, P, L, rng)
+    lp = rng.uniform(np.log(1.15), np.log(7.0), size=(n, 1)) * prof
+    day = np.floor(t / P[:, None])
+    weekend = ((day + rng.integers(0, 7, size=(n, 1))) % 7) >= 5
+    lw = np.where(weekend, np.log(rng.uniform(0.7, 1.0, size=(n, 1))), 0.0)
+    walk = np.cumsum(rng.standard_normal((n, L)) * (rng.uniform(0.005, 0.05, size=(n, 1)) / np.sqrt(P[:, None])), axis=1)
+    drift = rng.uniform(-0.1, 0.5, size=(n, 1)) * t / (365.0 * P[:, None])
+    ar = _t_ar1_rows(rng, n, L, rng.uniform(0.3, 0.95, size=n), rng.uniform(0.01, 0.25, size=n))
+    x = np.exp(rng.uniform(np.log(2e6), np.log(1e12), size=(n, 1))) * np.exp(lp + lw + walk + drift + ar)
+    peer = np.flatnonzero(rng.random(n) < 0.3)
+    at = rng.integers(L // 4, L, size=peer.size)
+    mult = np.exp(rng.uniform(np.log(0.5), np.log(2.0), size=peer.size))
+    for j, i in enumerate(peer):
+        x[i, at[j]:] *= mult[j]
+    outg = rng.random((n, L)) < (0.4 / (5.0 * P[:, None]))
+    rr, cc = np.nonzero(outg)
+    w = rng.integers(1, 25, size=rr.size)
+    dip = rng.uniform(0.0, 0.3, size=rr.size)
+    for j in range(rr.size):
+        x[rr[j], cc[j]:cc[j] + w[j]] *= dip[j]
+    S = np.where(rng.random(n) < 0.7, 4096.0, rng.uniform(1000.0, 4096.0, size=n))
+    return _t_pad_left(np.round(x), S)
+
+
+# --------------------------------------------------------------------------- #
+# 4. sub-daily profile sensors / loads / footfall (15-, 30-, 60-min)
+# --------------------------------------------------------------------------- #
+def _t_profile_cycle(rng, n, L):
+    t = np.arange(L, dtype=np.float64)[None, :]
+    P = rng.choice(np.array([96.0, 48.0, 24.0]), size=n, p=[0.3, 0.25, 0.45])
+    pp = _t_period_profile(rng, n, P, 3, 1, 0.7)
+    sd = np.array([pp[i, :int(P[i])].std() for i in range(n)])
+    pp /= np.maximum(sd, 1e-9)[:, None]
+    prof = _t_tile_profile(pp, P, L, rng)
+    day = np.floor(t / P[:, None])
+    wk = ((day + rng.integers(0, 7, size=(n, 1))) % 7) >= 5
+    wk_on = rng.random((n, 1)) < 0.6
+    season = rng.uniform(0.0, 0.5, size=(n, 1)) * np.sin(
+        2.0 * np.pi * t / (365.0 * P[:, None]) + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1)))
+    ar = _t_ar1_rows(rng, n, L, rng.uniform(0.5, 0.98, size=n), rng.uniform(0.05, 0.4, size=n))
+    additive = rng.random((n, 1)) < 0.35      # temperature-like rows
+    amp = rng.uniform(0.3, 1.2, size=(n, 1))
+    base = np.exp(rng.uniform(np.log(1.0), np.log(1e5), size=(n, 1)))
+    wkf = np.where(wk & wk_on, np.log(rng.uniform(0.55, 1.0, size=(n, 1))), 0.0)
+    mult = base * np.exp(amp * prof + season + 0.3 * ar + wkf)
+    temp = (rng.uniform(-5.0, 25.0, size=(n, 1)) + rng.uniform(1.0, 8.0, size=(n, 1)) * prof
+            + 10.0 * season + ar)
+    x = np.where(additive, temp, mult)
+    tick = np.where(rng.random((n, 1)) < 0.5, 0.1, 1.0)
+    x = np.where(rng.random((n, 1)) < 0.7, np.round(x / tick) * tick, x)
+    S = rng.uniform(800.0, 4096.0, size=n)
+    return _t_pad_left(x, S)
+
+
+# --------------------------------------------------------------------------- #
+# 5. tide-gauge levels (5- to 15-min): astronomical constituents + surge
+# --------------------------------------------------------------------------- #
+_T_TIDE_H = np.array([12.4206, 12.0, 12.6583, 23.9345, 25.8193])
+
+
+def _t_tide_level(rng, n, L):
+    t = np.arange(L, dtype=np.float64)[None, :]
+    dt_min = rng.choice(np.array([5.0, 6.0, 10.0, 15.0]), size=(n, 1))
+    hours = t * dt_min / 60.0
+    m2 = rng.uniform(0.2, 3.0, size=(n, 1))
+    rel = np.concatenate([np.ones((n, 1)), rng.uniform(0.1, 0.5, size=(n, 1)),
+                          rng.uniform(0.1, 0.25, size=(n, 1)),
+                          rng.uniform(0.05, 1.2, size=(n, 1)), rng.uniform(0.04, 0.9, size=(n, 1))], axis=1)
+    ph = rng.uniform(0.0, 2.0 * np.pi, size=(n, 5))
+    x = np.zeros((n, L))
+    for j in range(5):
+        x += (m2 * rel[:, j:j + 1]) * np.cos(2.0 * np.pi * hours / _T_TIDE_H[j] + ph[:, j:j + 1])
+    tau = rng.uniform(6.0, 48.0, size=n) * 60.0 / dt_min[:, 0]
+    surge = _t_ar1_rows(rng, n, L, np.exp(-1.0 / tau), rng.uniform(0.03, 0.35, size=n))
+    x = x + surge + rng.uniform(-2.0, 5.0, size=(n, 1))
+    res = np.where(rng.random((n, 1)) < 0.6, 0.001, 0.01)
+    x = np.round(x / res) * res
+    S = rng.uniform(1500.0, 4096.0, size=n)
+    return _t_pad_left(x, S)
+
+
+# --------------------------------------------------------------------------- #
+# 6. intermittent 15-min rainfall (tipping-bucket resolution)
+# --------------------------------------------------------------------------- #
+def _t_rain_burst(rng, n, L):
+    """Storm clusters on a dry background at 15 min, on a tipping-bucket lattice."""
+    rate = 1.0 / (rng.uniform(1.0, 6.0, size=(n, 1)) * 96.0)
+    start = rng.random((n, L)) < rate
+    rr, cc = np.nonzero(start)
+    mdur = rng.uniform(4.0, 40.0, size=n)
+    shape = rng.uniform(0.6, 2.0, size=n)
+    scale = rng.uniform(0.2, 2.5, size=n)
+    dur = rng.geometric(1.0 / mdur[rr])
+    inten = rng.gamma(shape[rr], scale[rr])
+    wet = np.zeros((n, L))
+    for j in range(rr.size):
+        i, c = rr[j], cc[j]
+        seg = wet[i, c:c + int(dur[j])]
+        np.maximum(seg, inten[j], out=seg)
+    wr, wc = np.nonzero(wet)
+    wet[wr, wc] *= rng.gamma(2.0, 0.5, size=wr.size)
+    tip = np.where(rng.random((n, 1)) < 0.6, 0.2, 0.1)
+    x = np.floor(wet / tip) * tip
+    S = rng.uniform(1500.0, 4096.0, size=n)
+    return _t_pad_left(x, S)
+
+
+# --------------------------------------------------------------------------- #
+# 7. cumulative download / pull counters (dockerhub, npm, steam-like)
+# --------------------------------------------------------------------------- #
+def _t_cum_counter(rng, n, L):
+    t = np.arange(L, dtype=np.float64)[None, :]
+    P = rng.choice(np.array([48.0, 24.0, 1.0]), size=(n, 1), p=[0.5, 0.3, 0.2])
+    frac = (t / P + rng.uniform(0.0, 1.0, size=(n, 1))) % 1.0
+    daily = np.where(P > 1.0, np.log(rng.uniform(1.2, 4.0, size=(n, 1))) * np.sin(2.0 * np.pi * frac), 0.0)
+    day = np.floor(t / np.maximum(P, 1.0))
+    wk = ((day + rng.integers(0, 7, size=(n, 1))) % 7) >= 5
+    lw = np.where(wk, np.log(rng.uniform(0.6, 1.0, size=(n, 1))), 0.0)
+    trend = rng.uniform(-0.3, 1.5, size=(n, 1)) * t / (365.0 * np.maximum(P, 1.0))
+    walk = np.cumsum(rng.standard_normal((n, L)) * (rng.uniform(0.01, 0.08, size=(n, 1)) / np.sqrt(np.maximum(P, 1.0))), axis=1)
+    rate = np.exp(rng.uniform(np.log(2.0), np.log(3e5), size=(n, 1))) * np.exp(daily + lw + trend + walk)
+    rate = np.minimum(rate, 1e9)
+    big = rate > 200.0
+    inc = np.where(big, np.maximum(np.rint(rate + np.sqrt(rate) * rng.standard_normal(rate.shape)), 0.0), 0.0)
+    small = np.flatnonzero(~big.ravel())
+    if small.size:
+        inc.ravel()[small] = rng.poisson(rate.ravel()[small])
+    stall_rows = np.flatnonzero(rng.random(n) < 0.2)
+    for i in stall_rows:
+        for _ in range(int(rng.integers(1, 4))):
+            c = int(rng.integers(0, L - 60))
+            w = int(rng.integers(5, 51))
+            owed = inc[i, c:c + w].sum()
+            inc[i, c:c + w] = 0.0
+            if c + w < L:
+                inc[i, c + w] += owed
+    x = np.exp(rng.uniform(np.log(1e5), np.log(1e10), size=(n, 1))) + np.cumsum(inc, axis=1)
+    S = rng.uniform(1500.0, 4096.0, size=n)
+    return _t_pad_left(np.round(x), S)
+
+
+# --------------------------------------------------------------------------- #
+# 8. generic dynamics at eval-like lengths (breadth)
+# --------------------------------------------------------------------------- #
+def _t_generic_dyn(rng, n, L):
+    """Broad dynamics at eval-like lengths: AR around a trend, random walks, seasonal AR, level shifts."""
+    t = np.arange(L, dtype=np.float64)[None, :]
+    kind = rng.random(n)
+    x = np.empty((n, L))
+    ar_rows = np.flatnonzero(kind < 0.30)
+    rw_rows = np.flatnonzero((kind >= 0.30) & (kind < 0.55))
+    se_rows = np.flatnonzero((kind >= 0.55) & (kind < 0.85))
+    js_rows = np.flatnonzero(kind >= 0.85)
+    if ar_rows.size:
+        m = ar_rows.size
+        x[ar_rows] = (0.3 * _t_ar1_rows(rng, m, L, rng.uniform(0.2, 0.995, size=m), np.ones(m))
+                      + rng.normal(0.0, 1.0, size=(m, 1)) * t / L)
+    if rw_rows.size:
+        m = rw_rows.size
+        x[rw_rows] = (3.0 * np.cumsum(rng.standard_normal((m, L)), axis=1) / np.sqrt(L)
+                      + 0.1 * _t_ar1_rows(rng, m, L, rng.uniform(0.2, 0.9, size=m), np.ones(m)))
+    if se_rows.size:
+        m = se_rows.size
+        per = rng.choice(np.array([7.0, 12.0, 24.0, 52.0, 96.0, 168.0]), size=(m, 1))
+        seas = np.sin(2.0 * np.pi * t / per + rng.uniform(0.0, 2.0 * np.pi, size=(m, 1)))
+        seas += rng.uniform(0.0, 0.6, size=(m, 1)) * np.sin(4.0 * np.pi * t / per + rng.uniform(0.0, 2.0 * np.pi, size=(m, 1)))
+        x[se_rows] = (rng.uniform(0.5, 2.0, size=(m, 1)) * seas
+                      + 0.4 * _t_ar1_rows(rng, m, L, rng.uniform(0.2, 0.95, size=m), np.ones(m))
+                      + 0.5 * rng.normal(0.0, 1.0, size=(m, 1)) * t / L)
+    if js_rows.size:
+        m = js_rows.size
+        jumps = np.cumsum((rng.random((m, L)) < (rng.uniform(0.0, 4.0, size=(m, 1)) / L))
+                          * rng.normal(0.0, 1.5, size=(m, L)), axis=1)
+        x[js_rows] = jumps + 0.2 * _t_ar1_rows(rng, m, L, rng.uniform(0.2, 0.95, size=m), np.ones(m))
+    x = x * np.exp(rng.uniform(np.log(1e-2), np.log(1e4), size=(n, 1))) \
+        + np.exp(rng.uniform(np.log(1e-2), np.log(1e5), size=(n, 1))) * (rng.random((n, 1)) < 0.7)
+    rnd = (rng.random((n, 1)) < 0.3) & (x.std(axis=1, keepdims=True) > 5.0)
+    x = np.where(rnd, np.round(x), x)
+    return _t_pad_left(x, _t_eval_len(rng, n))
+
+
+# --------------------------------------------------------------------------- #
+# 9. river stage / discharge at 15 min: storm hydrographs on a receding baseflow
+# --------------------------------------------------------------------------- #
+def _t_hydro_stage(rng, n, L):
+    t = np.arange(L, dtype=np.float64)[None, :]
+    per_day = 96.0
+    base = np.exp(rng.uniform(np.log(0.5), np.log(500.0), size=(n, 1)))
+    season = rng.uniform(0.0, 0.6, size=(n, 1)) * np.sin(
+        2.0 * np.pi * t / (365.0 * per_day) + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1)))
+    rate = 1.0 / (rng.uniform(3.0, 20.0, size=(n, 1)) * per_day)
+    storms = (rng.random((n, L)) < rate) * np.exp(rng.normal(0.0, 1.0, size=(n, L)))
+    mag = rng.uniform(0.5, 8.0, size=(n, 1))
+    tau = rng.uniform(1.0, 10.0, size=n) * per_day
+    # impulse -> short rising limb (AR smoothing over hours) -> exponential recession (days)
+    rise = np.exp(-1.0 / (rng.uniform(2.0, 24.0, size=n) * 4.0))
+    limb = _t_ar1(np.ascontiguousarray(storms * mag), rise) * (1.0 - rise)[:, None]
+    quick = _t_ar1(np.ascontiguousarray(limb), np.exp(-1.0 / tau))
+    flow = base * np.exp(season) * (1.0 + quick) * np.exp(_t_ar1_rows(rng, n, L, np.full(n, 0.995), rng.uniform(0.005, 0.03, size=n)))
+    stage_rows = rng.random((n, 1)) < 0.6
+    b = rng.uniform(0.3, 0.6, size=(n, 1))
+    stage = rng.uniform(0.2, 3.0, size=(n, 1)) * (flow / base) ** b + rng.uniform(-1.0, 50.0, size=(n, 1))
+    stage = np.round(stage / 0.001) * 0.001
+    mant = 10.0 ** (np.floor(np.log10(np.maximum(flow, 1e-9))) - 2.0)
+    flow3 = np.round(flow / mant) * mant
+    x = np.where(stage_rows, stage, flow3)
+    S = rng.uniform(1500.0, 4096.0, size=n)
+    return _t_pad_left(x, S)
+
+
+# --------------------------------------------------------------------------- #
+# 10. exact held levels with rare steps (policy rates, fuel prices, dock counts)
+# --------------------------------------------------------------------------- #
+def _t_stair_hold(rng, n, L):
+    """Piecewise-constant published levels: rare steps on a tick lattice, the row
+    ending in a held run of 64-720 points, so the flat continuation is taught here
+    too (the padded teaching rows would otherwise only show flat runs that break)."""
+    haz = np.exp(rng.uniform(np.log(1.0 / 2000.0), np.log(1.0 / 40.0), size=(n, 1)))
+    jump = rng.random((n, L)) < haz
+    kind = rng.random((n, 1))
+    tick = np.where(kind < 0.3, 1.0, np.where(kind < 0.6, 0.25, np.where(kind < 0.85, 0.01, 0.001)))
+    size = rng.geometric(0.6, size=(n, L)).astype(np.float64)
+    persist = rng.random((n, 1)) < 0.6
+    sign = np.where(persist, np.where(rng.random((n, 1)) < 0.6, 1.0, -1.0), np.where(rng.random((n, L)) < 0.5, 1.0, -1.0))
+    steps = np.where(jump, sign * size * tick, 0.0)
+    hold_end = rng.integers(64, 721, size=n)
+    col = np.arange(L)[None, :]
+    steps = np.where(col >= (L - hold_end)[:, None], 0.0, steps)
+    steps[:, 0] = 0.0
+    start = np.where(kind < 0.3, rng.integers(0, 11, size=(n, 1)).astype(np.float64),
+                     np.round(np.exp(rng.uniform(np.log(0.5), np.log(500.0), size=(n, 1))) / tick) * tick)
+    x = start + np.cumsum(steps, axis=1)
+    x = np.where(kind < 0.3, np.maximum(x, 0.0), x)
+    x = np.round(x / tick) * tick
+    # guarantee at least one step inside the kept span (the pair needs a non-constant channel)
+    S = _t_eval_len(rng, n, 400.0).astype(np.int64)
+    for i in range(n):
+        lo = L - int(S[i])
+        if x[i, lo:].max() == x[i, lo:].min():
+            j = int(rng.integers(lo + 1, max(lo + 2, L - int(hold_end[i]))))
+            x[i, j:] += tick[i, 0] * (1.0 if rng.random() < 0.5 else -1.0) * float(rng.integers(1, 4))
+    return _t_pad_left(x, S)
+
+
+_TEACH_FAMILIES = (
+    ("covid_waves", _t_covid_waves),
+    ("pct_feed", _t_pct_feed),
+    ("ixp_cycle", _t_ixp_cycle),
+    ("profile_cycle", _t_profile_cycle),
+    ("tide_level", _t_tide_level),
+    ("rain_burst", _t_rain_burst),
+    ("hydro_stage", _t_hydro_stage),
+    ("cum_counter", _t_cum_counter),
+    ("generic_dyn", _t_generic_dyn),
+    ("stair_hold", _t_stair_hold),
+)
+# row shares of the teaching stream (renormalised)
+_TEACH_MIX_MAIN = {"covid_waves": 0.24, "pct_feed": 0.10, "ixp_cycle": 0.14, "profile_cycle": 0.12,
+                   "tide_level": 0.06, "rain_burst": 0.04, "hydro_stage": 0.04, "cum_counter": 0.08,
+                   "generic_dyn": 0.10, "stair_hold": 0.08}
+_TEACH_MIX_OFFENSE = {"covid_waves": 0.24, "pct_feed": 0.08, "ixp_cycle": 0.14, "profile_cycle": 0.10,
+                      "tide_level": 0.10, "rain_burst": 0.06, "hydro_stage": 0.10, "cum_counter": 0.06,
+                      "generic_dyn": 0.06, "stair_hold": 0.06}
+_TEACH_MIX_RKI = {"covid_waves": 0.36, "pct_feed": 0.10, "ixp_cycle": 0.12, "profile_cycle": 0.10,
+                  "tide_level": 0.05, "rain_burst": 0.03, "hydro_stage": 0.03, "cum_counter": 0.06,
+                  "generic_dyn": 0.07, "stair_hold": 0.08}
+_TEACH_MIX = _TEACH_MIX_MAIN
+
+
+def _teach_weights(mix):
+    w = np.array([float(mix.get(name, 0.0)) for name, _ in _TEACH_FAMILIES], dtype=np.float64)
+    return w / w.sum()
+
+
+_TEACH_BATCH = 256
+_TEACH_SALT_ROWS = 0x7EAC4C02
