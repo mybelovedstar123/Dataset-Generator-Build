@@ -11135,3 +11135,156 @@ def _spread_flat_levels(
     level = rng.integers(0, int(spread), size=(n_flat, 1)).astype(np.float64)
     rows[flat] += level
     return rows
+
+
+def _apply_nonneg_integer_prior(
+    rng: np.random.Generator, block: np.ndarray, *,
+    integer_min_std: float = 0.0,
+    integer_min_std_frac: float = 1.0,
+    integer_frac: float = _NONNEG_INTEGER_FRAC,
+    flat_level_spread: float = 0.0,
+) -> np.ndarray:
+    """Shift most rows nonnegative and round most of those to integers.
+
+    ``integer_frac`` is the share of shifted rows that get rounded. Rounding is
+    the corpus's main producer of *exact* repeated values, which is the structure
+    the count-heavy eval domains are built from, so this is the lever for how much
+    exact-repeat content the corpus carries.
+
+    ``integer_min_std_frac`` is the share of those rows the guard is allowed to
+    touch, and it exists because the guard has already been tested at full
+    strength and failed badly. jen7-r set ``integer_min_std`` to 16 and left this
+    at 1.0, which rescaled essentially every row that was about to be rounded: the
+    corpus repeat share fell from 0.60 to 0.10, distinct levels rose from 10 to 75,
+    and it placed 369th of 372 while losing every individual domain. The
+    instructive part is that 75 levels at a 0.098 repeat share is almost exactly
+    web_cloudops' own profile (68 levels, 0.086), so the failure was not a bad
+    target -- it was applying one target to the whole corpus. The pool spans 16
+    levels in transport to 476 in sales, and the corpus needs to cover that range
+    rather than relocate onto a point in it. Below 1.0 the guard reaches a random
+    subset, leaving the low-resolution staircase rows that have been winning
+    intact and adding a high-resolution subpopulation beside them. At 1.0 no draw
+    is taken and the behaviour is exactly as before.
+
+    ``integer_min_std`` guards the resolution of the rounding. A family may emit
+    a row whose amplitude is only a couple of units -- ``step_level`` and
+    ``conditional_stability`` both draw scale from a log-uniform range starting at
+    1 -- and rounding such a row to integers leaves it with two or three distinct
+    levels, so it reads as a frozen staircase rather than a count series. Real
+    count series in the eval pool are integer *and* varied: transport is 96%
+    integer with a mean held-run of 19 samples, because its counts range over
+    hundreds. Above zero this rescales a row up to the given standard deviation
+    before rounding, which keeps the integer character while restoring the
+    resolution. At the default 0.0 the behaviour is exactly as before.
+    """
+    n = block.shape[0]
+    if n == 0:
+        return block
+    nonneg_mask = rng.random(n) < _NONNEG_FRAC
+    if not nonneg_mask.any():
+        return block
+    sel = np.nonzero(nonneg_mask)[0]
+    # At n=1 the selection is almost always "every row", where the fancy index
+    # is a full copy of the block; a plain view lets the shift and the rounding
+    # land in place instead of allocating the row four more times.
+    whole = sel.size == n
+    rows = block if whole else block[sel]
+    row_min = rows.min(axis=1, keepdims=True)
+    row_scale = np.maximum(rows.std(axis=1, keepdims=True), 1e-9)
+    floor = row_scale * rng.uniform(0.0, 0.15, size=(sel.size, 1))
+    shift = np.where(row_min < floor, floor - row_min, 0.0)
+    rows += shift
+    int_mask = rng.random(sel.size) < integer_frac
+    if integer_min_std > 0.0 and int_mask.any():
+        # Scale up only the rows that are about to be rounded and are too small to
+        # survive it. Applied before the rounding and after the nonneg shift, so
+        # the floor stays proportional to the row.
+        low = int_mask & (row_scale[:, 0] < integer_min_std)
+        if integer_min_std_frac < 1.0:
+            # Drawn only on this branch, so an arm that leaves the fraction at 1.0
+            # consumes the identical stream to the parent body.
+            low &= rng.random(sel.size) < integer_min_std_frac
+        if low.any():
+            grow = (integer_min_std / row_scale[low, 0])[:, None]
+            if whole:
+                rows[low] *= grow
+            else:
+                rows[low] = rows[low] * grow
+    if whole and int_mask.all():
+        np.rint(rows, out=rows)
+        _spread_flat_levels(rng, rows, flat_level_spread)
+        return block
+    if int_mask.any():
+        int_sel = sel[int_mask]
+        int_rows = _spread_flat_levels(
+            rng, np.rint(rows[int_mask]), flat_level_spread
+        )
+        block[int_sel] = int_rows
+        keep = ~int_mask
+        if keep.any():
+            block[sel[keep]] = rows[keep]
+    else:
+        block[sel] = rows
+    return block
+
+
+# Real sparse-count domains spend long stretches at an exact structural zero
+# floor, not just "small positive": measured on the 08-07 eval pool,
+# healthcare's frac_zero reaches 0.40 and energy's 0.37 at the 90th
+# percentile of series (rare-event dispatch/case counts; curtailed/idle grid
+# output), while this generator's own output — even after the nonneg/integer
+# prior above — tops out at frac_zero=0.013 at the 90th percentile, because
+# only the tiny intermittent/epi_decay/seasonal_counts families (2.9%
+# combined weight) ever produce sustained zero runs. Rounding a small
+# positive floor up from a shifted minimum (as the prior above does) almost
+# never lands exactly on zero, so the "flat-zero, occasional nonzero" lesson
+# is essentially untaught outside those three slivers. This adds it directly
+# as a shared post-process on a minority of already-nonnegative rows from
+# the same generic family pool, independent of any family's weight or math.
+_ZERO_INFLATE_ROW_FRAC = 0.14
+_ZERO_INFLATE_FLOOR_FRAC_LO = 0.15
+_ZERO_INFLATE_FLOOR_FRAC_HI = 0.85
+
+
+def _apply_interior_rebase_episode(
+    rng: np.random.Generator,
+    block: np.ndarray,
+    rate: float,
+    *,
+    endpoint: int | None = None,
+    periodic_continue: bool = False,
+    preserve_periodic_native: bool = False,
+    route_mode: str = "all",
+) -> np.ndarray:
+    """Insert one finite, context-validated continuation episode.
+
+    V449 teaches its strongest continuation law only near the terminal edge of
+    each 4096-point training row.  This arm reuses the exact same causal
+    classifier on an earlier prefix, then crossfades back to the untouched
+    native path.  The episode ends no later than 2816, leaving a gap before the
+    earliest sample (2864) read by V449's terminal classifier.
+    """
+    if rate <= 0.0:
+        return block
+    values = np.asarray(block, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] < 4096:
+        return block
+    endpoints = (1792, 2304, 2816)
+    end = (endpoints[int(rng.integers(0, len(endpoints)))]
+           if endpoint is None else int(endpoint))
+    if end not in _CAS1_INTERIOR_REBASE_ENDPOINTS:
+        raise ValueError("invalid interior rebase endpoint")
+    original = values[:, :end].copy()
+    episode = _apply_tail_rebase(
+        rng, original.copy(), rate,
+        periodic_continue=periodic_continue,
+        preserve_periodic_native=preserve_periodic_native,
+        _route_mode=route_mode,
+    )
+    fade = 96
+    alpha = np.linspace(0.0, 1.0, fade, dtype=np.float64)[None, :]
+    episode[:, -fade:] = (
+        (1.0 - alpha) * episode[:, -fade:] + alpha * original[:, -fade:]
+    )
+    values[:, :end] = episode
+    return values
