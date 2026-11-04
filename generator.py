@@ -2317,3 +2317,59 @@ def a1_build(P, rng, L, cad, cal, cfg):
     y = syn + diurnal + front + eps + ann
     fl = new_flags(n, scale_mode=0, quant_boost=0.7, quant_rel_hi=0.35)
     return y, fl
+
+
+# ═══════════════════════ A2 met_pressure_smooth ════════════════════════════
+
+def a2_params(rng, B, cfg):
+    p = cfg["families"]["met_pressure_smooth"]
+    return {
+        "ell_syn": logu(rng, p["synoptic_ell"][0], p["synoptic_ell"][1], B),
+        "tide_amp": rng.uniform(0.15, 0.45, B) * 0.06,
+        "dip_on": rng.random(B) < p["dip_rate"],
+        "dip_depth": rng.uniform(1.5, 4.0, B),
+        "dip_width": logu(rng, 24.0, 180.0, B),
+        "sig_e": logu(rng, p["noise_ratio"][0], p["noise_ratio"][1], B),
+        "quant": rng.random(B) < p["quantise_rate"],
+    }
+
+
+def a2_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    p_day = cad.p_day.reshape(n, 1)
+
+    # Matern-5/2 is twice mean-square differentiable: it has genuinely
+    # extrapolable local curvature, which is the only thing a 64-step forecast
+    # of a pressure field can exploit.
+    syn = matern_gp(rng, n, L, P["ell_syn"], nu=2.5)
+
+    has_day = p_day >= 4.0
+    ph = t / np.where(has_day, p_day, 1e9) + rng.random((n, 1))
+    tide = np.where(has_day,
+                    P["tide_amp"].reshape(n, 1)
+                    * (np.sin(2.0 * _cf_prims_TWO_PI * ph) + 0.5 * np.sin(_cf_prims_TWO_PI * ph + 1.1)),
+                    0.0)
+
+    E = 2
+    dpos = rng.integers(0, L, size=(n, E)).astype(np.float64)
+    dw = P["dip_width"].reshape(n, 1) * np.exp(rng.normal(0.0, 0.3, size=(n, E)))
+    dip = np.zeros((n, L))
+    live = P["dip_on"].reshape(n, 1) & (rng.random((n, E)) < 0.6)
+    for j in range(E):
+        idx = np.nonzero(live[:, j])[0]
+        if idx.size == 0:
+            continue
+        dip[idx] -= P["dip_depth"][idx].reshape(-1, 1) * np.exp(
+            -0.5 * ((t - dpos[idx, j:j + 1])
+                    / np.maximum(dw[idx, j:j + 1], 1.0)) ** 2)
+
+    eps = rng.standard_normal((n, L)) * P["sig_e"].reshape(n, 1)
+
+    y = syn + tide + dip + eps
+    # The defining property is a tiny relative variance riding on a large level:
+    # that is the small-MASE-denominator regime, where any trend error explodes
+    # log-MASE.  offset_pref = 1 forces the large-offset scale regime.
+    fl = new_flags(n, scale_mode=0, offset_pref=1, quant_rel_hi=0.55)
+    fl["quant_boost"] = np.where(P["quant"], 3.0, 0.4)
+    return y, fl
