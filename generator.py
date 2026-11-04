@@ -2373,3 +2373,78 @@ def a2_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=0, offset_pref=1, quant_rel_hi=0.55)
     fl["quant_boost"] = np.where(P["quant"], 3.0, 0.4)
     return y, fl
+
+
+# ═══════════════════════ A3 met_bounded_atom ═══════════════════════════════
+
+UPPER_GRID = np.array([1.0, 8.0, 10.0, 100.0, 1000.0])
+
+
+def a3_params(rng, B, cfg):
+    p = cfg["families"]["met_bounded_atom"]
+    variant = categorical(rng, p["variant_mix"], B)          # cloud / humidity / utilisation
+    return {
+        "variant": variant,
+        "ell": logu(rng, p["latent_ell"][0], p["latent_ell"][1], B),
+        "eta": logu(rng, p["eta"][0], p["eta"][1], B),
+        "c": rng.normal(p["centre_mean"], p["centre_sigma"], B),
+        "beta_cloud": rng.uniform(0.0, 0.25, B),
+        "beta_hum": rng.uniform(0.4, 1.1, B),
+        "phi_ar": rng.uniform(0.3, 0.85, B),
+        "ar_frac": logu(rng, 0.05, 0.45, B),
+        "upper": UPPER_GRID[categorical(rng, p["upper_mix"], B)],
+        "quantise": rng.random(B) < p["quantise_rate"],
+        "event_on": rng.random(B) < p["saturation_event_rate"],
+        "event_mu": logu(rng, 2e-4, 4e-3, B),
+        "event_branch": rng.uniform(0.2, 0.8, B),
+        "event_tau": logu(rng, 20.0, 400.0, B),
+        "event_len": logu(rng, 2.0, 30.0, B),
+    }
+
+
+def a3_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    t = time_grid(L)[None, :]
+    p_day = cad.p_day.reshape(n, 1)
+    variant = P["variant"]
+
+    has_day = p_day >= 3.0
+    ph = t / np.where(has_day, p_day, 1e9) + rng.random((n, 1))
+    daily = np.sin(_cf_prims_TWO_PI * ph)
+    biz = profile_trapezoid(rng, n, L, ph)
+    biz = unit_std(biz)
+
+    beta = np.where((variant == 0).reshape(n, 1), P["beta_cloud"].reshape(n, 1),
+                    np.where((variant == 1).reshape(n, 1),
+                             -P["beta_hum"].reshape(n, 1),  # humidity is anti-phase
+                             0.0))
+    diurnal = np.where((variant == 2).reshape(n, 1), biz, daily)
+    diurnal = np.where(has_day, diurnal, 0.0)
+    beta = np.where((variant == 2).reshape(n, 1), P["beta_hum"].reshape(n, 1) * 0.6, beta)
+
+    z = bounded_latent(rng, n, L, P["ell"], beta, diurnal, P["phi_ar"],
+                       P["ar_frac"].reshape(n, 1))
+    upper = P["upper"].reshape(n, 1)
+    y = censor(z, P["eta"].reshape(n, 1), P["c"].reshape(n, 1), upper)
+
+    # clustered saturation events (rain / overcast spells) pin the ceiling
+    on = P["event_on"]
+    if on.any():
+        mu = np.where(on.reshape(n, 1), P["event_mu"].reshape(n, 1), 0.0)
+        _, cnt = hawkes(rng, n, L, np.broadcast_to(mu, (n, L)).copy(),
+                        P["event_branch"], P["event_tau"])
+        starts = np.argsort(-cnt, axis=1)[:, :6]
+        lens = (P["event_len"].reshape(n, 1)
+                * np.exp(rng.normal(0.0, 0.5, size=(n, 6))))
+        live = np.take_along_axis(cnt, starts, axis=1) > 0
+        mask = run_mask(n, L, starts, np.where(live, lens, 0.0))
+        y = np.where(mask & on.reshape(n, 1), upper, y)
+
+    q = P["quantise"].reshape(n, 1)
+    step = np.where(upper <= 1.0, upper / 100.0, 1.0)
+    y = np.where(q, np.round(y / step) * step, y)
+
+    fl = new_flags(n, scale_mode=2, bounded=True, positive=True,
+                   quant_boost=0.0, obs_boost=0.5, allow_agg=False)
+    fl["integer"] = (P["quantise"] & (P["upper"] > 1.0))
+    return y, fl
