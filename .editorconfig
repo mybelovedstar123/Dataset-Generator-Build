@@ -1,0 +1,21 @@
+# https://editorconfig.org
+# No end_of_line rule: generator.py, config.json and requirements.txt use CRLF,
+# the docs and CI files use LF. Editors keep whatever a file already has.
+root = true
+
+[*]
+charset = utf-8
+
+[*.py]
+indent_style = space
+indent_size = 4
+
+[*.json]
+indent_style = space
+indent_size = 1
+
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+trim_trailing_whitespace = true
+insert_final_newline = true
