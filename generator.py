@@ -1367,3 +1367,172 @@ def complete_dwell_table(rng, dwell, L, median, sigma, minimum=1.0,
             extra = np.where(use, tail, extra)
         table = np.concatenate((table, np.maximum(extra, minimum)), axis=1)
     return rows, table, end[rows]
+
+
+# ═══════════════ chronoforge: cf_cadence ═══════════════
+# Cadence, derived periods, and the length ladder.
+#
+# We do not carry a hard-coded list of integer seasonal periods.  We sample a
+# *cadence* (the wall-clock spacing between samples, matched to the pool's
+# frequency map) and then derive every period physically::
+#
+#     P_day   = 86400 / c            P_week  = 7   * P_day
+#     P_half  = P_day / 2            P_month = 30.436875 * P_day
+#     P_third = P_day / 3            P_year  = 365.2425  * P_day
+#
+# Periods are used as *floats*.  At a daily cadence ``P_month = 30.436875`` is
+# genuinely non-integer, which produces the slow phase drift an integer-30 model
+# cannot reproduce; at an hourly cadence ``P_year = 8765.8`` exceeds the window
+# and correctly enters as a slow trend rather than a cycle.
+#
+# Length is drawn conditional on the cadence class: short evaluation contexts in
+# the real pool come from *daily* feeds, so our short training series carry daily
+# structure rather than truncated hourly structure.  Every length is an exact
+# multiple of 32 (the trainer buckets by ``p = L // 32`` and discards the
+# remainder, so a non-multiple silently throws away token budget).
+
+
+# Cadences (seconds between samples) matched to the pool's FREQ_MAP.
+FINE_SECONDS = np.array([30, 60, 150, 300, 360, 600, 900, 1800, 3600], dtype=np.float64)
+COARSE_SECONDS = np.array([28800, 86400], dtype=np.float64)
+
+SECONDS_PER_DAY = 86400.0
+
+# Derived-period multipliers on P_day.
+MULT_HALF = 0.5
+MULT_THIRD = 1.0 / 3.0
+MULT_WEEK = 7.0
+MULT_BIZWEEK = 5.0
+MULT_MONTH = 30.436875
+MULT_QUARTER = 91.310625
+MULT_YEAR = 365.2425
+
+
+class CadenceDraw:
+    """Per-row cadence for one batch (dense, batch-sized)."""
+
+    __slots__ = ("seconds", "p_day", "is_coarse", "length", "n")
+
+    def __init__(self, seconds: np.ndarray, is_coarse: np.ndarray, length: np.ndarray):
+        self.seconds = seconds
+        self.p_day = SECONDS_PER_DAY / seconds
+        self.is_coarse = is_coarse
+        self.length = length
+        self.n = seconds.shape[0]
+
+    def take(self, rows: np.ndarray) -> "CadenceDraw":
+        return CadenceDraw(self.seconds[rows], self.is_coarse[rows], self.length[rows])
+
+    # ── derived periods, as (n, 1) float columns ──
+    def period(self, name: str) -> np.ndarray:
+        pd = self.p_day.reshape(-1, 1)
+        return pd * _MULT[name]
+
+
+_MULT = {
+    "day": 1.0,
+    "half": MULT_HALF,
+    "third": MULT_THIRD,
+    "week": MULT_WEEK,
+    "bizweek": MULT_BIZWEEK,
+    "month": MULT_MONTH,
+    "quarter": MULT_QUARTER,
+    "year": MULT_YEAR,
+}
+
+
+def draw_cadence(rng: np.random.Generator, n: int, p_coarse: np.ndarray,
+                 cfg: dict) -> CadenceDraw:
+    """Draw a cadence and a length for every row of the batch."""
+    fine_s = np.asarray(cfg["cadence"]["fine_seconds"], dtype=np.float64)
+    coarse_s = np.asarray(cfg["cadence"]["coarse_seconds"], dtype=np.float64)
+    fine_w = np.asarray(cfg["cadence"]["fine_weights"], dtype=np.float64)
+    coarse_w = np.asarray(cfg["cadence"]["coarse_weights"], dtype=np.float64)
+
+    is_coarse = rng.random(n) < np.asarray(p_coarse, dtype=np.float64)
+    fi = categorical(rng, fine_w, n)
+    ci = categorical(rng, coarse_w, n)
+    seconds = np.where(is_coarse, coarse_s[ci], fine_s[fi])
+
+    fine_lad = cfg["length_ladder"]["fine"]
+    coarse_lad = cfg["length_ladder"]["coarse"]
+    fl = np.asarray(fine_lad["lengths"], dtype=np.int64)
+    fw = np.asarray(fine_lad["weights"], dtype=np.float64)
+    cl = np.asarray(coarse_lad["lengths"], dtype=np.int64)
+    cw = np.asarray(coarse_lad["weights"], dtype=np.float64)
+    length = np.where(is_coarse, cl[categorical(rng, cw, n)],
+                      fl[categorical(rng, fw, n)])
+    return CadenceDraw(seconds.astype(np.float64), is_coarse, length.astype(np.int64))
+
+
+# ─────────────────────── which periods are active ──────────────────────────
+
+ACTIVE_KEYS = ("day", "half", "third", "week", "bizweek", "month", "quarter", "free")
+
+
+def active_periods(rng: np.random.Generator, cad: CadenceDraw, cfg: dict,
+                   L: int) -> dict[str, np.ndarray]:
+    """Cadence-conditional Bernoulli activation of each derived period.
+
+    Returns a dict ``key -> (n, 1) period length in samples`` where inactive
+    rows carry ``0.0``.  Also emits a ``free`` entry: a continuous period drawn
+    log-uniformly in ``[6, L/3]``, incommensurate with everything else.  That is
+    the escape hatch which stops the model over-fitting to a fixed grid.
+    """
+    n = cad.n
+    tbl_fine = cfg["seasonality"]["active_fine"]
+    tbl_coarse = cfg["seasonality"]["active_coarse"]
+    coarse = cad.is_coarse.reshape(n, 1)
+    out: dict[str, np.ndarray] = {}
+    for key in ACTIVE_KEYS:
+        pf = float(tbl_fine.get(key, 0.0))
+        pc = float(tbl_coarse.get(key, 0.0))
+        p = np.where(coarse, pc, pf)
+        on = rng.random((n, 1)) < p
+        if key == "free":
+            per = np.exp(rng.uniform(np.log(6.0), np.log(max(L / 3.0, 12.0)), size=(n, 1)))
+        else:
+            per = cad.period(key)
+        # a period must fit at least ~2.2 cycles in the window to be learnable
+        on = on & (per >= 2.0) & (per <= L / 2.2)
+        out[key] = np.where(on, per, 0.0)
+    return out
+
+
+def diurnal_period(cad: CadenceDraw, min_samples: float = 3.0) -> np.ndarray:
+    """P_day where a diurnal cycle is resolvable, else 0."""
+    pd = cad.p_day.reshape(-1, 1)
+    return np.where(pd >= min_samples, pd, 0.0)
+
+
+def multi_seasonal(rng: np.random.Generator, n: int, L: int, cad: CadenceDraw,
+                   cfg: dict) -> np.ndarray:
+    """Sum of shaped profiles over every period that is active for the row.
+
+    Amplitudes are log-normal, so one component usually dominates; 45% of rows
+    additionally get their seasonal amplitude modulated by a slow latent, which
+    is what makes seasonality non-stationary in real feeds.
+    """
+    act = active_periods(rng, cad, cfg, L)
+    out = np.zeros((n, L))
+    any_on = np.zeros((n, 1), dtype=bool)
+    for key in ACTIVE_KEYS:
+        per = act[key]
+        on = per > 0
+        if not on.any():
+            continue
+        prof = seasonal_profile(rng, n, L, np.where(on, per, 1e9), cfg)
+        amp = np.exp(rng.normal(0.0, 0.7, size=(n, 1)))
+        out += np.where(on, amp * prof, 0.0)
+        any_on |= on
+
+    rate = float(cfg["seasonality"].get("amplitude_modulation_rate", 0.45))
+    mod = rng.random((n, 1)) < rate
+    if mod.any():
+        slow = matern_gp(rng, n, L, np.exp(rng.uniform(
+            np.log(L / 24.0), np.log(L / 3.0), n)), nu=1.5)
+        env = np.clip(1.0 + 0.7 * slow, 0.05, 4.0)
+        out = np.where(mod, out * env, out)
+
+    fallback = unit_std(np.cumsum(rng.standard_normal((n, L)), axis=1))
+    return np.where(any_on, unit_std(out), fallback)
