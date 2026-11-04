@@ -18109,3 +18109,294 @@ def _teach_weights(mix):
 
 _TEACH_BATCH = 256
 _TEACH_SALT_ROWS = 0x7EAC4C02
+
+
+def _teach_batch(seed, b, L=4096, families=_TEACH_FAMILIES, weights=None):
+    s = int(seed) & ((1 << 64) - 1)
+    key = [s & _T_MASK32, s >> 32, _TEACH_SALT_ROWS, int(b)]
+    rng = np.random.default_rng(np.random.SeedSequence(key))
+    if weights is None:
+        weights = _teach_weights(_TEACH_MIX)
+    fam = rng.choice(len(families), size=_TEACH_BATCH, p=weights)
+    out = np.empty((_TEACH_BATCH, L), dtype=np.float64)
+    for k, (_, fn) in enumerate(families):
+        idx = np.flatnonzero(fam == k)
+        if idx.size:
+            sub = np.random.default_rng(np.random.SeedSequence(key + [k + 1]))
+            out[idx] = fn(sub, int(idx.size), L)
+    np.nan_to_num(out, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    np.clip(out, -1e30, 1e30, out=out)
+    return out, fam
+
+
+class _TeachStream:
+    def __init__(self, seed):
+        self._seed = int(seed)
+        self._b = 0
+        self._buf = None
+        self._pos = _TEACH_BATCH
+
+    def next(self):
+        if self._pos >= _TEACH_BATCH:
+            self._buf, _ = _teach_batch(self._seed, self._b)
+            self._b += 1
+            self._pos = 0
+        row = self._buf[self._pos]
+        self._pos += 1
+        return np.array(row)
+
+
+def _teach_pair_ok(a, b):
+    if a.ndim != 1 or b.shape != a.shape or not np.isfinite(a).all() or not np.isfinite(b).all():
+        return False
+    sa = float(a.std())
+    sb = float(b.std())
+    if sa <= 1e-9 * (float(np.abs(a).mean()) + 1e-12) or sb <= 1e-9 * (float(np.abs(b).mean()) + 1e-12):
+        return False
+    c = float(np.dot(a - a.mean(), b - b.mean()) / (a.size * sa * sb))
+    return abs(c) < 0.99
+
+
+
+# ---- own-code teach2 families: IXP 5-min traffic, signed energy flows, web counters,
+# season onsets, sparse counts (real-pool-statistics matched). ----
+import math  # noqa: E402
+from numba import njit  # noqa: E402
+
+_T2_TAU = 2.0 * math.pi
+_T2_G = 256  # grid points per period for tabulated profiles
+
+
+# --------------------------------------------------------------------------- #
+# shared helpers
+# --------------------------------------------------------------------------- #
+def _t2_pad_left(x, S):
+    """Keep the last S[i] points of row i and repeat its first kept value before them."""
+    n, L = x.shape
+    S = np.clip(np.asarray(S, dtype=np.int64).reshape(-1), 64, L)
+    start = L - S
+    col = np.arange(L)[None, :]
+    first = x[np.arange(n), start][:, None]
+    return np.where(col < start[:, None], first, x)
+
+
+def _t2_eval_len(rng, n, lo=260.0):
+    """Series lengths following the eval pool's context+horizon CDF."""
+    u = rng.random(n)
+    return np.interp(u, [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.0],
+                     [lo, 520.0, 1000.0, 2300.0, 3500.0, 4096.0, 4096.0])
+
+
+def _t2_len(rng, n, L, p_own, lo, hi):
+    """Share p_own of rows at a source-like length U(lo, hi) (hi >= L means full), the
+    rest on the eval CDF, so short-history behaviour is still taught."""
+    S = _t2_eval_len(rng, n)
+    own = rng.random(n) < p_own
+    S = np.where(own, rng.uniform(lo, hi, size=n), S)
+    return np.minimum(S, L)
+
+
+def _t2_prof(rng, n, H, decay=1.0, p_more=0.7, G=_T2_G):
+    """(n, G) one-period Fourier profiles, mean 0, peak-to-trough 1."""
+    u = np.arange(G, dtype=np.float64)[None, :] / G
+    prof = np.zeros((n, G))
+    for h in range(1, H + 1):
+        on = rng.random((n, 1)) < (1.0 if h == 1 else p_more)
+        a = rng.normal(0.0, 1.0 / h ** decay, size=(n, 1)) * on
+        b = rng.normal(0.0, 1.0 / h ** decay, size=(n, 1)) * on
+        prof += a * np.cos(_T2_TAU * h * u) + b * np.sin(_T2_TAU * h * u)
+    prof -= prof.mean(axis=1, keepdims=True)
+    return prof / np.maximum(np.ptp(prof, axis=1, keepdims=True), 1e-9)
+
+
+def _t2_events(rng, n, lam):
+    """CSR event table: row pointer and the row index of each event (Poisson counts)."""
+    cnt = rng.poisson(np.maximum(lam, 0.0))
+    ptr = np.zeros(n + 1, dtype=np.int64)
+    ptr[1:] = np.cumsum(cnt)
+    return ptr, np.repeat(np.arange(n), cnt)
+
+
+@njit(cache=False, nogil=True)
+def _t2_pois1(lam, u):
+    """One Poisson draw from a uniform u: inverse CDF below 30, logistic-normal above."""
+    if lam <= 0.0:
+        return 0.0
+    if lam < 30.0:
+        p = math.exp(-lam)
+        s = p
+        k = 0
+        while u > s and k < 400:
+            k += 1
+            p *= lam / k
+            s += p
+        return float(k)
+    uu = min(max(u, 1e-12), 1.0 - 1e-12)
+    zz = 0.5513 * math.log(uu / (1.0 - uu))
+    v = math.floor(lam + math.sqrt(lam) * zz + 0.5)
+    return v if v > 0.0 else 0.0
+
+
+@njit(cache=False, nogil=True)
+def _t2_pois_kernel(lam, u, out):
+    n, L = lam.shape
+    for i in range(n):
+        for t in range(L):
+            out[i, t] = _t2_pois1(lam[i, t], u[i, t])
+    return out
+
+
+@njit(cache=False, nogil=True)
+def _t2_cumsum(x):
+    n, L = x.shape
+    out = np.empty((n, L))
+    for i in range(n):
+        s = 0.0
+        for t in range(L):
+            s += x[i, t]
+            out[i, t] = s
+    return out
+
+
+@njit(cache=False, nogil=True)
+def _t2_stale_kernel(x, u, p, maxrun):
+    """Polling staleness: with prob p[i] a point repeats the previous published value
+    (runs capped at maxrun), in place."""
+    n, L = x.shape
+    for i in range(n):
+        pi = p[i]
+        if pi <= 0.0:
+            continue
+        run = 0
+        for t in range(1, L):
+            if u[i, t] < pi and run < maxrun:
+                x[i, t] = x[i, t - 1]
+                run += 1
+            else:
+                run = 0
+    return x
+
+
+@njit(cache=False, nogil=True)
+def _t2_ar1_kernel(z, phi):
+    """Row-wise AR(1) with unit stationary sd from standard-normal innovations z."""
+    n, L = z.shape
+    out = np.empty((n, L))
+    for i in range(n):
+        p = phi[i]
+        q = math.sqrt(max(1.0 - p * p, 1e-12))
+        a = z[i, 0]
+        out[i, 0] = a
+        for t in range(1, L):
+            a = p * a + q * z[i, t]
+            out[i, t] = a
+    return out
+
+
+def _t2_ar1_small(z, phi):
+    """AR(1) along axis 1 (unit stationary sd)."""
+    return _t2_ar1_kernel(np.ascontiguousarray(z, dtype=np.float64), np.ascontiguousarray(phi, dtype=np.float64))
+
+
+@njit(cache=False, nogil=True)
+def _t2_pad_inplace(x, S):
+    """In-place twin of _t2_pad_left: row i keeps its last S[i] points (clipped to
+    [64, L]) and repeats the first kept value before them."""
+    n, L = x.shape
+    for i in range(n):
+        s = min(max(int(S[i]), 64), L)
+        st = L - s
+        v = x[i, st]
+        for t in range(st):
+            x[i, t] = v
+    return x
+
+
+@njit(cache=False, nogil=True)
+def _t2_burst_kernel(buf, ev_ptr, ev_pos, ev_len, ev_mag):
+    """Add decaying bursts m * exp(-k / len), k = 0, 1, ... from ev_pos on, in place."""
+    n, L = buf.shape
+    for i in range(n):
+        for e in range(ev_ptr[i], ev_ptr[i + 1]):
+            m = ev_mag[e]
+            if m == 0.0:
+                continue
+            dec = math.exp(-1.0 / max(ev_len[e], 1e-3))
+            w = m
+            t = ev_pos[e]
+            while t < L and abs(w) > 1e-3 * abs(m):
+                buf[i, t] += w
+                w *= dec
+                t += 1
+    return buf
+
+
+@njit(cache=False, nogil=True)
+def _t2_prof_add(x, prof, P, ph0, scale):
+    """x[i, t] += scale[i] * prof[i, grid((t / P[i] + ph0[i]) mod 1)], in place."""
+    n, L = x.shape
+    G = prof.shape[1]
+    for i in range(n):
+        if scale[i] == 0.0:
+            continue
+        for t in range(L):
+            u = t / P[i] + ph0[i]
+            g = int((u - math.floor(u)) * G)
+            if g >= G:
+                g = G - 1
+            x[i, t] += scale[i] * prof[i, g]
+    return x
+
+
+# --------------------------------------------------------------------------- #
+# 1. IXP 5-min exchange traffic
+# --------------------------------------------------------------------------- #
+@njit(cache=False, nogil=True)
+def _t2_ixp_kernel(z, r, P, ph0, prof, amp, dv, drift, arphi, arsd, oamp, oper, oph,
+                   sh_pos, sh_mag, ev_ptr, ev_pos, ev_len, ev_mag, ev_kind, lvl, out):
+    n, L = z.shape
+    G = prof.shape[1]
+    K = sh_pos.shape[1]
+    buf = np.empty(L)
+    for i in range(n):
+        p = arphi[i]
+        q = arsd[i] * math.sqrt(max(1.0 - p * p, 1e-12))
+        a = arsd[i] * z[i, 0]
+        Pi = P[i]
+        for t in range(L):
+            if t > 0:
+                a = p * a + q * z[i, t]
+            u = t / Pi + ph0[i]
+            day = int(u)
+            fr = u - day
+            g = int(fr * G)
+            if g >= G:
+                g = G - 1
+            v = (lvl[i] + amp[i] * prof[i, g] + dv[i, day] * (1.0 - fr) + dv[i, day + 1] * fr
+                 + drift[i] * t + a)
+            if oamp[i] > 0.0:
+                v += oamp[i] * math.sin(_T2_TAU * t / oper[i] + oph[i])
+            for k in range(K):
+                if t >= sh_pos[i, k]:
+                    v += sh_mag[i, k]
+            buf[t] = v
+        for e in range(ev_ptr[i], ev_ptr[i + 1]):
+            s = ev_pos[e]
+            m = ev_mag[e]
+            if ev_kind[e] == 0:            # burst: jump, exponential decay
+                dec = math.exp(-1.0 / ev_len[e])
+                w = m
+                t = s
+                while t < L and abs(w) > 1e-3 * abs(m):
+                    buf[t] += w
+                    w *= dec
+                    t += 1
+            else:                           # dip / outage: flat
+                t1 = min(L, s + int(ev_len[e]))
+                for t in range(s, t1):
+                    buf[t] += m
+        ri = r[i]
+        for j in range(L):
+            te = int(j * ri)
+            out[i, j] = math.floor(math.exp(buf[te]) + 0.5)
+    return out
