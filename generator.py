@@ -18400,3 +18400,300 @@ def _t2_ixp_kernel(z, r, P, ph0, prof, amp, dv, drift, arphi, arsd, oamp, oper, 
             te = int(j * ri)
             out[i, j] = math.floor(math.exp(buf[te]) + 0.5)
     return out
+
+
+def _t2_ixp_core(rng, n, L):
+    small = rng.random(n) < 0.22
+    lvl = np.where(small, rng.uniform(4.0, 9.0, size=n), np.clip(rng.normal(11.0, 0.8, size=n), 8.5, 13.3))
+    lvl = lvl * math.log(10.0)
+    # effective period of the daily cycle in points: 288 for most feeds, but graph
+    # exports / polled feeds cycle at ~420-475 or ~272-282 points per day
+    kind = rng.choice(7, size=n, p=[0.64, 0.13, 0.04, 0.04, 0.06, 0.04, 0.05])
+    base_P = np.array([288.0, 471.0, 420.0, 450.0, 277.0, 1440.0, 144.0])[kind]
+    P = base_P * np.where(kind == 0, 1.0, rng.uniform(0.985, 1.015, size=n))
+    # sample-and-hold rows: a coarser feed re-gridded with duplicated polls
+    # (rep ~ 1 - r); its cycle stretches to P / r on the published grid
+    sh = rng.random(n) < 0.07
+    r = np.where(sh, rng.uniform(0.55, 0.72, size=n), 1.0)
+    P = np.where(sh, 288.0 * rng.uniform(0.97, 1.0, size=n), P)
+    ph0 = rng.uniform(0.0, 1.0, size=n)
+    prof = _t2_prof(rng, n, 4, 1.2, 0.6)
+    weak = rng.random(n) < 0.08
+    amp = np.where(small, rng.uniform(0.3, 2.8, size=n),
+                   np.where(weak, rng.uniform(0.05, 0.35, size=n),
+                            np.minimum(np.exp(rng.normal(math.log(1.6), 0.4, size=n)), 4.0)))
+    # day-level values: weekday profile (+ weekend dip on most rows) + a day AR walk
+    D = int(L / 140.0) + 4
+    wk = rng.normal(0.0, 1.0, size=(n, 7)) * rng.uniform(0.005, 0.04, size=(n, 1))
+    we_on = rng.random(n) < 0.75
+    wk[:, 5] += np.where(we_on, np.log(rng.uniform(0.7, 1.0, size=n)), 0.0)
+    wk[:, 6] += np.where(we_on, np.log(rng.uniform(0.7, 1.0, size=n)), 0.0)
+    d0 = rng.integers(0, 7, size=(n, 1))
+    wkd = np.take_along_axis(wk, (np.arange(D)[None, :] + d0) % 7, axis=1)
+    dsd = np.where(small, rng.uniform(0.05, 0.3, size=n), rng.uniform(0.005, 0.05, size=n))
+    dar = _t2_ar1_small(rng.standard_normal((n, D)), rng.uniform(0.5, 0.95, size=n)) * dsd[:, None]
+    dv = np.ascontiguousarray(wkd + dar)
+    drift = rng.uniform(-0.12, 0.15, size=n) / L
+    arphi = rng.uniform(0.0, 0.95, size=n)
+    arsd = np.where(small, np.exp(rng.uniform(math.log(0.08), math.log(0.9), size=n)),
+                    np.exp(rng.uniform(math.log(0.008), math.log(0.12), size=n)))
+    osc = rng.random(n) < 0.08
+    oamp = np.where(osc, rng.uniform(0.03, 0.25, size=n), 0.0)
+    oper = rng.uniform(18.0, 32.0, size=n)
+    oph = rng.uniform(0.0, _T2_TAU, size=n)
+    # peering / capacity level shifts (up to 2 per row)
+    has = rng.random((n, 2)) < np.array([0.25, 0.08])
+    sh_pos = np.where(has, rng.integers(1, L, size=(n, 2)), L + 1).astype(np.int64)
+    sh_mag = rng.normal(0.0, 0.22, size=(n, 2))
+    # bursts (kind 0) and dips / outages (kind 1), CSR over rows
+    days = L / P
+    b_rate = np.exp(rng.uniform(math.log(0.2), math.log(8.0), size=n)) * days
+    d_rate = rng.uniform(0.0, 5.0, size=n) * L / 4096.0
+    bptr, brow = _t2_events(rng, n, b_rate)
+    dptr, drow = _t2_events(rng, n, d_rate)
+    nb, nd = brow.size, drow.size
+    b_mag = np.exp(rng.normal(math.log(0.15), 0.85, size=nb)) * np.where(small[brow], 3.0, 1.0)
+    b_len = rng.uniform(1.0, 12.0, size=nb)
+    zero = rng.random(nd) < 0.35
+    d_mag = np.where(zero, -60.0, np.log(rng.uniform(0.02, 0.4, size=nd)))
+    d_len = np.where(zero, rng.integers(1, 4, size=nd), np.minimum(rng.geometric(0.15, size=nd), 40)).astype(np.float64)
+    row = np.concatenate([brow, drow])
+    order = np.argsort(row, kind="stable")
+    ev_pos = np.concatenate([rng.integers(0, L, size=nb), rng.integers(0, L, size=nd)])[order]
+    ev_len = np.concatenate([b_len, d_len])[order]
+    ev_mag = np.concatenate([b_mag, d_mag])[order]
+    ev_kind = np.concatenate([np.zeros(nb, np.int64), np.ones(nd, np.int64)])[order]
+    ev_ptr = bptr + dptr
+    z = rng.standard_normal((n, L))
+    f = np.ascontiguousarray
+    # the kernel reads z[i, t] before it writes out[i, t]: z doubles as the output
+    out = _t2_ixp_kernel(z, f(r), f(P), f(ph0), f(prof), f(amp), dv, f(drift), f(arphi), f(arsd), f(oamp),
+                         f(oper), f(oph), f(sh_pos), f(sh_mag), ev_ptr, f(ev_pos.astype(np.int64)), f(ev_len),
+                         f(ev_mag), f(ev_kind), f(lvl), z)
+    # rare duplicated polls on most feeds
+    _t2_stale_kernel(out, rng.random((n, L)), np.where(rng.random(n) < 0.6, rng.uniform(0.0, 0.003, size=n), 0.0), 1)
+    S = _t2_len(rng, n, L, 0.7, float(L), float(L))
+    _t2_pad_inplace(out, S)
+    return out, {"freq": np.full(n, "5min"), "mode": kind + 10 * sh, "S": np.clip(S, 64, L).astype(np.int64)}
+
+
+def _t2_ixp_traffic(rng, n, L):
+    return _t2_ixp_core(rng, n, L)[0]
+
+
+# --------------------------------------------------------------------------- #
+# 2. signed interconnector / interface flows (5-min)
+# --------------------------------------------------------------------------- #
+@njit(cache=False, nogil=True)
+def _t2_ou2_kernel(e, a, k, jh, off, res, out):
+    """v = a v + e (+ hour-boundary jump); y = (1 - k) y + v: a slow signed corridor
+    flow with momentum (autocorrelated increments) and ramped schedule jumps."""
+    n, L = e.shape
+    for i in range(n):
+        v = 0.0
+        y = 0.0
+        for t in range(L):
+            v = a[i] * v + e[i, t]
+            tt = t + off[i]
+            if tt % res[i] == 0:
+                v += jh[i, tt // res[i]]
+            y = (1.0 - k[i]) * y + v
+            out[i, t] = y
+    return out
+
+
+@njit(cache=False, nogil=True)
+def _t2_sched_kernel(sp, res, off, R, out):
+    """Setpoint k holds on [k*res, (k+1)*res) (shifted by off); the first R points of
+    each block ramp linearly from the previous setpoint."""
+    n, L = out.shape
+    for i in range(n):
+        rs = res[i]
+        for t in range(L):
+            tt = t + off[i]
+            kk = tt // rs
+            ph = tt - kk * rs
+            cur = sp[i, kk]
+            if ph < R[i] and kk > 0:
+                prev = sp[i, kk - 1]
+                cur = prev + (cur - prev) * (ph + 1.0) / (R[i] + 1.0)
+            out[i, t] = cur
+    return out
+
+
+@njit(cache=False, nogil=True)
+def _t2_gap_kernel(x, ev_ptr, ev_pos, ev_stale, ev_zero):
+    """Feed gaps: the last value is re-published for ev_stale points, then zeros."""
+    n, L = x.shape
+    for i in range(n):
+        for e in range(ev_ptr[i], ev_ptr[i + 1]):
+            s = ev_pos[e]
+            v = x[i, s]
+            t1 = min(L, s + ev_stale[e])
+            for t in range(s, t1):
+                x[i, t] = v
+            t2 = min(L, t1 + ev_zero[e])
+            for t in range(t1, t2):
+                x[i, t] = 0.0
+    return x
+
+
+def _t2_flow_ac(rng, m, L, S1):
+    """AC corridor: slow signed OU with momentum, weak daily cycle, clip at capacity."""
+    tau = np.exp(rng.uniform(math.log(80.0), math.log(700.0), size=m))
+    a = rng.uniform(0.1, 0.6, size=m)
+    # schedule jumps on hour (or quarter-hour) boundaries, heavy-tailed sizes
+    res = np.where(rng.random(m) < 0.6, 12, 3).astype(np.int64)
+    K = L // 3 + 8
+    pj = rng.uniform(0.05, 0.5, size=(m, 1)) * np.where(res == 3, 0.3, 1.0)[:, None]
+    jh = rng.standard_t(3.0, size=(m, K)) * (rng.random((m, K)) < pj)
+    jh *= rng.uniform(3.0, 12.0, size=(m, 1))
+    off = rng.integers(0, 12, size=m)
+    y = rng.standard_normal((m, L))
+    _t2_ou2_kernel(y, a, 1.0 / tau, jh, off, res, y)
+    y -= y.mean(axis=1, keepdims=True)
+    y /= np.maximum(y.std(axis=1, keepdims=True), 1e-9)
+    prof = _t2_prof(rng, m, 3, 1.0, 0.6)
+    P = np.where(rng.random(m) < 0.8, 288.0, rng.uniform(270.0, 300.0, size=m))
+    dA = np.where(rng.random(m) < 0.5, rng.uniform(0.6, 2.5, size=m), rng.uniform(0.0, 0.8, size=m))
+    _t2_prof_add(y, prof, P, rng.uniform(0.0, 1.0, size=m), dA)
+    one_way = rng.random(m) < 0.4
+    mu = np.where(one_way, rng.choice(np.array([-1.0, 1.0]), size=m, p=[0.3, 0.7]) * rng.uniform(1.5, 4.0, size=m),
+                  rng.normal(0.0, 1.1, size=m))
+    y += mu[:, None]
+    y *= S1[:, None]
+    clip = rng.random(m) < 0.5
+    hi = np.where(clip, y.max(axis=1) - S1 * rng.uniform(0.0, 0.8, size=m), np.inf)
+    lo = np.where(clip, y.min(axis=1) + S1 * rng.uniform(0.0, 0.8, size=m), -np.inf)
+    np.clip(y, lo[:, None], hi[:, None], out=y)
+    jr = np.flatnonzero(rng.random(m) < 0.5)
+    if jr.size:
+        y[jr] += rng.standard_normal((jr.size, L)) * (S1[jr] * rng.uniform(0.0, 0.03, size=jr.size))[:, None]
+    return y
+
+
+def _t2_flow_hvdc(rng, m, L, S1):
+    """HVDC link following hourly / 15-min setpoints, often pinned at +/- capacity."""
+    res = np.where(rng.random(m) < 0.7, 12, 3).astype(np.int64)
+    K = L // 3 + 8
+    phi_h = rng.uniform(0.85, 0.99, size=m)
+    phi = np.where(res == 3, phi_h ** 0.25, phi_h)
+    zh = _t2_ar1_small(rng.standard_normal((m, K)), phi)
+    C = S1 * rng.uniform(1.2, 2.5, size=m)
+    sp = C[:, None] * np.tanh(rng.uniform(0.6, 3.0, size=(m, 1)) * zh + rng.normal(0.0, 0.8, size=(m, 1)))
+    asym = rng.random(m) < 0.3
+    sp = np.where(asym[:, None] & (sp < 0), sp * rng.uniform(0.5, 1.0, size=(m, 1)), sp)
+    off = rng.integers(0, 12, size=m)
+    R = rng.integers(0, 4, size=m)
+    x = _t2_sched_kernel(np.ascontiguousarray(sp), res, off, R, np.empty((m, L)))
+    jr = np.flatnonzero(rng.random(m) < 0.7)
+    if jr.size:
+        x[jr] += rng.uniform(0.05, 1.5, size=(jr.size, 1)) * rng.standard_normal((jr.size, L))
+    # maintenance outage at 0
+    orow = np.flatnonzero(rng.random(m) < 0.12)
+    s = rng.integers(0, L, size=orow.size)
+    w = rng.integers(100, 900, size=orow.size)
+    for j, i in enumerate(orow):
+        x[i, s[j]:s[j] + w[j]] = 0.0
+    return x
+
+
+def _t2_flow_sch(rng, m, L, S1):
+    """Integer interface schedules: long exact plateaus changing on hour boundaries."""
+    K = L // 12 + 3
+    haz = np.exp(rng.uniform(math.log(0.01), math.log(0.3), size=(m, 1)))
+    chg = rng.random((m, K)) < haz
+    C = np.round(S1 * rng.uniform(1.0, 3.0, size=m) / 5.0) * 5.0
+    lo = np.where(rng.random(m) < 0.6, 0.0, -C * rng.uniform(0.3, 1.0, size=m))
+    choice = rng.random((m, K))
+    walk = np.cumsum(rng.normal(0.0, 1.0, size=(m, K)) * chg, axis=1) * (C / 3.0)[:, None]
+    lvl = np.where(choice < 0.25, C[:, None], np.where(choice < 0.4, lo[:, None], walk))
+    idx = np.where(chg, np.arange(K)[None, :], 0)
+    idx[:, 0] = 0
+    np.maximum.accumulate(idx, axis=1, out=idx)
+    sp = np.take_along_axis(lvl, idx, axis=1)
+    tick = np.where(rng.random((m, 1)) < 0.5, 5.0, 1.0)
+    sp = np.round(np.clip(sp, lo[:, None], C[:, None]) / tick) * tick
+    off = rng.integers(0, 3, size=m)
+    R = np.where(rng.random(m) < 0.3, 1, 0).astype(np.int64)
+    x = _t2_sched_kernel(np.ascontiguousarray(sp), np.full(m, 12, np.int64), off, R, np.empty((m, L)))
+    return np.round(x, out=x)
+
+
+def _t2_fix_const(rng, x, S, step):
+    """Rows whose kept span is constant get one step inside it (a pair needs variation)."""
+    n, L = x.shape
+    S = np.clip(np.asarray(S, dtype=np.int64), 64, L)
+    c = np.flatnonzero(x.max(axis=1) == x.min(axis=1))
+    for i in c:
+        j = int(rng.integers(L - int(S[i]) + 1, L))
+        x[i, j:] += step * (1.0 if rng.random() < 0.5 else -1.0) * max(abs(x[i, 0]) * 0.05, 1.0)
+    return x
+
+
+def _t2_flow_core(rng, n, L):
+    S1 = np.exp(rng.uniform(math.log(100.0), math.log(2000.0), size=n))
+    mode = rng.choice(3, size=n, p=[0.55, 0.3, 0.15])
+    x = np.empty((n, L))
+    for k, fn in enumerate((_t2_flow_ac, _t2_flow_hvdc, _t2_flow_sch)):
+        idx = np.flatnonzero(mode == k)
+        if idx.size:
+            x[idx] = fn(rng, idx.size, L, S1[idx])
+    # published resolution: 0.01 MW, integer MW, or raw float
+    rk = rng.random(n)
+    for tk, sel in ((0.01, rk < 0.35), (1.0, (rk >= 0.35) & (rk < 0.45))):
+        idx = np.flatnonzero(sel & (mode != 2))
+        if idx.size:
+            x[idx] = np.round(x[idx] / tk) * tk
+    # duplicated polls (runs <= 3) and feed gaps (stale run, then zeros)
+    pd = np.where(rng.random(n) < 0.75, rng.uniform(0.01, 0.08, size=n), 0.0)
+    _t2_stale_kernel(x, rng.random((n, L)), pd, 3)
+    gp = np.where(rng.random(n) < 0.5, L / rng.uniform(1500.0, 6000.0, size=n), 0.0)
+    ptr, row = _t2_events(rng, n, gp)
+    ne = row.size
+    _t2_gap_kernel(x, ptr, rng.integers(0, L, size=ne).astype(np.int64),
+                   rng.integers(6, 20, size=ne).astype(np.int64),
+                   np.where(rng.random(ne) < 0.7, rng.integers(3, 9, size=ne), 0).astype(np.int64))
+    S = np.clip(_t2_len(rng, n, L, 0.6, 1800.0, float(L) + 2500.0), 64, L).astype(np.int64)
+    _t2_pad_inplace(x, S)
+    return _t2_fix_const(rng, x, S, 1.0), {"freq": np.full(n, "5min"), "mode": mode, "S": S}
+
+
+def _t2_signed_flow(rng, n, L):
+    return _t2_flow_core(rng, n, L)[0]
+
+
+# --------------------------------------------------------------------------- #
+# 3. web counters / levels
+# --------------------------------------------------------------------------- #
+@njit(cache=False, nogil=True)
+def _t2_rate_kernel(P, ph0, prof, amp, dv, z, arphi, arsd, out):
+    """log-rate = amp * periodic profile + day-level value (linear across the day) + AR
+    noise; out may alias z (z[i, t] is read before out[i, t] is written)."""
+    n, L = out.shape
+    G = prof.shape[1]
+    for i in range(n):
+        p = arphi[i]
+        q = arsd[i] * math.sqrt(max(1.0 - p * p, 1e-12))
+        a = arsd[i] * z[i, 0]
+        for t in range(L):
+            if t > 0:
+                a = p * a + q * z[i, t]
+            u = t / P[i] + ph0[i]
+            day = int(u)
+            fr = u - day
+            g = int(fr * G)
+            if g >= G:
+                g = G - 1
+            out[i, t] = amp[i] * prof[i, g] + dv[i, day] * (1.0 - fr) + dv[i, day + 1] * fr + a
+    return out
+
+
+@njit(cache=False, nogil=True)
+def _t2_logpois_kernel(lr, lvl, u, out):
+    """Poisson counts with rate exp(lvl[i] + lr[i, t]); out may alias lr."""
+    n, L = lr.shape
+    for i in range(n):
+        for t in range(L):
+            out[i, t] = _t2_pois1(math.exp(min(lvl[i] + lr[i, t], 40.0)), u[i, t])
+    return out
