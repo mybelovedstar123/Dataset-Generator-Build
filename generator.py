@@ -3701,3 +3701,124 @@ def d3_build(P, rng, L, cad, cal, cfg):
 
 MAX_SEASONAL_M = 48
 MAX_ORDER = 3 + 2 * MAX_SEASONAL_M
+
+
+# ═════════════════════════════ E1 arma_sarima ══════════════════════════════
+
+def _poly_from_inverse_roots(rng, n, order, lo=0.05, hi=0.97):
+    """Degree-3 polynomial coefficients from drawn inverse roots.
+
+    Building the polynomial from roots (rather than drawing coefficients and
+    rejecting) makes stationarity and invertibility hold *by construction* — no
+    rejection loop, so the cost is a fixed handful of vector ops.
+    """
+    r = rng.uniform(lo, hi, size=(n, 3)) * np.sign(rng.standard_normal((n, 3)))
+    live = np.arange(3)[None, :] < np.asarray(order).reshape(n, 1)
+    r = np.where(live, r, 0.0)
+    complex_pair = (rng.random(n) < 0.45) & (np.asarray(order) >= 2)
+    rho = rng.uniform(lo, hi, n)
+    th = rng.uniform(0.15, np.pi - 0.15, n)
+    a, b, c = r[:, 0], r[:, 1], r[:, 2]
+    # all-real product
+    c1_r = a + b + c
+    c2_r = a * b + a * c + b * c
+    c3_r = a * b * c
+    # one real root x one complex-conjugate pair.  At order 2 the pair IS the
+    # polynomial: drop the real root so the degree stays 2 (c3 == 0).  Leaving
+    # it in made a degree-3 seasonal factor whose B^3m term _expand_seasonal
+    # then truncated, and a truncated polynomial is not stationary.
+    a_c = np.where(np.asarray(order) >= 3, a, 0.0)
+    two_rc = 2.0 * rho * np.cos(th)
+    c1_c = a_c + two_rc
+    c2_c = rho ** 2 + a_c * two_rc
+    c3_c = a_c * rho ** 2
+    use = complex_pair
+    c1 = np.where(use, c1_c, c1_r)
+    c2 = np.where(use, c2_c, c2_r)
+    c3 = np.where(use, c3_c, c3_r)
+    # (1 - aB)(1 - bB)(1 - cB) = 1 - e1*B + e2*B^2 - e3*B^3: the elementary
+    # symmetric coefficients ALTERNATE in sign.  _expand_seasonal builds
+    # ``1 - k1*B - k2*B^2 - k3*B^3`` from what we return, so hand it
+    # (e1, -e2, e3) — returning (e1, e2, e3) flips the B^2 term and about a
+    # quarter of the draws land outside the unit circle and explode.
+    return np.stack([c1, -c2, c3], axis=1)
+
+
+def _expand_seasonal(base, seas, m, n):
+    """Convolve a degree-3 polynomial with a seasonal polynomial at lag m."""
+    out = np.zeros((n, MAX_ORDER + 1))
+    poly = np.concatenate([np.ones((n, 1)), -base], axis=1)          # 1 - c1 B - ...
+    spol = np.concatenate([np.ones((n, 1)), -seas], axis=1)          # 1 - S1 B^m - ...
+    rows = np.arange(n)
+    for j in range(4):
+        for k in range(3):
+            idx = j + k * np.asarray(m).astype(np.int64)
+            idx = np.clip(idx, 0, MAX_ORDER)
+            np.add.at(out, (rows, idx), poly[:, j] * spol[:, k])
+    return -out[:, 1:]
+
+
+def e1_params(rng, B, cfg):
+    p = cfg["families"]["arma_sarima"]
+    mgrid = np.array([2, 3, 4, 6, 7, 12, 24, 48])
+    return {
+        "p": rng.integers(0, 4, B),
+        "q": rng.integers(0, 4, B),
+        "P": rng.integers(0, 3, B),
+        "Q": rng.integers(0, 3, B),
+        "d": (rng.random(B) < p["d_rate"]).astype(np.int64),
+        "D": (rng.random(B) < p["big_d_rate"]).astype(np.int64),
+        "m": mgrid[rng.integers(0, len(mgrid), B)],
+        "seasonal_on": rng.random(B) < p["seasonal_rate"],
+        "student": rng.random(B) < p["student_rate"],
+        "nu": rng.uniform(3.0, 10.0, B),
+        "sig": logu(rng, 0.05, 20.0, B),
+        "drift": rng.normal(0.0, 0.02, B),
+    }
+
+
+def e1_build(P, rng, L, cad, cal, cfg):
+    n = cad.n
+    son = P["seasonal_on"]
+    m = np.where(son, P["m"], 0).astype(np.int64)
+    Pord = np.where(son, P["P"], 0)
+    Qord = np.where(son, P["Q"], 0)
+    D = np.where(son, P["D"], 0)
+
+    ar = _poly_from_inverse_roots(rng, n, P["p"])
+    ma = _poly_from_inverse_roots(rng, n, P["q"])
+    sar = _poly_from_inverse_roots(rng, n, np.minimum(Pord, 3))
+    sma = _poly_from_inverse_roots(rng, n, np.minimum(Qord, 3))
+
+    phi = np.ascontiguousarray(_expand_seasonal(ar, sar, m, n))
+    theta = np.ascontiguousarray(-_expand_seasonal(ma, sma, m, n))
+    ordv = np.where(m > 0, 3 + 2 * m, 3).astype(np.int64)
+    ordv = np.minimum(ordv, MAX_ORDER)
+
+    z = rng.standard_normal((n, L))
+    if P["student"].any():
+        nu = np.maximum(P["nu"].reshape(n, 1), 2.5)
+        g = rng.chisquare(np.broadcast_to(nu, (n, L))) / nu
+        tt = z / np.sqrt(np.maximum(g, 1e-9))
+        tt *= np.sqrt(np.maximum((nu - 2.0) / nu, 1e-3))
+        z = np.where(P["student"].reshape(n, 1), tt, z)
+    e = np.ascontiguousarray(z * P["sig"].reshape(n, 1))
+
+    out = np.zeros((n, L))
+    k_arma(phi, ordv, theta, ordv, e, out)
+    out = np.clip(out, -1e120, 1e120)
+
+    if (D > 0).any():
+        acc = np.zeros((n, L))
+        k_seasonal_int(np.ascontiguousarray(out),
+                         np.where(D > 0, np.maximum(m, 1), L + 1).astype(np.int64), acc)
+        out = np.where((D > 0).reshape(n, 1), acc, out)
+    dmask = (P["d"] > 0).reshape(n, 1)
+    if dmask.any():
+        t = time_grid(L)[None, :]
+        integ = np.cumsum(out, axis=1) + P["drift"].reshape(n, 1) \
+            * P["sig"].reshape(n, 1) * t
+        out = np.where(dmask, integ, out)
+
+    fl = new_flags(n, scale_mode=0, quant_boost=0.9)
+    return out, fl
