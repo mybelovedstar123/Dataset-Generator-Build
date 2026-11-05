@@ -20519,3 +20519,138 @@ def _w86r_record(r, n, kind):
 # spawn_key=(k,)) and left-padded to the record length with its first value. A row that fails the band's keep test
 # (or whose builder fails) is dropped and the parent record is yielded unchanged.
 _W86B_Q = 0.295  # ~0.20 of non-quiet univariate base records (the band keeps its own 0.32, this adds on the rest)
+_W86B_COIN_TAG = 0x86B0C024
+_W86B_XOR = 0x86B05EED
+_W86B_TAG = 0x86B0BA4D
+_FORK_DEDUP_TAG = 1110315
+_W86B_E_FAMS = (('electricity_spot_price', 0.006256592551033714), ('electricity_net_demand', 0.012513185102067429),
+                ('energy_solar_wind_unit_load_flow', 0.012513185102067429),
+                ('unit_dispatch_load_or_carbon_intensity', 0.021956928849211528),
+                ('solar_pv_output', 0.008444557919663202), ('count_ladder_or_spot_price', 0.01689001438773241 * 0.67))
+_W86B_E_CUM = np.cumsum([w for _, w in _W86B_E_FAMS]) / sum(w for _, w in _W86B_E_FAMS)
+# pollutant share of the air rows: rain family pollutant mode (.53 x .85) + 40% of the weather-family rows
+_W86B_AQ_P = ((0.010399799251136611 * 0.53 * 0.85 + _W86A_AQ_SHARE * (0.01872844442642478 * 0.8 + 0.015200743384437363 * 0.7))
+              / (0.010399799251136611 * 0.53 * 0.85 + 0.01872844442642478 * 0.8 + 0.015200743384437363 * 0.7))
+_W86B_POL_P = 0.38  # policy share of the rates rows (108 policy / 174 FX-yield-crypto in an 8000-row sample)
+
+
+def _w86b_energy_one(r):
+    fam = _W86B_E_FAMS[int(np.searchsorted(_W86B_E_CUM, r.random() * 0.999999))][0]
+    return _w86e2_record(r, fam)
+
+
+def _w86b_civic_one(r):
+    return _w86c_event_hourly(r, _pt_sample_series_length(r))
+
+
+def _w86b_air_one(r):
+    aq = r.random() < _W86B_AQ_P
+    S = 4096 if r.random() < _W86A_FULL_P else _pt_sample_series_length(r)
+    S = int(min(max(S, 256), 4096))
+    return _w86a_pollutant(r, S) if aq else _w86a_weather(r, S)
+
+
+def _w86b_rates_one(r):
+    kind = 'policy' if r.random() < _W86B_POL_P else 'mkt'
+    return _w86r_record(r, _pt_sample_series_length(r), kind)
+
+
+def _w86b_intlike(x):
+    # integer-valued (count-like: docks, traffic, visits) parents get no weakness channel
+    t = np.asarray(x[-512:], dtype=np.float64)
+    return bool(t.size and np.mean(t == np.round(t)) >= 0.98)
+
+
+_W86B_FAMILIES = (("w86b_energy", _w86b_energy_one, 0.40), ("w86b_civic", _w86b_civic_one, 0.20),
+                  ("w86b_rates", _w86b_rates_one, 0.20), ("w86b_air", _w86b_air_one, 0.20))
+_W86B_CUM = np.cumsum([w for _, _, w in _W86B_FAMILIES]) / sum(w for _, _, w in _W86B_FAMILIES)
+
+
+def _w86b_row(r, L, one):
+    x = None
+    y = np.zeros(0)
+    for _ in range(4):
+        y = np.nan_to_num(np.asarray(one(r), dtype=np.float64).reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        if y.size >= 2 and np.any(y != y[0]):
+            x = y
+            break
+    if x is None:
+        x = np.array([0.0, 1.0]) if y.size < 2 else y.copy()
+        x[-1] = x[-1] + max(abs(float(x[-1])) * 1e-3, 1.0)
+    out = np.empty(L, dtype=np.float64)
+    if x.size >= L:
+        out[:] = x[x.size - L:]
+    else:
+        out[:L - x.size] = x[0]
+        out[L - x.size:] = x
+    np.clip(out, -1e30, 1e30, out=out)
+    return out
+
+
+class _W86BStream:
+    """Weakness rows, one per call, each from its own rng; family k of _W86B_FAMILIES exposed as last_fam."""
+
+    def __init__(self, seed):
+        self._seed = int(seed) & ((1 << 64) - 1)
+        self._k = 0
+        self.last_fam = -1
+
+    def next(self, L):
+        r = np.random.default_rng(np.random.SeedSequence([self._seed, _W86B_TAG], spawn_key=(self._k,)))
+        self._k += 1
+        f = int(np.searchsorted(_W86B_CUM, r.random() * 0.999999))
+        self.last_fam = f
+        with np.errstate(all="ignore"):
+            return _w86b_row(r, int(L), _W86B_FAMILIES[f][1])
+
+
+def _w86b_add(stream, x):
+    """(2, L) record [x, weakness row] with x kept byte for byte as channel 0, else None (x yielded unchanged)."""
+    if not (isinstance(x, np.ndarray) and x.ndim == 1 and x.dtype == np.float64 and x.size >= 2):
+        return None
+    try:
+        y = stream.next(x.size)
+    except Exception:
+        stream.last_fam = -1
+        return None
+    z = np.empty((2, x.size), dtype=np.float64)
+    z[0] = x
+    z[1] = y
+    if (np.all(np.isfinite(z)) and np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12))
+            and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12) and np.array_equal(z[0], x)):
+        return z
+    stream.last_fam = -1
+    return None
+
+
+_W86BParent = Generator
+
+
+class Generator(_W86BParent):
+    """The published records unchanged; weakness rows added as channel 1 under a share of its univariate records."""
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        self._w86b_stream = _W86BStream((int(self._seed) ^ _W86B_XOR) & ((1 << 64) - 1))
+
+    @property
+    def name(self) -> str:
+        return 'a135bwncni31'
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if _W86B_Q > 0.0 and np.ndim(x) == 1:
+                    u = np.random.default_rng(np.random.SeedSequence([seed, _W86B_COIN_TAG], spawn_key=(i,))).random()
+                    if u < _W86B_Q and not _k87_quiet(x) and not _w86b_intlike(x):
+                        z = _w86b_add(self._w86b_stream, x)
+                        if z is not None:
+                            x = z
+                yield x
+        finally:
+            base.close()
