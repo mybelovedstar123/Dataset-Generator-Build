@@ -20492,3 +20492,30 @@ def _w86r_policy(r, n):
         k = int(np.clip(N - 1 - T, 1, N - 1))
         x[k:] = max(round(x[0] + (0.25 if r.random() < 0.5 else -0.25), 4), floor - 0.25)
     return np.round(x, 3 if r.random() < 0.1 else 2)
+
+
+def _w86r_record(r, n, kind):
+    if kind == 'policy':
+        x = _w86r_policy(r, n)
+    else:
+        k = _w86r_pick(r, *_W86R_MKT)
+        N = int(np.clip(n, 256, 4096))
+        x = _w86r_fx(r, N) if k == 'fx' else _w86r_yield(r, N) if k == 'yield' else _w86r_crypto(r, n)
+    x = np.nan_to_num(np.asarray(x, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.any(x != x[0]):
+        x = x.copy(); x[-1] = x[-1] + max(abs(x[-1]) * 1e-3, 0.01)
+    return np.ascontiguousarray(x, dtype=np.float64)
+
+
+# ═══════════════ w86b: weakness rows ADDED as channel 1 on records the published generator leaves univariate ═══════════════
+# The generator above (the published king, band included) is the parent class and is not changed in any way: every
+# record it yields is yielded here, in order, as the very same object, unless it is univariate and selected below.
+# Nothing above is re-bound, patched or read back; the parent's RNGs, teach and band streams advance exactly as without
+# this block. A record the parent leaves univariate draws an independent coin under this block's own tag
+# (SeedSequence([seed, _W86B_COIN_TAG], spawn_key=(i,))); on success, when the record's recent tail is not quiet (the
+# same quiet rule the band uses), one row of a separate weakness stream (energy .40 / civic .20 / rates .20 /
+# air .20) is stacked UNDER it as channel 1, uncoupled (it keeps its own reporting grid): channel 0 stays the parent
+# row byte for byte. Weakness row k is built only from its own rng SeedSequence([stream seed, _W86B_TAG],
+# spawn_key=(k,)) and left-padded to the record length with its first value. A row that fails the band's keep test
+# (or whose builder fails) is dropped and the parent record is yielded unchanged.
+_W86B_Q = 0.295  # ~0.20 of non-quiet univariate base records (the band keeps its own 0.32, this adds on the rest)
