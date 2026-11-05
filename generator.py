@@ -19366,3 +19366,301 @@ class Generator(_PublishedGenerator):
 # units / other / signed net); load / CI integer shares and end phases per cadence. Values are rounded to 0-3 dp
 # and stored through float32, exactly like the pool records (19.83 -> 19.8299999237).
 _W86E2_LAST = ['', 0, '']  # sub-kind, cadence and style of the last rebuilt record (diagnostics only)
+_W86E2_KINDS = ('price', 'load', 'gen', 'unit', 'ci', 'flow')
+_W86E2_WIN = [None]  # solar production-window mask of the record being built
+# 15-min solar: steps from the last in-window reading to the record end (real quantiles .1/.25/.5/.75/.9: 20/25/28/29.5/31)
+_W86E2_SOLT = (18.0, 20.0, 25.0, 28.0, 29.5, 31.0, 34.0)
+_W86E2_FAMS = {
+    'electricity_spot_price': (1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    'electricity_net_demand': (0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+    'energy_solar_wind_unit_load_flow': (0.0, 0.12, 0.55, 0.08, 0.0, 0.25),
+    'unit_dispatch_load_or_carbon_intensity': (0.0, 0.20, 0.0, 0.55, 0.25, 0.0),
+    'solar_pv_output': (0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+    'count_ladder_or_spot_price': (1.0, 0.0, 0.0, 0.0, 0.0, 0.0),  # spot-price mode only
+}
+_W86E2_GENSUB = (('solar', 'wind', 'fuel', 'total'), (0.25, 0.2, 0.45, 0.1))
+# cadence (steps per day) mix per kind: real pool rows (row-weighted)
+_W86E2_CAD = {
+    'price': ((96, 48, 288, 24), (0.41, 0.36, 0.15, 0.08)),
+    'load': ((96, 48, 288, 24), (0.35, 0.06, 0.55, 0.04)),
+    'fuel': ((96, 48, 288, 24), (0.30, 0.49, 0.15, 0.06)),
+    'total': ((96, 48, 288, 24), (0.45, 0.25, 0.20, 0.10)),
+    'wind': ((96,), (1.0,)),
+    'solar': ((96, 24), (0.9, 0.1)),
+    'unit': ((144, 288), (0.54, 0.46)),
+    'ci': ((96, 48, 288), (0.62, 0.25, 0.13)),
+    'flow': ((288,), (1.0,)),
+}
+# record length quantiles [0 .1 .25 .5 .75 .9 1] per cadence (real, capped at the 4096 row length)
+_W86E2_LQ = np.array([0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0])
+_W86E2_LEN = {
+    96: (1000, 1800, 4096, 4096, 4096, 4096, 4096), 48: (1700, 2000, 2900, 3300, 4096, 4096, 4096),
+    288: (2100, 2900, 4096, 4096, 4096, 4096, 4096), 24: (1416, 1440, 1490, 1560, 1900, 2000, 2016),
+    144: (4096,) * 7,
+}
+# end phase = (steps since the daily-profile max) / P at the series end: 17 real quantiles per (kind, cadence)
+_W86E2_PHQ = np.linspace(0.0, 1.0, 17)
+_W86E2_PH = {
+    ('price', 96): (0.03, 0.14, 0.17, 0.17, 0.17, 0.17, 0.17, 0.17, 0.17, 0.18, 0.18, 0.2, 0.23, 0.24, 0.25, 0.48, 0.8),
+    ('price', 48): (0.06, 0.08, 0.08, 0.17, 0.17, 0.17, 0.17, 0.21, 0.25, 0.38, 0.46, 0.46, 0.79, 0.89, 0.91, 0.92, 0.92),
+    ('price', 288): (0.0, 0.1, 0.19, 0.19, 0.19, 0.2, 0.2, 0.2, 0.25, 0.31, 0.32, 0.33, 0.33, 0.35, 0.35, 0.35, 0.71),
+    ('price', 24): (0.12, 0.12, 0.12, 0.12, 0.19, 0.21, 0.21, 0.21, 0.21, 0.21, 0.21, 0.21, 0.21, 0.21, 0.21, 0.21, 0.21),
+    ('load', 96): (0.11, 0.16, 0.16, 0.17, 0.18, 0.22, 0.25, 0.35, 0.38, 0.48, 0.5, 0.57, 0.61, 0.74, 0.93, 0.93, 0.93),
+    ('load', 48): (0.19, 0.19, 0.19, 0.19, 0.19, 0.24, 0.33, 0.33, 0.33, 0.33, 0.33, 0.33, 0.33, 0.33, 0.33, 0.33, 0.33),
+    ('load', 288): (0.0, 0.02, 0.1, 0.12, 0.15, 0.18, 0.19, 0.2, 0.21, 0.22, 0.29, 0.75, 0.81, 0.84, 0.91, 0.93, 1.0),
+    ('load', 24): (0.29, 0.29, 0.3, 0.32, 0.33, 0.33, 0.33, 0.33, 0.54, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75),
+    ('solar', 96): (0.12, 0.35, 0.49, 0.51, 0.53, 0.54, 0.55, 0.55, 0.56, 0.57, 0.58, 0.59, 0.6, 0.61, 0.61, 0.64, 0.68),
+    ('solar', 24): (0.0, 0.08, 0.08, 0.08, 0.08, 0.12, 0.2, 0.75, 0.77, 0.79, 0.83, 0.84, 0.96, 0.96, 0.96, 0.96, 0.96),
+    ('fuel', 24): (0.12, 0.13, 0.17, 0.19, 0.21, 0.21, 0.21, 0.21, 0.21, 0.21, 0.54, 0.62, 0.62, 0.64, 0.85, 0.96, 0.96),
+    ('fuel', 48): (0.0, 0.07, 0.17, 0.23, 0.27, 0.29, 0.31, 0.35, 0.44, 0.52, 0.6, 0.71, 0.77, 0.83, 0.88, 0.92, 0.98),
+    ('fuel', 96): (0.0, 0.05, 0.16, 0.18, 0.28, 0.29, 0.31, 0.38, 0.43, 0.5, 0.54, 0.62, 0.81, 0.85, 0.89, 0.95, 0.99),
+    ('fuel', 288): (0.0, 0.02, 0.14, 0.19, 0.21, 0.23, 0.25, 0.36, 0.37, 0.4, 0.4, 0.47, 0.48, 0.52, 0.53, 0.6, 0.99),
+    ('ci', 48): (0.19, 0.19, 0.19, 0.23, 0.23, 0.23, 0.23, 0.23, 0.24, 0.25, 0.29, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35),
+    ('ci', 96): (0.03, 0.1, 0.14, 0.14, 0.16, 0.16, 0.17, 0.19, 0.21, 0.22, 0.24, 0.47, 0.49, 0.61, 0.71, 0.94, 0.99),
+    ('ci', 288): (0.54, 0.54, 0.55, 0.56, 0.58, 0.58, 0.59, 0.59, 0.62, 0.62, 0.62, 0.62, 0.62, 0.63, 0.63, 0.64, 0.64),
+}
+
+
+def _w86e2_pick(r, vals, probs):
+    return vals[int(np.searchsorted(np.cumsum(probs), r.random() * float(np.sum(probs))))]
+
+
+def _w86e2_lu(r, a, b):
+    return float(np.exp(r.uniform(np.log(a), np.log(b))))
+
+
+def _w86e2_bump(tod, c, w):
+    d = np.abs(((tod - c) + 0.5) % 1.0 - 0.5)
+    return np.exp(-0.5 * (d / w) ** 2)
+
+
+def _w86e2_ar(r, m, phi, sd):
+    e = r.standard_normal(m) * sd * np.sqrt(max(1.0 - phi * phi, 1e-6))
+    out = np.empty(m)
+    p = r.standard_normal() * sd
+    for t in range(m):
+        p = phi * p + e[t]
+        out[t] = p
+    return out
+
+
+def _w86e2_smooth(r, m, tau):
+    # AR(1) with time constant tau steps, unit stationary sd
+    return _w86e2_ar(r, m, float(np.exp(-1.0 / max(tau, 1.0))), 1.0)
+
+
+def _w86e2_smooth2(r, m, tau):
+    # second-order smooth (AR(1) of an AR(1)), unit sd: its steps are themselves smooth, so step sizes cluster
+    phi = float(np.exp(-1.0 / max(tau, 1.0)))
+    y = _w86e2_ar_e(_w86e2_ar_e(r.standard_normal(m + int(4 * tau) + 8), phi), phi)[-m:]
+    return y / (float(np.std(y)) + 1e-12)
+
+
+def _w86e2_holds(r, x, p):
+    if p <= 0.0:
+        return x
+    h = r.random(x.size) < p
+    h[0] = False
+    return x[np.maximum.accumulate(np.where(h, 0, np.arange(x.size)))]
+
+
+def _w86e2_fq(x, d):
+    # pool records are float32 copies of 0-3 dp numbers (19.83 -> 19.8299999237); d < 0 keeps the float
+    y = np.round(x, int(d)) if d >= 0 else np.asarray(x, dtype=np.float64)
+    return np.asarray(y, dtype=np.float32).astype(np.float64)
+
+
+def _w86e2_softneg(x, F):
+    neg = x < 0.0
+    x[neg] = -F * (1.0 - np.exp(x[neg] / F))
+    return x
+
+
+def _w86e2_spikes(r, x, M, rate, amp, updown, dec):
+    # isolated / short-decay price spikes; rate per step (array or scalar), amp absolute scale, updown share negative
+    sp = r.random(M) < rate
+    if not sp.any():
+        return x
+    sg = np.where(r.random(M) < updown, -1.0, 1.0)
+    mag = np.where(sp, sg * amp * (r.pareto(r.uniform(1.4, 2.6), M) + 0.25), 0.0)
+    for t in range(1, M):
+        if mag[t] == 0.0 and mag[t - 1] != 0.0 and abs(dec * mag[t - 1]) > 0.1 * amp:
+            mag[t] = dec * mag[t - 1]
+    return x + mag
+
+
+# ------------------------------------------------------------------ prices
+def _w86e2_stack(r, x, K, jit):
+    # offer-stack clearing: the price sits on one of K offer tranches spread over the path's range (tranche prices
+    # drift slowly), so most steps move by cents and a minority jump between tranches
+    lev = np.sort(np.quantile(x, r.random(K)))
+    j = np.clip(np.searchsorted(lev, x), 1, K - 1)
+    near = np.where(np.abs(lev[j] - x) < np.abs(lev[j - 1] - x), lev[j], lev[j - 1])
+    return near * (1.0 + jit * _w86e2_smooth(r, x.size, r.uniform(5.0, 50.0)))
+
+
+def _w86e2_jumpy(r, M, pj, js, phi):
+    # small Gaussian moves plus a share pj of jumps js times larger, mean-reverting (AR phi): heavy-tailed steps
+    e = r.standard_normal(M) * np.where(r.random(M) < pj, js, 1.0)
+    return _w86e2_ar_e(e, phi)
+
+
+def _w86e2_ar_e(e, phi):
+    out = np.empty(e.size)
+    p = 0.0
+    for t in range(e.size):
+        p = phi * p + e[t]
+        out[t] = p
+    return out
+
+
+def _w86e2_negdips(r, x, M, rate, depth, zp):
+    # brief negative / zero-price intervals (real-time over-generation), 1-4 intervals each
+    k = int(r.poisson(rate * M))
+    for _ in range(k):
+        t0 = int(r.integers(0, M)); d = int(r.integers(1, 5))
+        x[t0:t0 + d] = 0.0 if r.random() < zp else -depth * r.uniform(0.02, 1.0)
+    return x
+
+
+def _w86e2_px_eu(r, M, P, tod, day, dow, nd):
+    # EU 15-min day-ahead (energy_charts / energinet / elering / pse): strong two-peak diurnal, midday solar dip with
+    # recurring negative stretches and exact-zero clearing prices; hydro/wind zones (nordic/baltic, ~1/3 of the
+    # rows) with larger day-level swings, a flatter shape and jumpy quarter-hours; iberian rows with repeated values
+    L = _w86e2_lu(r, 35.0, 140.0)
+    z = r.random()
+    sty = 'nordic' if z < 0.33 else ('iberian' if z < 0.43 else ('italian' if z < 0.58 else 'central'))
+    _W86E2_LAST[2] = 'eu_' + sty
+    nordic = sty == 'nordic'
+    lv = _w86e2_ar(r, nd, r.uniform(0.5, 0.9), r.uniform(0.2, 0.65) if nordic else r.uniform(0.05, 0.15))
+    wk = np.zeros(7); wk[5] = np.log(r.uniform(0.8, 0.97)); wk[6] = np.log(r.uniform(0.65, 0.93))
+    a = r.uniform(0.2, 0.6) if nordic else 1.0
+    shp = a * (r.uniform(0.1, 0.4) * _w86e2_bump(tod, r.uniform(7.5, 9.0) / 24.0, r.uniform(1.0, 1.8) / 24.0)
+               + r.uniform(0.3, 0.8) * _w86e2_bump(tod, r.uniform(19.0, 20.5) / 24.0, r.uniform(1.2, 2.2) / 24.0)
+               - r.uniform(0.0, 0.2) * _w86e2_bump(tod, r.uniform(2.5, 4.5) / 24.0, r.uniform(2.0, 3.2) / 24.0))
+    dsc = np.exp(r.uniform(0.1, 0.35) * r.standard_normal(nd))  # day-to-day shape amplitude
+    x = L * np.exp(lv[day] + wk[dow] + shp * dsc[day])
+    solar = r.uniform(0.5, 1.3) if (not nordic or r.random() < 0.35) else r.uniform(0.0, 0.25)
+    if sty == 'italian':  # zones with a zero floor (italy, serbia)
+        solar = r.uniform(0.2, 0.8)
+    sunny = r.beta(r.uniform(2.0, 4.0), r.uniform(0.7, 1.4), nd)
+    x = x - L * solar * sunny[day] * (1.0 + 0.4 * (dow >= 5)) \
+        * _w86e2_bump(tod, r.uniform(12.5, 14.0) / 24.0, r.uniform(1.6, 2.6) / 24.0)
+    windy = (r.random(nd) < r.uniform(0.0, 0.08)) * r.uniform(0.4, 1.2, nd)
+    x = x - L * windy[day] * np.exp(0.5 * shp)
+    # quarter-hour moves (real MAD of 15-min steps ~3-5% of the level), larger in the ramps and the solar dip;
+    # hydro / wind / iberian zones jumpier (share of steps beyond 8 MAD .05-.12 vs .01-.02 in the central zones)
+    vol = np.exp(r.uniform(0.2, 0.6) * _w86e2_smooth(r, M, P * r.uniform(0.1, 0.5))) \
+        * (1.0 + r.uniform(0.5, 2.0) * _w86e2_bump(tod, 13.0 / 24.0, 0.1) + r.uniform(0.0, 1.0) * _w86e2_bump(tod, 20.0 / 24.0, 0.05))
+    if sty in ('nordic', 'iberian'):
+        x = x + L * r.uniform(0.01, 0.025) * vol * _w86e2_jumpy(r, M, r.uniform(0.08, 0.2), r.uniform(7.0, 13.0), r.uniform(0.2, 0.6))
+    else:
+        x = x + L * r.uniform(0.012, 0.035) * vol * _w86e2_jumpy(r, M, r.uniform(0.02, 0.05), r.uniform(4.0, 8.0), r.uniform(0.0, 0.5))
+    floor0 = sty == 'italian' or (nordic and r.random() < 0.5)  # zones that never clear below zero
+    x = _w86e2_softneg(x, L * r.uniform(0.02, 0.12)) if not floor0 else np.maximum(x, L * r.uniform(0.0, 0.2))
+    if sty == 'iberian':
+        x = _w86e2_holds(r, x, r.uniform(0.08, 0.25))
+    z = L * r.uniform(0.004, 0.03)  # clearing at exactly 0.00 around the zero crossing
+    x = np.where((np.abs(x) < z) & (r.random(M) < 0.75), 0.0, x)
+    return _w86e2_fq(x, 2)
+
+
+def _w86e2_px_rt(r, M, P, tod, day, dow, nd):
+    # 5-min real-time LMPs (nyiso_realtime_lbmp_zonal, caiso_oasis_lmp_5min): the marginal unit's offer sets the
+    # price (tranche plateaus, jumps between them), modest diurnal, multi-day swings and scarcity spikes of many
+    # times the level (which set the week's std, so the last hours are quiet relative to it), brief negative dips
+    L = _w86e2_lu(r, 18.0, 70.0)
+    duck = r.random() < 0.08
+    _W86E2_LAST[2] = 'rt_duck' if duck else 'rt'
+    lv = _w86e2_ar(r, nd, r.uniform(0.75, 0.95), r.uniform(0.45, 1.0))
+    if duck:
+        shp = r.uniform(0.5, 1.0) * _w86e2_bump(tod, r.uniform(18.5, 20.0) / 24.0, 0.07) \
+            - r.uniform(0.4, 0.9) * _w86e2_bump(tod, r.uniform(11.5, 13.5) / 24.0, 0.1)
+    else:
+        shp = r.uniform(0.2, 0.6) * _w86e2_bump(tod, r.uniform(16.5, 19.5) / 24.0, r.uniform(0.08, 0.15)) \
+            + r.uniform(0.0, 0.2) * _w86e2_bump(tod, r.uniform(7.0, 9.0) / 24.0, 0.06) \
+            - r.uniform(0.1, 0.3) * _w86e2_bump(tod, r.uniform(2.5, 5.0) / 24.0, 0.1)
+    x = L * np.exp(lv[day] + shp + r.uniform(0.03, 0.12) * _w86e2_smooth(r, M, P * r.uniform(0.02, 0.1)))
+    x = _w86e2_stack(r, x, int(r.integers(8, 30)), r.uniform(0.002, 0.01))
+    x = x + L * r.uniform(0.001, 0.006) * r.standard_t(3.0, M)
+    vol = np.exp(r.uniform(0.2, 0.7) * _w86e2_smooth(r, M, r.uniform(6.0, 60.0)))
+    x = _w86e2_spikes(r, x, M, r.uniform(0.005, 0.03) * vol, L * r.uniform(0.02, 0.1), r.uniform(0.1, 0.4), r.uniform(0.0, 0.5))
+    k = int(r.poisson(r.uniform(1.0, 6.0) * M / (7.0 * P)))  # scarcity events: 1-6 a week at 2-40x the level
+    pko = r.uniform(16.0, 20.0) / 24.0
+    for _ in range(k):  # partly around the daily peak
+        t0 = int(r.integers(0, M))
+        if r.random() < 0.3:
+            t0 = int(t0 - (tod[t0] - pko) * P + r.normal(0.0, 0.06 * P)) % M
+        d = int(r.integers(1, 9))
+        x[t0:t0 + d] += L * _w86e2_lu(r, 2.0, 40.0) * np.exp(-0.4 * np.arange(min(d, M - t0)))
+    if r.random() < 0.75:
+        x = _w86e2_negdips(r, x, M, r.uniform(0.0008, 0.004), L, 0.4)
+    return _w86e2_fq(x, 2)
+
+
+def _w86e2_px_nz(r, M, P, tod, day, dow, nd):
+    # NZ half-hourly dispatch prices: hydro offer stack, multi-day regimes from ~0 to 150+, prices sitting on
+    # offer tranches for hours and jumping between them, spill collapses to cents, no negatives
+    L = _w86e2_lu(r, 15.0, 90.0)
+    lv = _w86e2_ar(r, nd, r.uniform(0.4, 0.85), r.uniform(0.2, 0.5))
+    shp = r.uniform(0.2, 0.7) * _w86e2_bump(tod, r.uniform(7.5, 9.0) / 24.0, 0.06) \
+        + r.uniform(0.4, 1.0) * _w86e2_bump(tod, r.uniform(17.5, 19.5) / 24.0, 0.07) \
+        - r.uniform(0.2, 0.8) * _w86e2_bump(tod, r.uniform(2.0, 5.0) / 24.0, 0.1)
+    x = L * np.exp(lv[day] + shp + _w86e2_ar(r, M, r.uniform(0.85, 0.97), r.uniform(0.3, 0.8)))
+    x = _w86e2_stack(r, x, int(r.integers(4, 12)), r.uniform(0.001, 0.006))
+    x = x * np.exp((r.random(M) < r.uniform(0.02, 0.08)) * r.normal(0.0, 0.8, M))
+    spill = (r.random(nd) < r.uniform(0.0, 0.2))[day] & (r.random(M) < r.uniform(0.3, 0.9))
+    x = np.where(spill, _w86e2_holds(r, r.uniform(0.01, 0.5, M), 0.6), x)
+    x = _w86e2_holds(r, x, r.uniform(0.05, 0.2))
+    return _w86e2_fq(np.maximum(x, 0.01), 2)
+
+
+def _w86e2_px_agile(r, M, P, tod, day, dow, nd):
+    # Octopus Agile (GB day-ahead x multiplier + 16-19h peak adder, p/kWh, 3 dp): plateau peak, overnight low,
+    # windy / sunny half-hours below zero on many days
+    L = _w86e2_lu(r, 8.0, 20.0)
+    lv = _w86e2_ar(r, nd, r.uniform(0.5, 0.9), r.uniform(0.04, 0.14))
+    pk = ((tod >= 16.0 / 24.0) & (tod < 19.0 / 24.0)).astype(np.float64)
+    shp = r.uniform(0.1, 0.3) * _w86e2_bump(tod, r.uniform(7.0, 9.0) / 24.0, 0.05) \
+        - r.uniform(0.1, 0.4) * _w86e2_bump(tod, r.uniform(2.0, 5.0) / 24.0, 0.1)
+    base = L * np.exp(lv[day] + shp + _w86e2_ar(r, M, r.uniform(0.7, 0.95), r.uniform(0.03, 0.08)))
+    wind = np.exp(r.uniform(0.5, 1.1) * _w86e2_smooth(r, M, P * r.uniform(0.08, 0.4)) - 0.7)
+    x = base - L * r.uniform(0.15, 0.5) * wind - L * r.uniform(0.5, 1.2) * r.beta(2.0, 1.5, nd)[day] \
+        * _w86e2_bump(tod, 13.0 / 24.0, 0.08) - L * r.uniform(0.2, 0.8) * _w86e2_bump(tod, 3.5 / 24.0, 0.1)
+    x = _w86e2_softneg(x, L * r.uniform(0.1, 0.4))
+    x = x * np.where(x > 0, 2.2, 1.0) + pk * L * r.uniform(0.6, 1.2)
+    return _w86e2_fq(x, 3)
+
+
+def _w86e2_px_gb(r, M, P, tod, day, dow, nd):
+    # GB market index / system prices (30-min): imbalance-driven noise, negatives, spikes; index rows with
+    # zero-volume periods priced at exactly 0
+    L = _w86e2_lu(r, 50.0, 110.0)
+    lv = _w86e2_ar(r, nd, r.uniform(0.5, 0.85), r.uniform(0.1, 0.25))
+    shp = r.uniform(0.2, 0.6) * _w86e2_bump(tod, r.uniform(17.0, 19.0) / 24.0, 0.06) \
+        - r.uniform(0.1, 0.3) * _w86e2_bump(tod, r.uniform(2.0, 5.0) / 24.0, 0.1)
+    x = L * np.exp(lv[day] + shp) + L * r.uniform(0.05, 0.3) * _w86e2_ar(r, M, r.uniform(0.3, 0.7), 1.0)
+    x = _w86e2_spikes(r, x, M, r.uniform(0.005, 0.03), L * r.uniform(0.3, 1.0), 0.35, r.uniform(0.0, 0.4))
+    x = _w86e2_softneg(x, L * r.uniform(0.2, 0.8))
+    if r.random() < 0.3:
+        x = _w86e2_holds(r, x, r.uniform(0.05, 0.2))
+    if r.random() < 0.35:
+        off = _w86e2_holds(r, r.random(M) < r.uniform(0.2, 0.6), r.uniform(0.5, 0.9))
+        if r.random() < 0.5:  # no volume traded since the last publication: zero-priced tail
+            off[-int(r.integers(64, 300)):] = True
+        x = np.where(off, 0.0, x)
+    return _w86e2_fq(x, 2)
+
+
+def _w86e2_px_latam(r, M, P, tod, day, dow, nd):
+    # hourly spot (colombia xm / simem): marginal-offer tranches held across hours, evening peak, jumps; no negatives
+    L = _w86e2_lu(r, 60.0, 900.0)
+    lv = _w86e2_ar(r, nd, r.uniform(0.6, 0.92), r.uniform(0.04, 0.15))
+    shp = r.uniform(0.6, 1.3) * _w86e2_bump(tod, r.uniform(18.5, 20.5) / 24.0, r.uniform(0.04, 0.08)) \
+        + r.uniform(0.0, 0.3) * _w86e2_bump(tod, r.uniform(10.0, 13.0) / 24.0, 0.1) \
+        - r.uniform(0.1, 0.4) * _w86e2_bump(tod, r.uniform(2.0, 5.0) / 24.0, 0.1)
+    x = L * np.exp(lv[day] + shp + _w86e2_ar(r, M, r.uniform(0.3, 0.8), r.uniform(0.01, 0.05)))
+    x = _w86e2_stack(r, x, int(r.integers(8, 20)), r.uniform(0.0, 0.004))
+    x = _w86e2_holds(r, x, r.uniform(0.2, 0.4))
+    x = x * (1.0 + (r.random(M) < r.uniform(0.0, 0.03)) * r.uniform(0.2, 1.0, M))
+    return _w86e2_fq(x, 2)
