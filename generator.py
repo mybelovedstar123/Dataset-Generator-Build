@@ -20204,3 +20204,291 @@ def _w86a_holds(r, y, P, p_stuck, p_end):
         L = int(min(S // 3, max(3, int(P * r.uniform(0.15, 1.5)))))
         y[S - L:] = y[S - L - 1]
     return y
+
+
+def _w86a_pollutant(r, S):
+    sp = ('no2', 'pm25', 'pm10', 'o3', 'no', 'co')[int(np.searchsorted(np.cumsum((0.3, 0.25, 0.18, 0.15, 0.07, 0.05)), r.random(), side='right'))]
+    P = (24, 48, 96)[int(np.searchsorted(np.cumsum((0.86, 0.09, 0.05)), r.random(), side='right'))]
+    S = int(S)
+    am, pm_ = r.uniform(7.0, 9.0), r.uniform(18.0, 21.5)
+    if sp in ('no2', 'co'):
+        a1, a2, amp = r.uniform(0.6, 1.0), r.uniform(0.5, 1.0), r.uniform(0.3, 0.8)
+        prof = lambda h: amp * (a1 * _w86a_bump(h, am, 1.6) + a2 * _w86a_bump(h, pm_, 2.6) - 0.5 * _w86a_bump(h, 14.5, 3.0))
+        key = 'no2'
+    elif sp == 'no':
+        amp = r.uniform(0.9, 2.2)
+        prof = lambda h: amp * (_w86a_bump(h, am, 1.4) + 0.4 * _w86a_bump(h, pm_ + 1.0, 2.5) - 0.8 * _w86a_bump(h, 14.0, 3.5))
+        key = 'no2'
+    elif sp == 'o3':
+        pk, amp = r.uniform(14.0, 17.0), r.uniform(0.25, 0.8)
+        prof = lambda h: amp * (_w86a_bump(h, pk, 3.5) - 0.35 * _w86a_bump(h, am, 1.5))
+        key = 'o3'
+    else:
+        amp = r.uniform(0.05, 0.35)
+        pe = r.uniform(19.0, 23.5)
+        prof = lambda h: amp * (_w86a_bump(h, pe, 2.5) + r_am * _w86a_bump(h, am, 1.5) - 0.5 * _w86a_bump(h, 15.0, 3.0))
+        r_am = r.uniform(0.2, 0.9)
+        key = 'pm'
+    h, day = _w86a_clock(r, S, P, prof, key)
+    dow = (day + int(r.integers(0, 7))) % 7
+    pr = prof(h)
+    pr = pr - pr.mean()
+    wk = np.ones(S)
+    if sp in ('no2', 'no', 'co'):
+        wk = np.where(dow >= 5, np.log(r.uniform(0.6, 0.9)), 0.0)
+    else:
+        wk = np.zeros(S)
+    # synoptic multi-day swings, inversion / pollution episodes, fast AR noise
+    syn = _w86a_smooth(r, S, P * r.uniform(0.7, 3.0), r.uniform(0.18, 0.45))
+    ep = np.zeros(S)
+    for _ in range(int(r.poisson(S / P / r.uniform(6.0, 20.0)))):
+        c = int(r.integers(0, S)); L = P * r.uniform(0.4, 3.0)
+        tt = (np.arange(S) - c) / L
+        ep += r.uniform(0.2, 0.8) * np.exp(-0.5 * tt * tt) * (1.0 if sp != 'o3' else 0.4)
+    fast = _w86a_ar(r, S, r.uniform(0.5, 0.88), r.uniform(0.1, 0.3))
+    if sp == 'o3':
+        lvl = 10.0 ** r.normal(1.65, 0.15)
+        y = lvl * (1.0 + pr) * np.exp(0.6 * syn + 0.4 * ep) + lvl * 0.15 * fast
+        y = np.maximum(y, r.uniform(0.0, 3.0))
+    else:
+        mu = {'no2': r.normal(1.2, 0.3), 'no': r.normal(0.55, 0.4), 'co': r.normal(2.4, 0.2),
+              'pm25': r.normal(0.85, 0.25), 'pm10': r.normal(1.15, 0.22)}[sp]
+        ly = mu * np.log(10.0) + pr + wk + syn + ep + fast
+        ly += r.normal(0.0, 0.1) * np.arange(S) / S
+        y = np.exp(ly)
+        ns = int(r.poisson(S * r.uniform(0.0005, 0.004)))
+        for _ in range(ns):                            # local sources: fires, works, fireworks
+            a = int(r.integers(0, S)); L = int(r.integers(1, 4))
+            y[a:a + L] *= r.uniform(1.8, 5.0)
+    y = _w86a_holds(r, y, P, 0.12, 0.05)
+    y = _w86a_round(r, y, ((1.0, 0.35), (0.1, 0.3), (0.001, 0.35)))
+    q = 1.0 if np.all(y == np.round(y)) else (0.1 if np.all(np.abs(y * 10 - np.round(y * 10)) < 1e-6) else 0.001)
+    if r.random() < 0.8:
+        y = np.maximum(y, q)
+    return np.maximum(y, 0.0)
+
+
+def _w86a_weather(r, S):
+    kd = ('temp', 'rh', 'wind', 'pres', 'water')[int(np.searchsorted(np.cumsum((0.6, 0.12, 0.14, 0.08, 0.06)), r.random(), side='right'))]
+    P = (144, 48, 24, 96, 288)[int(np.searchsorted(np.cumsum((0.25, 0.22, 0.36, 0.11, 0.06)), r.random(), side='right'))]
+    S = int(S)
+    hp = r.uniform(13.5, 16.0)
+    b2, p2 = r.uniform(0.0, 0.3), r.uniform(0.0, 24.0)
+    tprof = lambda h: np.cos(2 * np.pi * (h - hp) / 24.0) + b2 * np.cos(4 * np.pi * (h - p2) / 24.0)
+    if kd == 'temp' or kd == 'water':
+        h, day = _w86a_clock(r, S, P, tprof, 'temp')
+    elif kd == 'rh':
+        h, day = _w86a_clock(r, S, P, lambda hh: -tprof(hh), 'rh')
+    elif kd == 'wind':
+        h, day = _w86a_clock(r, S, P, lambda hh: _w86a_bump(hh, hp - 1.0, 4.0), 'wind')
+    else:
+        pp = r.uniform(0.0, 12.0)
+        h, day = _w86a_clock(r, S, P, lambda hh: np.cos(4 * np.pi * (hh - pp) / 24.0) + 0.3 * np.cos(2 * np.pi * (hh - pp) / 24.0), 'pres')
+    nd = int(day.max()) + 2
+    cloud = np.exp(_w86a_ar(r, nd, r.uniform(0.3, 0.8), r.uniform(0.2, 0.5)))[day]   # day-to-day diurnal range
+    syn = _w86a_smooth(r, S, P * r.uniform(1.5, 5.0), 1.0)
+    fr = np.zeros(S)
+    nf = int(r.poisson(S / P * r.uniform(0.05, 0.25)))
+    if nf:
+        imp = np.zeros(S)
+        imp[r.integers(0, S, nf)] = -r.exponential(1.0, nf) * np.where(r.random(nf) < 0.7, 1.0, -0.6)
+        fr = lfilter([1.0], [1.0, -np.exp(-1.0 / (P * r.uniform(0.5, 3.0)))], imp)
+    t = np.arange(S) / S
+    if kd == 'temp':
+        base = r.uniform(-2.0, 29.0)
+        A = r.uniform(1.5, 6.0) * (0.5 if base > 25 else 1.0)
+        y = base + A * cloud * tprof(h) + r.uniform(1.0, 4.5) * syn + r.uniform(1.0, 4.0) * fr
+        y += r.normal(-1.5, 2.0) * t + _w86a_ar(r, S, r.uniform(0.3, 0.9), r.uniform(0.05, 0.35))
+        rq = ((0.1, 0.6), (1.0, 0.12), (0.01, 0.18), (0.5, 0.05), (0.0, 0.05))
+    elif kd == 'water':
+        base = r.uniform(8.0, 24.0)
+        y = base + r.uniform(0.05, 0.8) * cloud * tprof(h - 2.0) + r.uniform(0.3, 1.5) * syn + 0.3 * fr
+        y += r.normal(-0.8, 1.0) * t + _w86a_ar(r, S, 0.9, r.uniform(0.005, 0.05))
+        rq = ((0.01, 0.5), (0.1, 0.4), (0.001, 0.1))
+    elif kd == 'rh':
+        y = r.uniform(60.0, 88.0) - r.uniform(6.0, 22.0) * cloud * tprof(h) + r.uniform(5.0, 12.0) * syn - r.uniform(3.0, 10.0) * fr
+        y += _w86a_ar(r, S, r.uniform(0.4, 0.9), r.uniform(0.5, 3.0))
+        y = np.clip(y, r.uniform(10.0, 30.0), 100.0)
+        rq = ((1.0, 0.8), (0.1, 0.2))
+    elif kd == 'wind':
+        lw = 0.45 * syn + r.uniform(0.1, 0.5) * cloud * (_w86a_bump(h, hp - 1.0, 4.0) - 0.35) + 0.3 * np.maximum(-fr, 0.0)
+        y = r.uniform(1.5, 6.0) * np.exp(lw + _w86a_ar(r, S, r.uniform(0.3, 0.8), r.uniform(0.15, 0.35)))
+        rq = ((0.1, 0.5), (1.0, 0.25), (0.514444, 0.15), (0.01, 0.1))
+    else:
+        y = r.uniform(995.0, 1025.0) + r.uniform(3.0, 10.0) * _w86a_smooth(r, S, P * r.uniform(1.5, 4.0), 1.0)
+        y += r.uniform(0.3, 1.0) * np.cos(4 * np.pi * (h - pp) / 24.0) + _w86a_ar(r, S, 0.8, 0.05)
+        rq = ((0.1, 0.8), (0.01, 0.2))
+    y = _w86a_holds(r, y, P, 0.1, 0.05)
+    return _w86a_round(r, y, rq)
+
+
+# ---- rates / FX / crypto records (weak/w86rates/w86rates_append.py) ----
+# Real records in the pool (weak/w86rates/rates_real.py, 5 snapshots 09-23..09-27, 45 sources, 229 channels):
+#  * policy rates (riksbank, boc, bis_cbpol, bis panels): calendar-daily, held flat (rep .99), a change every
+#    ~100-140 days (7-11 per 1000) in 25 bp units (BoC 25/50), 2 dp; at the record end the last change is
+#    6..320 days back (median ~110), so the last 64 steps are flat in ~85% of records;
+#  * daily FX (ecb reference panel, boc, norges, boi_il): business days only (weekends/holidays are MISSING,
+#    not held: rep .002-.02), log-return kurtosis 6-8, r(|ret|) lag1 .1-.2, ~5 significant digits;
+#  * daily yields (ecb curve, treasury, riksbank gvb, bund): small daily moves (bp), trend episodes, treasury 2 dp
+#    (rep .28), fixings with measurement noise (ecb_stp acf1 -.5), kurtosis 5-20, r(|ret|) .15-.3;
+#  * crypto (coinbase, kraken, bitstamp, okx, kucoin; 1m/5m/15m/30m/H): 24/7 random walk with GARCH-like vol
+#    clustering (r(|ret|) .15-.3, kurtosis 7-20), a tick grid (1m rep .02-.14), an intraday vol profile
+#    (max/mean 1.3-2.0) and records that end ~.53 day after the vol peak (fixed cut time -> end vol below mean).
+_W86R_MKT = (('fx', 'yield', 'crypto'), (0.40, 0.25, 0.35))
+_W86R_CFREQ = ((1440, 288, 96, 48, 24), (0.35, 0.15, 0.38, 0.03, 0.09))
+# crypto end phase = (steps since the intraday |ret| profile max) / day, real deciles (weak/w86rates/crypto_phase.py)
+_W86R_PHQ = np.linspace(0.0, 1.0, 11)
+_W86R_CPH = np.array((0.0, 0.25, 0.39, 0.51, 0.52, 0.53, 0.54, 0.55, 0.64, 0.82, 0.99))
+# policy: days since the last change at the record end (real quantiles 0/.1/.25/.5/.75/.9/1 widened)
+_W86R_TRQ = np.array((0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0))
+_W86R_TRV = np.array((1.0, 6.0, 20.0, 106.0, 230.0, 330.0, 700.0))
+
+
+def _w86r_pick(r, vals, probs):
+    return vals[int(np.searchsorted(np.cumsum(probs), r.random() * float(np.sum(probs))))]
+
+
+def _w86r_lu(r, a, b):
+    return float(np.exp(r.uniform(np.log(a), np.log(b))))
+
+
+def _w86r_garch(r, m, a_lo=0.03, a_hi=0.12):
+    # unit-variance GARCH(1,1) path with standardised Student-t innovations (fat tails + vol clustering)
+    nu = r.uniform(3.3, 8.0)
+    z = np.clip(r.standard_t(nu, m) / np.sqrt(nu / (nu - 2.0)), -14.0, 14.0)
+    a = r.uniform(a_lo, a_hi)
+    b = max(r.uniform(0.9, 0.993) - a, 0.0)
+    w = 1.0 - a - b
+    out = np.empty(m)
+    h = 1.0
+    for t in range(m):
+        e = np.sqrt(h) * z[t]
+        out[t] = e
+        h = w + a * min(e * e, 60.0) + b * h
+    return out
+
+
+def _w86r_ar(r, m, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 1.0)))
+    e = r.standard_normal(m) * sd * np.sqrt(1.0 - phi * phi)
+    out = np.empty(m)
+    p = r.standard_normal() * sd
+    for t in range(m):
+        p = phi * p + e[t]
+        out[t] = p
+    return out
+
+
+def _w86r_sig_round(x, L, sig):
+    dp = int(np.clip(sig - 1 - np.floor(np.log10(max(abs(L), 1e-9))), 0, 8))
+    return np.round(x, dp)
+
+
+def _w86r_fx(r, N):
+    # business-day FX fixing: the level anchors the END (last value), GARCH-t log returns, slow drift episodes
+    u = r.random()
+    L = _w86r_lu(r, 0.3, 160.0) if u < 0.8 else _w86r_lu(r, 0.004, 0.3) if u < 0.93 else _w86r_lu(r, 160.0, 20000.0)
+    v = r.random()
+    sd = _w86r_lu(r, 0.0025, 0.008) if v < 0.8 else _w86r_lu(r, 0.008, 0.02) if v < 0.95 else _w86r_lu(r, 2e-5, 4e-4)
+    lr = sd * _w86r_garch(r, N, 0.06, 0.17) + sd * r.uniform(0.02, 0.12) * _w86r_ar(r, N, _w86r_lu(r, 30.0, 250.0), 1.0)
+    c = np.cumsum(lr)
+    x = L * np.exp(c - c[-1])
+    x = _w86r_sig_round(x, L, int(r.integers(4, 7)))
+    rp = r.uniform(0.0, 0.012)                      # rare repeated fixings (holiday carry-over)
+    if rp > 0.0:
+        h = r.random(N) < rp
+        h[0] = False
+        x = x[np.maximum.accumulate(np.where(h, 0, np.arange(N)))]
+    return x
+
+
+def _w86r_yield(r, N):
+    # business-day yield in percent: small daily bp moves (GARCH-t), trend regimes, optional fixing noise
+    L = r.uniform(-0.4, 5.5) if r.random() < 0.88 else r.uniform(5.5, 12.0)
+    sd = _w86r_lu(r, 2.0, 9.0) / 100.0
+    d = sd * _w86r_garch(r, N, 0.06, 0.17) + sd * r.uniform(0.05, 0.3) * _w86r_ar(r, N, _w86r_lu(r, 60.0, 400.0), 1.0)
+    x = np.cumsum(d)
+    x = x - x[-1] + L
+    if r.random() < 0.25:                            # money-market fixings: iid measurement noise (acf1 < 0)
+        x = x + sd * r.uniform(0.3, 0.9) * r.standard_normal(N)
+    k = r.random()
+    return np.round(x, 2) if k < 0.4 else np.round(x, 3) if k < 0.65 else np.round(x, int(r.integers(4, 7)))
+
+
+def _w86r_crypto(r, n):
+    P = int(_w86r_pick(r, *_W86R_CFREQ))
+    N = 4096 if r.random() < 0.72 else int(np.clip(n, 512, 4096))
+    M = N + P
+    L = _w86r_lu(r, 0.03, 90000.0)
+    sd = _w86r_lu(r, 0.012, 0.06) / np.sqrt(P)       # per-step log-return sd from a 1.2-6% daily sd
+    off = int(r.integers(0, P))
+    ab = np.arange(M) + off
+    tod = (ab % P) / float(P)
+    dow = ((ab // P + int(r.integers(0, 7))) % 7)
+    pk = r.random()
+    A, A2 = r.uniform(0.15, 0.55), r.uniform(0.0, 0.2)
+    v = np.maximum(1.0 + A * np.cos(2.0 * np.pi * (tod - pk)) + A2 * np.cos(4.0 * np.pi * (tod - r.random())), 0.25)
+    v = v * np.where(dow >= 5, r.uniform(0.6, 0.95), 1.0)
+    lr = sd * v * _w86r_garch(r, M, 0.04, 0.14)
+    # end phase lock: the record ends where (steps since the vol-profile max) / P matches a real end phase
+    ph = float(np.interp(r.random(), _W86R_PHQ, _W86R_CPH))
+    tgt = (pk + ph) % 1.0
+    cand = np.arange(N - 1, M)
+    e = int(cand[np.argmin(np.abs(((tod[cand] - tgt) + 0.5) % 1.0 - 0.5))])
+    lr = lr[e - N + 1:e + 1]
+    c = np.cumsum(lr)
+    x = L * np.exp(c - c[-1])
+    # tick grid (1m: frequent unchanged minutes) and occasional stale prints
+    tick = 10.0 ** np.round(np.log10(L * sd * _w86r_lu(r, 0.01, 0.35 if P >= 288 else 0.1)))
+    x = np.round(x / tick) * tick
+    x = np.round(x, int(np.clip(-np.floor(np.log10(tick)), 0, 10)))
+    if P >= 288 and r.random() < 0.3:
+        h = r.random(N) < r.uniform(0.0, 0.06)
+        h[0] = False
+        x = x[np.maximum.accumulate(np.where(h, 0, np.arange(N)))]
+    return x
+
+
+def _w86r_policy(r, n):
+    # calendar-daily policy rate: meetings every ~6-8 weeks, easing/tightening cycles of 25/50 bp moves, long holds
+    N = int(np.clip(n, 300, 4096))
+    M = N + 900
+    u = r.random()
+    L = r.uniform(0.5, 5.5) if u < 0.72 else r.uniform(5.5, 14.0) if u < 0.87 else r.uniform(-0.75, 0.5)
+    floor = min(L, r.choice([-0.75, -0.5, 0.0, 0.0, 0.05, 0.1, 0.25]))
+    em = L > 5.5
+    gap = r.uniform(35.0, 60.0)
+    t = float(r.uniform(0.0, gap))
+    x = np.empty(M)
+    lvl, state, last = L, 0, 0
+    p_start, p_end, p_move = r.uniform(0.08, 0.26), 1.0 / r.uniform(3.0, 8.0), r.uniform(0.55, 0.95)
+    sizes = (0.25, 0.5, 0.75, 0.1, 0.15, 1.0)
+    sw = (0.64, 0.2, 0.06, 0.03, 0.03, 0.04) if not em else (0.35, 0.3, 0.12, 0.03, 0.03, 0.17)
+    while last < M:
+        nxt = min(int(t + gap * r.uniform(0.9, 1.1)), M)
+        x[last:nxt] = lvl
+        last = nxt
+        t = float(nxt)
+        if state == 0:
+            if r.random() < p_start:  # direction leans back toward the anchor level (no runaway drift)
+                state = 1 if r.random() < float(np.clip(0.5 + 0.12 * (L - lvl), 0.1, 0.9)) else -1
+        elif r.random() < p_end:
+            state = 0
+        if state != 0 and r.random() < p_move:
+            lvl = max(round(lvl + state * _w86r_pick(r, sizes, sw), 4), floor)
+        elif state == 0 and r.random() < 0.03:       # rare off-cycle emergency move
+            lvl = max(round(lvl - _w86r_pick(r, (0.25, 0.5, 1.0), (0.4, 0.4, 0.2)), 4), floor)
+    d = np.flatnonzero(np.diff(x) != 0) + 1          # change points
+    T = float(np.interp(r.random(), _W86R_TRQ, _W86R_TRV))
+    if d.size:
+        ends = np.arange(N - 1, M)
+        prev = np.searchsorted(d, ends, side='right') - 1
+        tr = np.where(prev >= 0, ends - d[np.maximum(prev, 0)], ends + 1)
+        e = int(ends[np.argmin(np.abs(tr - T) + 1e-3 * r.random(ends.size))])
+    else:
+        e = M - 1
+    x = x[e - N + 1:e + 1].copy()
+    if not np.any(x != x[0]):                        # at least one move inside the record
+        k = int(np.clip(N - 1 - T, 1, N - 1))
+        x[k:] = max(round(x[0] + (0.25 if r.random() < 0.5 else -0.25), 4), floor - 0.25)
+    return np.round(x, 3 if r.random() < 0.1 else 2)
