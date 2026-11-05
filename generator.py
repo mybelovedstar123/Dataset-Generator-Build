@@ -20796,3 +20796,82 @@ class Generator(_K2Parent):
 # block's own tag; on success (same quiet rule, integer-valued records skipped as by the champion) one row of a separate stream is stacked under it as
 # channel 1 (left-padded, own rng per row, same keep test as the champion's weakness rows).
 _S1_Q = 0.8000
+_S1_COIN_TAG = 0x51C0C006
+_S1_XOR = 0x51C05E06
+_S1_TAG = 0x51C0BA06
+_FORK_DEDUP_TAG = 1110712
+
+
+def _s1_ed_one(r):
+    return _t2ed_share(r, 1, 4096)[0]
+
+
+def _s1_web_one(r):
+    return _t2_web_counter(r, 1, 4096)[0]
+
+
+def _s1_station_one(r):
+    return _sticky_station(r, 1, 4096)[0]
+
+
+_S1_FAMILIES = (("s1_civic", _w86b_civic_one, 0.6000), ("s1_energy", _w86b_energy_one, 0.4000))
+_S1_CUM = np.cumsum([w for _, _, w in _S1_FAMILIES]) / sum(w for _, _, w in _S1_FAMILIES)
+
+
+class _S1Stream:
+    """Rows of the s1 stream, one per call, each from its own rng."""
+
+    def __init__(self, seed):
+        self._seed = int(seed) & ((1 << 64) - 1)
+        self._k = 0
+        self.last_fam = -1
+
+    def next(self, L):
+        r = np.random.default_rng(np.random.SeedSequence([self._seed, _S1_TAG], spawn_key=(self._k,)))
+        self._k += 1
+        f = int(np.searchsorted(_S1_CUM, r.random() * 0.999999))
+        self.last_fam = f
+        with np.errstate(all="ignore"):
+            return _w86b_row(r, int(L), _S1_FAMILIES[f][1])
+
+
+_S1Parent = Generator
+
+
+class Generator(_S1Parent):
+    """The champion's records unchanged; one more stream added as channel 1 on records it leaves univariate."""
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        self._s1_stream = _S1Stream((int(self._seed) ^ _S1_XOR) & ((1 << 64) - 1))
+
+    @property
+    def name(self) -> str:
+        return 'km2q70b8s1'
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if _S1_Q > 0.0 and np.ndim(x) == 1:
+                    u = np.random.default_rng(np.random.SeedSequence([seed, _S1_COIN_TAG], spawn_key=(i,))).random()
+                    if u < _S1_Q and not _k87_quiet(x) and not _w86b_intlike(x):
+                        z = _w86b_add(self._s1_stream, x)
+                        if z is not None:
+                            x = z
+                yield x
+        finally:
+            base.close()
+
+
+# ═══════════════ s2: pool-shaped channels on records the parent leaves univariate ═══════════════
+# Parent class unchanged: every record it yields is yielded here in order, as the same object, unless it is STILL
+# univariate. Such a record draws an independent coin under this block's tag; on success (same quiet rule) it gets
+# channels from one s2 family stacked under it: short left-padded pool-shaped series (live counts that move every
+# step, decimal-grid prices/rates/sensors, ED-visit percentage waves, sub-hourly spiky prices, holds that resume) or
+# channels DERIVED from the record itself (dock = capacity - count for count rows; a coupled sensor partner otherwise).
+_S2_Q = 0.6000
