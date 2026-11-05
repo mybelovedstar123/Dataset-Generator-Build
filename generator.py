@@ -20875,3 +20875,165 @@ class Generator(_S1Parent):
 # step, decimal-grid prices/rates/sensors, ED-visit percentage waves, sub-hourly spiky prices, holds that resume) or
 # channels DERIVED from the record itself (dock = capacity - count for count rows; a coupled sensor partner otherwise).
 _S2_Q = 0.6000
+_S2_COIN_TAG = 0x52C0C01B
+_S2_XOR = 0x52C05E1B
+_S2_TAG = 0x52C0BA1B
+_FORK_DEDUP_TAG = 1110773
+
+
+def _s2_len(r):
+    u = r.random()
+    if u < 0.40:
+        return int(r.integers(200, 1000))
+    if u < 0.75:
+        return int(r.integers(1000, 3000))
+    return int(r.integers(3000, 4097))
+
+
+def _s2_count_live(r):
+    n = _s2_len(r)
+    per = float(r.choice([24.0, 48.0, 96.0, 144.0, 288.0, 7.0]))
+    t = np.arange(n, dtype=np.float64)
+    base = 10.0 ** r.uniform(0.7, 4.3)
+    amp = r.uniform(0.05, 0.7)
+    ph = r.uniform(0.0, 2.0 * np.pi)
+    cyc = 1.0 + amp * np.sin(2.0 * np.pi * t / per + ph) + 0.3 * amp * np.sin(4.0 * np.pi * t / per + 2.0 * ph)
+    trend = np.exp(np.cumsum(r.normal(0.0, r.uniform(0.0005, 0.01), n)))
+    lam = np.maximum(base * np.maximum(cyc, 0.05) * trend, 0.05)
+    return r.poisson(lam * np.exp(r.normal(0.0, r.uniform(0.0, 0.3), n))).astype(np.float64)
+
+
+def _s2_decgrid(r):
+    kind = int(r.integers(0, 5))
+    n = _s2_len(r)
+    t = np.arange(n, dtype=np.float64)
+    if kind == 0:
+        y = 10.0 ** r.uniform(-1.0, 2.0) * np.exp(np.cumsum(r.normal(0.0, r.uniform(0.0008, 0.008), n)))
+        dp = int(r.integers(3, 6))
+    elif kind == 1:
+        y = r.uniform(0.3, 6.0) + np.cumsum(r.normal(0.0, r.uniform(0.005, 0.05), n))
+        dp = int(r.integers(2, 4))
+    elif kind == 2:
+        y = r.uniform(20.0, 400.0) * np.exp(np.cumsum(r.normal(0.0, r.uniform(0.002, 0.02), n)))
+        dp = 2
+    elif kind == 3:
+        per = float(r.choice([24.0, 144.0, 96.0]))
+        y = (r.uniform(-5.0, 30.0) + r.uniform(1.5, 10.0) * np.sin(2.0 * np.pi * t / per + r.uniform(0.0, 6.28))
+             + np.cumsum(r.normal(0.0, 0.04, n)))
+        dp = 1
+    else:
+        sph = float(r.choice([1.0, 4.0, 6.0, 12.0]))
+        y = (r.uniform(0.5, 5.0) + r.uniform(0.3, 2.5) * np.sin(2.0 * np.pi * t / (12.42 * sph) + r.uniform(0.0, 6.28))
+             + r.uniform(0.05, 0.6) * np.sin(2.0 * np.pi * t / (24.84 * sph)) + r.normal(0.0, 0.02, n))
+        dp = int(r.integers(2, 4))
+    return np.round(y, dp)
+
+
+def _s2_cdcpct(r):
+    n = int(r.integers(300, 900))
+    t = np.arange(n, dtype=np.float64)
+    y = np.full(n, r.uniform(0.3, 3.0))
+    for _ in range(int(r.integers(1, 4))):
+        y = y + r.uniform(0.5, 8.0) * np.exp(-0.5 * ((t - r.uniform(0.0, n)) / r.uniform(15.0, 60.0)) ** 2)
+    y = y * np.exp(r.normal(0.0, r.uniform(0.02, 0.08), n)) * (1.0 + 0.05 * np.sin(2.0 * np.pi * t / 7.0 + r.uniform(0.0, 6.28)))
+    return np.round(np.clip(y, 0.01, 60.0), 2)
+
+
+def _s2_spikyprice(r):
+    n = _s2_len(r)
+    per = float(r.choice([288.0, 48.0, 96.0, 24.0]))
+    t = np.arange(n, dtype=np.float64)
+    base = r.uniform(20.0, 150.0)
+    shape = 1.0 + r.uniform(0.1, 0.5) * np.sin(2.0 * np.pi * t / per - 1.5) + 0.2 * np.sin(4.0 * np.pi * t / per)
+    y = base * shape * np.exp(0.5 * np.cumsum(r.normal(0.0, 0.01, n))) + r.normal(0.0, base * 0.05, n)
+    sp = r.random(n) < r.uniform(0.002, 0.02)
+    y[sp] = y[sp] * r.uniform(2.0, 15.0, int(sp.sum()))
+    ng = r.random(n) < r.uniform(0.0, 0.01)
+    y[ng] = -r.uniform(0.0, 50.0, int(ng.sum()))
+    return np.round(y, 2)
+
+
+def _s2_holdresume(r):
+    n = _s2_len(r)
+    y = np.cumsum(r.normal(0.0, 1.0, n)) + r.uniform(10.0, 100.0)
+    a = int(n * r.uniform(0.3, 0.8))
+    b = min(n - int(r.integers(5, 100)), a + int(r.integers(16, 400)))
+    if b > a:
+        y[a:b] = y[a]
+    return np.round(y, int(r.integers(0, 3)))
+
+
+_S2_FAMILIES = (("s2_holdresume", _s2_holdresume, 0.5000), ("s2_spikyprice", _s2_spikyprice, 0.5000))
+_S2_CUM = np.cumsum([w for _, _, w in _S2_FAMILIES]) / sum(w for _, _, w in _S2_FAMILIES)
+
+
+def _s2_corr(r, x):
+    """Channels derived from the record itself: count rows -> dock = capacity - count (strong anti-correlation, the
+    station-status layout); other rows -> one coupled sensor partner (affine copy + its own noise and lag)."""
+    x = np.asarray(x, dtype=np.float64)
+    if x.size and np.mean(x[-512:] == np.round(x[-512:])) >= 0.98 and np.nanmin(x) >= 0.0:
+        cap = float(np.nanmax(x)) + float(r.integers(0, 6))
+        dock = np.maximum(cap - x, 0.0)
+        return dock[None, :]
+    lag = int(r.integers(0, 4))
+    a = r.uniform(0.5, 2.0) * r.choice([-1.0, 1.0])
+    b = r.uniform(-1.0, 1.0) * (np.nanstd(x) + 1e-9)
+    y = a * np.roll(x, lag) + b + r.normal(0.0, r.uniform(0.02, 0.2) * (np.nanstd(x) + 1e-9), x.size)
+    y[:lag] = y[lag] if lag < y.size else y[:lag]
+    return y[None, :]
+
+
+class _S2Stream:
+    def __init__(self, seed):
+        self._seed = int(seed) & ((1 << 64) - 1)
+        self._k = 0
+
+    def rng(self):
+        r = np.random.default_rng(np.random.SeedSequence([self._seed, _S2_TAG], spawn_key=(self._k,)))
+        self._k += 1
+        return r
+
+
+_S2Parent = Generator
+
+
+class Generator(_S2Parent):
+    """Parent records unchanged; pool-shaped s2 channels stacked under a share of records the parent leaves univariate."""
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        self._s2_stream = _S2Stream((int(self._seed) ^ _S2_XOR) & ((1 << 64) - 1))
+
+    @property
+    def name(self) -> str:
+        return 'km2q70b8s1s2hs'
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if _S2_Q > 0.0 and np.ndim(x) == 1 and np.asarray(x).size >= 64:
+                    u = np.random.default_rng(np.random.SeedSequence([seed, _S2_COIN_TAG], spawn_key=(i,))).random()
+                    if u < _S2_Q and not _k87_quiet(x):
+                        r = self._s2_stream.rng()
+                        f = int(np.searchsorted(_S2_CUM, r.random() * 0.999999))
+                        try:
+                            with np.errstate(all="ignore"):
+                                if _S2_FAMILIES[f][0] == "s2_corr":
+                                    add = _s2_corr(r, x)
+                                else:
+                                    add = _w86b_row(r, np.asarray(x).size, _S2_FAMILIES[f][1])[None, :]
+                            z = np.vstack([np.asarray(x, dtype=np.float64)[None, :], add])
+                            np.clip(z, -1e30, 1e30, out=z)
+                            if (np.all(np.isfinite(z)) and np.array_equal(z[0], x)
+                                    and np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12))):
+                                x = z
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
