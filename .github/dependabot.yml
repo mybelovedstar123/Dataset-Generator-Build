@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # Keep the actions used by CI current. Python dependencies are hash-pinned
+  # in requirements.txt and updated by hand.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
