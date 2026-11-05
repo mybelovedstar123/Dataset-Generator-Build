@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Compile generator.py
+        run: python -m py_compile generator.py
+
+      - name: Lint for syntax and runtime errors
+        run: |
+          pip install --disable-pip-version-check --quiet ruff==0.13.1
+          ruff check --no-cache --isolated --select E9,F63,F7 --output-format github generator.py
+
+      - name: Validate JSON files
+        run: |
+          for f in *.json; do
+            python -m json.tool "$f" > /dev/null
+            echo "ok  $f"
+          done
+
+      - name: Check requirements.txt pins
+        run: python .github/scripts/check_requirements.py requirements.txt
