@@ -19950,3 +19950,257 @@ def _w86e2_flow(r, M, P, tod, day, dow):
         T = int(np.exp(r.uniform(np.log(64.0), np.log(600.0))))
         x[-T:] = x[-T - 1]
     return _w86e2_fq(x, 0 if r.random() < 0.2 else 2)
+
+
+def _w86e2_ci(r, M, P, tod, day, dow):
+    # carbon intensity (g/kWh): weather-driven multi-hour swings (wind / solar share) over a weak diurnal, smooth
+    # at the step level, occasional mix jumps; energy_charts 15-min rows 1 dp, GB / energinet rows integer
+    nd = int(day[-1]) + 1
+    B = r.uniform(50.0, 600.0)
+    lv = _w86e2_ar(r, nd, r.uniform(0.5, 0.9), r.uniform(0.04, 0.15))
+    shp = -r.uniform(0.2, 0.6) * _w86e2_bump(tod, r.uniform(12.0, 14.0) / 24.0, r.uniform(0.07, 0.12)) \
+        + r.uniform(0.0, 0.25) * _w86e2_bump(tod, r.uniform(17.0, 20.0) / 24.0, 0.1)
+    z = lv[day] + shp + r.uniform(0.08, 0.22) * _w86e2_smooth2(r, M, P * r.uniform(0.04, 0.2)) \
+        + r.uniform(0.1, 0.3) * _w86e2_ar_e((r.random(M) < r.uniform(0.005, 0.03)) * r.standard_normal(M), 0.9)
+    x = B * np.exp(z)
+    if P == 288:
+        x = _w86e2_holds(r, x, r.uniform(0.15, 0.35))
+    return _w86e2_fq(x, 1 if (P == 96 and r.random() < 0.9) else 0)
+
+
+def _w86e2_make(r, kind, sub):
+    ck = sub if kind == 'gen' else kind
+    _W86E2_LAST[0] = sub
+    _W86E2_LAST[2] = ''
+    cads, cp = _W86E2_CAD[ck]
+    P = int(_w86e2_pick(r, cads, cp))
+    _W86E2_LAST[1] = P
+    N = int(np.clip(np.interp(r.random(), _W86E2_LQ, np.array(_W86E2_LEN[P], dtype=np.float64)), 256, 4096))
+    M = N + P
+    off = int(r.integers(0, P))
+    ab = np.arange(M) + off
+    tod = (ab % P) / float(P)
+    day = ab // P
+    dow = ((day + int(r.integers(0, 7))) % 7).astype(np.intp)
+    if kind == 'price':
+        x = _w86e2_price(r, M, P, tod, day, dow)
+    elif kind == 'load':
+        x = _w86e2_load(r, M, P, tod, day, dow)
+    elif kind == 'gen':
+        x = {'solar': _w86e2_solar, 'wind': _w86e2_wind, 'fuel': _w86e2_fuel, 'total': _w86e2_total}[sub](r, M, P, tod, day, dow)
+    elif kind == 'flow':
+        x = _w86e2_flow(r, M, P, tod, day, dow)
+    elif kind == 'unit':
+        x = _w86e2_unit(r, M, P, tod, day, dow)
+    else:
+        x = _w86e2_ci(r, M, P, tod, day, dow)
+    x = np.nan_to_num(np.asarray(x, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    # phase lock: end the record where (steps since the daily-profile max) / P matches a real end phase
+    phk = (ck if ck in ('solar', 'fuel') else ('fuel' if ck == 'total' else kind), P)
+    e = -1
+    if ck == 'solar' and P == 96 and _W86E2_WIN[0] is not None:
+        # end a real number of steps after the last in-window reading (the pool cuts ~7 h after sunset)
+        w = _W86E2_WIN[0]
+        T = int(round(float(np.interp(r.random(), _W86E2_LQ, np.array(_W86E2_SOLT)))))
+        c = np.flatnonzero(w[:-1] & ~w[1:]) + T
+        c = c[(c >= N - 1) & (c <= M - 1)]
+        if c.size:
+            e = int(c[-1])
+    _W86E2_WIN[0] = None
+    if e < 0 and phk in _W86E2_PH:
+        K = M // P
+        Mx = x[M - K * P:].reshape(K, P)
+        prof = (Mx - Mx.mean(axis=1, keepdims=True))[-min(K, 14):].mean(axis=0)
+        a = (M - K * P) + int(np.argmax(prof))           # absolute index of a profile max
+        ph = float(np.interp(r.random(), _W86E2_PHQ, np.array(_W86E2_PH[phk])))
+        e = a + int(round(ph * P))
+        e = N - 1 + ((e - (N - 1)) % P)                  # in [N-1, N+P-1]
+    elif e < 0:
+        e = N - 1 + int(r.integers(0, P + 1))
+    e = min(e, M - 1)
+    x = x[e - N + 1:e + 1]
+    if kind == 'ci' and P == 96 and r.random() < 0.9:  # latest ~day not yet published: forward-filled end
+        T = int(r.integers(64, 130))
+        x = x.copy(); x[-T:] = x[-T - 1]
+    if not np.any(x != x[0]):
+        x = x.copy(); x[-1] = x[-1] + 1.0
+    return np.ascontiguousarray(x, dtype=np.float64)
+
+
+def _w86e2_record(r, fam):
+    kind = _W86E2_KINDS[int(np.searchsorted(np.cumsum(_W86E2_FAMS[fam]), r.random() * 0.999999))]
+    sub = kind
+    if kind == 'gen':
+        sub = 'solar' if fam == 'solar_pv_output' else _w86e2_pick(r, *_W86E2_GENSUB)
+    return _w86e2_make(r, kind, sub)
+
+
+# ---- civic event-stream hourly counts (weak/w86civic_append.py) ----
+# Real hourly/half-hourly civic volumes (911/fire/EMS/police dispatch, crime incidents, 311 requests;
+# 26 series in pool 2026-09-27, weak/civic_real_h.py) are aggregated EVENT STREAMS:
+#  * an empty bucket is never emitted, so the series has no zeros at all (26/26), even at median 1-2;
+#  * the last bucket is the hour still being filled: x[-1] / same-hour mean median .57 (p10 .10) and
+#    x[-1] is the minimum of the last day in 58% of series; 311 feeds lag several hours (dallas: .07);
+#  * the diurnal profile is moderate (min/max of the mean day .45-.7 for 911/fire/police, ~.06 for
+#    311 office hours), weekly min/max .7-.9 (311 ~.45), Fano ~2 (NB, rare surges).
+def _w86c_day_profile(rng, P, office):
+    ph = np.arange(P, dtype=np.float64) / P
+    if office:
+        # 311 / service requests: office hours, peak late morning, deep night trough
+        peak = rng.uniform(0.40, 0.52)
+        width = rng.uniform(0.10, 0.17)
+        d = (ph - peak + 0.5) % 1.0 - 0.5
+        lp = -0.5 * (d / width) ** 2
+        lp += rng.uniform(0.0, 0.25) * np.cos(2.0 * np.pi * (ph - rng.uniform(0.55, 0.75)))
+        trough = float(np.exp(rng.uniform(np.log(0.03), np.log(0.22))))
+    else:
+        # 911 / fire / EMS / police / crime: trough ~4-6 am, broad afternoon-evening plateau
+        lp = np.zeros(P)
+        pk = rng.uniform(0.60, 0.80)
+        for h, a in ((1, 1.0), (2, rng.uniform(0.1, 0.45)), (3, rng.uniform(0.0, 0.2))):
+            lp += a * np.cos(2.0 * np.pi * h * (ph - pk) + (0.0 if h == 1 else rng.uniform(0, 2 * np.pi)))
+        trough = float(np.exp(rng.uniform(np.log(0.18), np.log(0.75))))
+    span = lp.max() - lp.min()
+    lp = (lp - lp.max()) / (span if span > 1e-9 else 1.0) * np.log(1.0 / trough)
+    p = np.exp(lp)
+    return p / p.mean()
+
+
+def _w86c_event_hourly(rng, n):
+    P = 48 if rng.random() < 0.2 else 24
+    office = rng.random() < 0.3
+    lvl = float(np.clip(rng.normal(0.72 + (0.35 if office else 0.0), 0.55), -0.15, 2.6))
+    mu = 10.0 ** lvl / (P / 24.0)
+    m = int(n * 1.25) + 8 * P
+    for _ in range(4):
+        t = np.arange(m)
+        ph0 = int(rng.integers(0, P))
+        day = (t + ph0) // P
+        prof = _w86c_day_profile(rng, P, office)
+        wk = np.exp(rng.normal(0.0, 0.05, 7))
+        if office:
+            wk[5:] *= rng.uniform(0.3, 0.75)
+        else:
+            wk[4:6] *= rng.uniform(1.0, 1.15)   # Fri/Sat nights
+            wk[6] *= rng.uniform(0.85, 1.05)
+        wk /= wk.mean()
+        dow = (day + int(rng.integers(0, 7))) % 7
+        # holidays: a few whole days with office dips / emergency shifts
+        nd = int(day.max()) + 1
+        hol = np.zeros(nd)
+        for _h in range(int(rng.poisson(nd / 60.0))):
+            hol[int(rng.integers(0, nd))] = np.log(rng.uniform(0.3, 0.7)) if office else rng.normal(0.0, 0.15)
+        # slow drift: daily AR(1) in log + small trend, rare multi-hour surges (storms, events)
+        phi = rng.uniform(0.6, 0.95)
+        e = rng.normal(0.0, rng.uniform(0.03, 0.12) * np.sqrt(1.0 - phi * phi), nd)
+        dl = np.empty(nd)
+        dl[0] = e[0] / np.sqrt(1.0 - phi * phi)
+        for j in range(1, nd):
+            dl[j] = phi * dl[j - 1] + e[j]
+        trend = rng.normal(0.05, 0.15) * (t / m)
+        logr = np.log(mu) + np.log(prof[(t + ph0) % P]) + np.log(wk[dow]) + dl[day] + hol[day] + trend
+        ns = int(rng.poisson(m / (P * rng.uniform(15.0, 90.0))))
+        if ns:
+            imp = np.zeros(m)
+            np.add.at(imp, rng.integers(0, m, ns), rng.uniform(0.3, 1.3, ns))
+            logr += lfilter([1.0], [1.0, -np.exp(-1.0 / rng.uniform(1.0, 0.25 * P))], imp)
+        k = float(np.exp(rng.uniform(np.log(3.0), np.log(80.0))))
+        rate = np.exp(logr) * rng.gamma(k, 1.0 / k, m)
+        c = rng.poisson(np.minimum(rate, 1e6)).astype(np.float64)
+        # end of window: reporting lag (311: several buckets still filling) and the open last bucket
+        if office and rng.random() < 0.35:
+            L = int(rng.integers(2, 10))
+            frac = 1.0 - (1.0 - rng.uniform(0.02, 0.4)) * np.exp(-np.arange(L)[::-1] / rng.uniform(1.0, 4.0))
+            c[m - L:] = rng.binomial(c[m - L:].astype(np.int64), np.clip(frac, 0.0, 1.0)).astype(np.float64)
+        if rng.random() < 0.9:
+            c[-1] = float(rng.binomial(int(c[-1]), rng.uniform(0.02, 0.95)))
+        # empty buckets are never emitted (event-stream aggregation); the open bucket has >= 1 event
+        if rng.random() < 0.9:
+            c[-1] = max(c[-1], 1.0)
+            c = c[c > 0]
+        if c.size >= n:
+            return np.ascontiguousarray(c[c.size - n:], dtype=np.float64)
+        m = int(m * n / max(c.size, 1) * 1.3) + 8 * P
+    return np.ascontiguousarray(_pt_left_pad_to_length(np.maximum(c, 1.0), n), dtype=np.float64)
+
+
+# ---- air-quality + weather records (weak/w86air/w86air_append.py) ----
+# Air quality (irceline/luchtmeetnet/openaq/opendata NO2,PM,O3: 3.5% of chain windows, worse than init
+# on chain) and weather (newcastle/hko/ipma/metar/eccc temps: 3.5%) are covered in P1 only by
+# weather_station_readings, two_timescale_ar_sensor and the pollutant mode of rainfall_or_air_pollutant,
+# whose end state is at a random time of day and whose pollutant mode has no species structure.
+# Real pool records end at a FIXED time of day per source (weak/w86air/air_real.py: circular R of the
+# end phase across the 5 snapshots median .99), so the end phase (days since the mean-day profile max)
+# of every rebuilt row is drawn from the real per-kind deciles below. A share of these rows is
+_W86A_AQ_SHARE = 0.4          # weather-family rows rebuilt as pollutant rows (AQ ~ weather on chain)
+_W86A_FULL_P = 0.4
+_W86A_DEC = np.linspace(0.0, 1.0, 11)
+# real end phase deciles (fraction of a day since the mean-day profile max), pool 09-23..09-27
+_W86A_PH = {
+    'no2': (0.292, 0.442, 0.592, 0.675, 0.692, 0.708, 0.708, 0.708, 0.708, 0.708, 0.708),
+    'o3': (0.25, 0.258, 0.267, 0.275, 0.283, 0.292, 0.308, 0.325, 0.342, 0.358, 0.375),
+    'pm': (0.0, 0.283, 0.375, 0.496, 0.558, 0.708, 0.708, 0.754, 0.792, 0.817, 0.917),
+    'temp': (0.229, 0.461, 0.517, 0.542, 0.553, 0.583, 0.642, 0.752, 0.873, 0.929, 0.99),
+    'rh': (0.0, 0.35, 0.7, 0.883, 0.9, 0.917, 0.917, 0.917, 0.917, 0.917, 0.917),
+    'wind': (0.208, 0.313, 0.508, 0.542, 0.542, 0.562, 0.583, 0.612, 0.625, 0.662, 0.708),
+    'pres': (0.0, 0.083, 0.167, 0.217, 0.233, 0.25, 0.25, 0.25, 0.267, 0.3, 0.333),
+}
+
+
+def _w86a_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+
+def _w86a_ph(r, key):
+    v = float(np.interp(r.random(), _W86A_DEC, _W86A_PH[key]))
+    return (v + r.normal(0.0, 0.02)) % 1.0
+
+
+def _w86a_ar(r, m, phi, sd):
+    e = r.standard_normal(m) * sd * np.sqrt(max(1e-12, 1.0 - phi * phi))
+    e[0] = r.standard_normal() * sd
+    return lfilter([1.0], [1.0, -phi], e)
+
+
+def _w86a_smooth(r, m, corr, sd):
+    """smooth zero-mean noise of length m with correlation length ~corr steps (coarse AR + interp)."""
+    step = max(1, int(corr / 4.0))
+    k = m // step + 3
+    c = _w86a_ar(r, k, float(np.exp(-4.0 / max(corr / step, 1.0))), sd)
+    return np.interp(np.arange(m) / step, np.arange(k), c)
+
+
+def _w86a_bump(h, c, w):
+    d = np.abs(h - c)
+    d = np.minimum(d, 24.0 - d)
+    return np.exp(-0.5 * (d / w) ** 2)
+
+
+def _w86a_clock(r, S, P, prof_fn, key):
+    """hour-of-day of each step so that the END sits at the real end phase after the profile max."""
+    hg = np.arange(P) * 24.0 / P
+    m0 = int(np.argmax(prof_fn(hg)))
+    e = (m0 + int(round(_w86a_ph(r, key) * P))) % P
+    h0 = (e - (S - 1)) % P
+    st = np.arange(S) + h0
+    return (st % P) * 24.0 / P, st // P
+
+
+def _w86a_round(r, y, choices):
+    q = choices[int(np.searchsorted(np.cumsum([c[1] for c in choices]), r.random(), side='right'))][0]
+    if q <= 0.0:
+        return y
+    return np.round(y / q) * q
+
+
+def _w86a_holds(r, y, P, p_stuck, p_end):
+    S = y.size
+    if r.random() < p_stuck:
+        for _ in range(int(r.integers(1, 4))):
+            L = int(r.integers(3, max(4, int(P * r.uniform(0.2, 1.5)))))
+            a = int(r.integers(1, max(2, S - L - 2)))
+            y[a:a + L] = y[a - 1]
+    if r.random() < p_end:
+        L = int(min(S // 3, max(3, int(P * r.uniform(0.15, 1.5)))))
+        y[S - L:] = y[S - L - 1]
+    return y
