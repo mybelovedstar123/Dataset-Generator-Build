@@ -33,6 +33,8 @@ coupled channel is stacked under the first.
 | `config.json` | Family weights, length band, observation-layer rates, augmentation, partner-program settings, runtime controls |
 | `requirements.txt` | Hash-pinned runtime dependencies |
 | `SCAN.json` | Static scan report for the module (`high: 0, warn: 0`) |
+| `.github/` | CI workflow, requirements checker, Dependabot config, issue and PR templates |
+| `CONTRIBUTING.md`, `SECURITY.md` | Contribution rules and vulnerability reporting |
 
 ## Technology stack
 
@@ -249,6 +251,15 @@ for x in gen.generate(1_000):
 
 `generate` is a generator. Closing it early (`close()`, or leaving a `for` loop) stops
 the producer threads cleanly.
+
+## Development
+
+Every pull request runs [CI](.github/workflows/ci.yml). `generator.py` must compile
+and pass `ruff` for syntax and runtime errors, every JSON file must parse, and every
+line in `requirements.txt` must be an exact `==` pin with a `sha256` hash.
+[CONTRIBUTING.md](CONTRIBUTING.md) lists the same checks as local commands, plus the
+reproducibility rules a change must follow.
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Known limitations
 
