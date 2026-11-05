@@ -20654,3 +20654,11 @@ class Generator(_W86BParent):
                 yield x
         finally:
             base.close()
+
+
+# ═══════════════ k: micro-priced crypto channels (price below the scaler eps floor + huge volume) ═══════════════
+# Parent class unchanged; a record that is STILL univariate draws an independent coin under this block's tag and, on
+# success (same quiet rule), gets two channels stacked under it: an hourly micro-price walk whose level (1e-8..1e-5) and
+# absolute moves sit far below the backbone's 1e-5 scale floor, and a heavy-tailed volume count of 1e8..1e11 — the
+# exchange micro-coin layout (price, volume) the eval pool carries for meme coins. Rows use their own rng per record.
+_K_Q = 0.7000
