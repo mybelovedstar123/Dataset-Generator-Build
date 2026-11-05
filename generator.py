@@ -20662,3 +20662,83 @@ class Generator(_W86BParent):
 # absolute moves sit far below the backbone's 1e-5 scale floor, and a heavy-tailed volume count of 1e8..1e11 — the
 # exchange micro-coin layout (price, volume) the eval pool carries for meme coins. Rows use their own rng per record.
 _K_Q = 0.7000
+_K_COIN_TAG = 0x5EC0C008
+_K_XOR = 0x5EC05E08
+_K_TAG = 0x5EC0BA08
+_FORK_DEDUP_TAG = 1110608
+
+
+def _k_micro_pair(r, L):
+    """(2, L) float64: micro price (level 10^U(-8,-5), t-distributed hourly log-returns, pumps/dumps, tick quantised)
+    and its exchange volume (log-normal, diurnal, coupled to |returns|), left-padded with the first value."""
+    n = int(max(min(L, 4096), 64))
+    lvl = 10.0 ** r.uniform(-8.0, -5.0)
+    sig = r.uniform(0.004, 0.03)
+    df = r.uniform(2.5, 6.0)
+    ret = sig * r.standard_t(df, size=n) / np.sqrt(df / (df - 2.0))
+    k = r.poisson(n / 400.0)
+    for _ in range(int(k)):
+        p = int(r.integers(0, n)); w = int(r.integers(2, 24))
+        ret[p:p + w] += r.choice([-1.0, 1.0]) * r.uniform(0.02, 0.15) / w
+    logp = np.log(lvl) + np.cumsum(ret)
+    price = np.exp(logp)
+    tick = 10.0 ** (np.floor(np.log10(lvl)) - r.integers(2, 5))
+    price = np.maximum(np.round(price / tick) * tick, tick)
+    usd = 10.0 ** r.uniform(3.5, 6.5)
+    hod = np.arange(n) % 24
+    diurnal = 1.0 + 0.35 * np.sin(2.0 * np.pi * (hod - r.uniform(0, 24)) / 24.0)
+    vol_usd = usd * diurnal * np.exp(r.normal(0.0, 0.9, size=n)) * (1.0 + 25.0 * np.abs(ret))
+    vol = np.minimum(np.maximum(np.round(vol_usd / price), 1.0), 1e12)
+    z = np.vstack([price, vol]).astype(np.float64)
+    if n < L:
+        pad = np.repeat(z[:, :1], L - n, axis=1)
+        z = np.hstack([pad, z])
+    return z[:, -L:]
+
+
+_KParent = Generator
+
+
+class Generator(_KParent):
+    """Parent records unchanged; micro-price + volume channels stacked under a share of still-univariate records."""
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        self._k_seed = (int(self._seed) ^ _K_XOR) & ((1 << 64) - 1)
+        self._k_n = 0
+
+    @property
+    def name(self) -> str:
+        return 'k124q70'
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if _K_Q > 0.0 and np.ndim(x) == 1 and np.asarray(x).size >= 64:
+                    u = np.random.default_rng(np.random.SeedSequence([seed, _K_COIN_TAG], spawn_key=(i,))).random()
+                    if u < _K_Q and not _k87_quiet(x):
+                        r = np.random.default_rng(np.random.SeedSequence([self._k_seed, _K_TAG], spawn_key=(self._k_n,)))
+                        self._k_n += 1
+                        try:
+                            with np.errstate(all="ignore"):
+                                kz = _k_micro_pair(r, np.asarray(x).size)
+                            z = np.vstack([np.asarray(x, dtype=np.float64)[None, :], kz])
+                            if (np.all(np.isfinite(z)) and np.array_equal(z[0], x)
+                                    and np.all(np.std(z, axis=1) > 1e-12 * (np.abs(z).mean(axis=1) + 1e-30))):
+                                x = z
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
+
+
+# ═══════════════ k2: micro-priced channels under two-channel records ═══════════════
+# Parent class unchanged; a record that is exactly two-channel draws an independent coin under this block's tag and, on
+# success (channel 0 not quiet), gets the micro-price + volume pair of the k block stacked under it as channels 3-4.
+_K2_Q = 0.8000
