@@ -20742,3 +20742,57 @@ class Generator(_KParent):
 # Parent class unchanged; a record that is exactly two-channel draws an independent coin under this block's tag and, on
 # success (channel 0 not quiet), gets the micro-price + volume pair of the k block stacked under it as channels 3-4.
 _K2_Q = 0.8000
+_K2_COIN_TAG = 0x5EC2C004
+_K2_XOR = 0x5EC25E04
+_K2_TAG = 0x5EC2BA04
+_FORK_DEDUP_TAG = 1110701
+
+_K2Parent = Generator
+
+
+class Generator(_K2Parent):
+    """Parent records unchanged; micro-price + volume channels stacked under a share of two-channel records."""
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        self._k2_seed = (int(self._seed) ^ _K2_XOR) & ((1 << 64) - 1)
+        self._k2_n = 0
+
+    @property
+    def name(self) -> str:
+        return 'km2q70b8'
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if _K2_Q > 0.0 and np.ndim(x) == 2 and np.shape(x)[0] == 2 and np.shape(x)[1] >= 64:
+                    u = np.random.default_rng(np.random.SeedSequence([seed, _K2_COIN_TAG], spawn_key=(i,))).random()
+                    if u < _K2_Q and not _k87_quiet(np.asarray(x)[0]):
+                        r = np.random.default_rng(np.random.SeedSequence([self._k2_seed, _K2_TAG], spawn_key=(self._k2_n,)))
+                        self._k2_n += 1
+                        try:
+                            xa = np.asarray(x, dtype=np.float64)
+                            with np.errstate(all="ignore"):
+                                kz = _k_micro_pair(r, xa.shape[1])
+                            z = np.vstack([xa, kz])
+                            if (np.all(np.isfinite(z)) and np.array_equal(z[:2], xa)
+                                    and np.all(np.std(z, axis=1) > 1e-12 * (np.abs(z).mean(axis=1) + 1e-30))):
+                                x = z
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
+
+
+# ═══════════════ s1: second added stream on records the champion leaves univariate ═══════════════
+# The champion above is the parent class and is not changed in any way: every record it yields is yielded here, in
+# order, as the very same object, unless it is STILL univariate. Such a record draws an independent coin under this
+# block's own tag; on success (same quiet rule, integer-valued records skipped as by the champion) one row of a separate stream is stacked under it as
+# channel 1 (left-padded, own rng per row, same keep test as the champion's weakness rows).
+_S1_Q = 0.8000
