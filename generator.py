@@ -19346,3 +19346,23 @@ class Generator(_PublishedGenerator):
                 yield x
         finally:
             base.close()
+
+
+# ═══════════════ w86b: pure weakness record builders (hook-free) ═══════════════
+# Only the per-record builders of the four weakness modules (energy2 / civic / air / rates) and their constants
+# and helpers. Nothing here touches the published generator: no family builder is replaced, no class is patched,
+# no per-row P1 state is read, and every value is drawn only from the rng passed in by the caller below.
+# ---- energy2 record builders (weak/e2_mod.py) ----
+# ---- w86energy2: end-state-faithful energy rows for the P1 energy families, rebuilt in place (v2, round 2) ----
+# v2 over round-1 w86energy: dose .7 -> .9; count_ladder_or_spot_price spot-price rows covered (ladder rows untouched,
+# mode read from a COPY of the row rng state, no extra draws); faithful signed-flow kind (statnett_physical_flow /
+# nyiso_interface_flows). Round 2 re-fits every kind per cadence against the real pool rows (5 snapshots
+# 09-23..09-27, row-weighted like the chain windows): prices are built per market style (EU 15-min day-ahead,
+# 5-min real-time with heavy spikes and quiet ends, 30-min NZ offer-stack / Agile / GB index, hourly LatAm / PVPC)
+# with recurring midday negatives and exact-zero clearing prices; units split into 10-min continuous and 5-min
+# set-point-held rows; signed flows are hourly schedules with ramps, clustered volatility, limit/zero holds;
+# solar has a real production window (night zero runs 34-46 steps) and night floors applied to every sub-floor
+# value; wind is 15-min only; fuel rows are per-fuel (CCGT / baseload / interconnector / pumped storage / idle
+# units / other / signed net); load / CI integer shares and end phases per cadence. Values are rounded to 0-3 dp
+# and stored through float32, exactly like the pool records (19.83 -> 19.8299999237).
+_W86E2_LAST = ['', 0, '']  # sub-kind, cadence and style of the last rebuilt record (diagnostics only)
