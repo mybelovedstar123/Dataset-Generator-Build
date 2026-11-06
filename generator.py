@@ -21502,3 +21502,125 @@ class Generator(_C91Parent):
 # The gate is decided after the run's draws are taken, so the stream position, record count, record lengths and every
 # record outside the window are untouched; a record whose candidate runs all fail is yielded unchanged.
 _C124B2_W = 256
+_C124B2_QMIN = 0.95
+_C124B2_MIN_N = 16
+_C124B2_TAG = 0xC124B002
+_C91_TAG = _C124B2_TAG
+
+
+def _c124b2_extend(x, r):
+    v = np.asarray(x)
+    if v.ndim != 1 or v.size < 256 or v.dtype.kind != 'f':
+        return None
+    L = int(v.size)
+    ch = np.flatnonzero(v[1:] != v[:-1]) + 1
+    starts = np.concatenate(([0], ch)).tolist()
+    ends = np.concatenate((ch, [L])).tolist()
+    cand = [(s, e) for s, e in zip(starts, ends) if s > 0 and e - s >= _C91_MIN_RUN]
+    if not cand:
+        return None
+    ceq = np.concatenate(([0], np.cumsum(v[1:] == v[:-1])))   # ceq[k] = exact repeats among the first k differences
+    chosen = {}
+    ins = 0
+    for j in r.permutation(len(cand)).tolist():
+        if r.random() >= _C91_P:
+            continue
+        d = int(min(_C91_MIN_D + int(r.geometric(1.0 / _C91_MEAN_D)), _C91_MAX_D))
+        s = cand[j][0]
+        a = max(1, s - _C124B2_W)
+        nd = s - a
+        if nd < _C124B2_MIN_N or int(ceq[s - 1] - ceq[a - 1]) < _C124B2_QMIN * nd:
+            continue
+        if ins + d > _C91_MAX_TOTAL:
+            continue
+        chosen[j] = d
+        ins += d
+    if ins == 0:
+        return None
+    pieces = []
+    prev = 0
+    for j, (s, e) in enumerate(cand):
+        d = chosen.get(j)
+        if d is None:
+            continue
+        pieces.append(v[prev:e])
+        pieces.append(np.full(d, v[e - 1], dtype=v.dtype))
+        prev = e
+    pieces.append(v[prev:])
+    w = np.concatenate(pieces)[ins:]
+    return w if w.size == L else None
+
+
+_c91_extend = _c124b2_extend
+_C124B2Parent = Generator
+
+
+class Generator(_C124B2Parent):
+    """The hold layer below, lengthening only exact runs that follow a quiet regime (same window, law and lengths)."""
+
+    @property
+    def name(self) -> str:
+        return 'c124-b2: quiet-regime (lattice-evidence) gate on the hold layer'
+
+
+# ═══════════════ c128-wsT: weakness-family series ADDED as channel 2 under two-channel records (whole stream) ═══════════════
+# Every record of the parent (king171 + the c91/c96 hold layer + the c124-b2 quiet gate) is yielded unchanged, in order,
+# except: anywhere in the stream (_C128_OPEN_NUM = 0: the window is the whole stream), an exactly TWO-channel float64
+# record (length >= 256, all finite) whose channel 0 passes the king's own c159 eligibility (not constant, not
+# _k87_quiet, not _w86b_intlike) and whose own coin falls under _C128_Q becomes a THREE-channel record (the record
+# passes unchanged if the builder's output is not exactly L finite, non-constant values; none was dropped in
+# generate(2000) at seed 4242). Channels 0 and 1 are the record itself (byte-identical); channel 2 is one series of the
+# same length from one of the 4 families with the largest weakness contribution x confidence (tidal, hydro, infra,
+# mobility; all rated medium), picked by the _C128_FAMS weights (their recommended weights). Univariate records are
+# never touched.
+# Host choice (explicit, after the 2026-10-09 review): the eligibility IS the king's. c159 (like w86b and s1) stacks its
+# shapes as channel 1 under univariate rows that pass `not _k87_quiet(x) and not _w86b_intlike(x)`; this layer runs
+# those same two king helpers, unchanged, on channel 0 of its host. It cannot run them on univariate rows: the parent
+# leaves none that pass (0 of 1581 univariate records at seed 1 and 0 of 1581 at seed 2, generate(3000)), because band,
+# w86b, c159, k, s1 and s2 have already stacked channels under every one of them. What the parent leaves univariate is
+# _k87_quiet (held, sticky or slow-tailed) or integer-like, and the c91 hold layer's teaching lives on those rows (it
+# lengthens exact holds in univariate rows only). So the host follows the lineage's own k2 precedent (k2 stacks its
+# micro-price pair under exactly two-channel records whose channel 0 is not _k87_quiet), and the added series goes in as
+# channel 2. Every univariate record stays byte-identical to the parent's, including each quiet / held row that the hold
+# layer lengthens, so no univariate record leaves the C = 1 batch bucket. The one indirect effect is on the stream's
+# length (last paragraph).
+# Why: on 5 king legs (the 2 REAL published era legs + 3 legs of the same code) x 3 recent public pools, the trained
+# king is WORSE than its own warm-start init on a consistent set of sources (training makes it forget them); they cost
+# ~1.1% of the log-score. Log-mass lost per family over the top-90 sources (1.066% in all; positive = king worse than
+# init): tidal 0.162, hydro 0.142, infra 0.129, mobility 0.115, crypto 0.114, health 0.108, energy 0.107, rates 0.103;
+# this layer uses the 4 chosen families (0.548 of the 1.066%). The king won with the same method: its c159 layer adds
+# shapes that stay worse than the warm start as an extra channel beside a moving, real-valued channel 0 (not _k87_quiet,
+# not _w86b_intlike), and this layer adds its series beside exactly such a channel 0.
+# Dose: about 5.2% of records are hosts (generate(3000) at seeds 1, 2, 3, 11, 777 and 4242: 4.7-5.7%). Most other
+# two-channel records have a _k87_quiet channel 0 (14-15% of records) or an integer-like one (2-3%). That is close to
+# the ~6% of all records this layer aims for, so _C128_Q = 1.0 and every host gains its channel. Batches are bucketed by
+# channel count and the loss averages a batch's channels, so the added series carries 1/3 of its record's weight. That
+# gives ~1.7% of the record slots, a little more than the ~1.4% that the first c128 build's 2.8% univariate hosts
+# carried at 1/2 each.
+# Statistics only: each builder draws its parameters from ranges that summarise pool statistics (cadences, grids,
+# levels, volatilities, event and hold rates, mixture weights); no real values, sequences or lookup tables are embedded.
+# Record i's draws come only from SeedSequence([seed, _C128_TAG], spawn_key=(i,)), so every parent RNG advances exactly
+# as without this block. A three-channel record is billed at points+mv20 (3 x L x 100/120 instead of 2 x L x 100/120).
+# That is ~2.5% more billed points (generate(2000), seed 4242), so the trainer reaches its budget ~2.4% of the parent
+# stream earlier. That cut falls inside the hold layer's late window, which gets ~6% shorter.
+
+# c128 family 'tidal': tide-gauge sea level + coastal/ocean met observations (statistics-only builder).
+#
+# Entry point: _c128_tidal(r, L) -> float64 array of exactly length L (r: a numpy Generator).
+# Short records are generated with n < L points and LEFT-PADDED with their first value (the scorer pads short histories the same way).
+#
+# Sub-families (weights from the pool's share of lost log-mass):
+#   gauge    0.64  IOC tide-gauge water level: real constituent periods (M2 S2 N2 K2 / K1 O1 P1 Q1 / MK3 M4 MS4 M6)
+#                  sampled mostly at 1-min cadence (M2 = 745 samples, K1/O1 = 1436/1549 samples -- periods the king's
+#                  three tide builders never emit, they stop at 5-min), plus 2..15-min feeds; smooth surge, harbour
+#                  seiche (8-90 min), sensor noise, mm/cm grid, datum offsets (incl. negative datums), rare spikes.
+#   aux      0.06  gauge-station auxiliary sensors (battery / housing pressure): near-constant level on a 1e-3 / 1e-2
+#                  grid, 50-95 % repeated values, a weak daily cycle and single-quantum blips.
+#   press    0.16  barometric pressure with the atmospheric tide (S2 = 12 h dominant, S1 = 24 h): 1-min ocean drones
+#                  and hourly buoys, smooth synoptic swings, occasional cyclone dip, 0.01 / 0.1 hPa grid.
+#   buoy     0.14  buoy observations: significant wave height (log-OU + storms), wave period (sticky), humidity
+#                  (diurnal, capped), air/water temperature (diurnal + synoptic, holds), wind speed (15-min / hourly).
+# All parameters are drawn from ranges that summarise pool statistics; no pool values are embedded.
+
+# physical tidal constituent periods in hours (constants of astronomy, not fitted values)
+_C128_TIDAL_SEMI_H = np.array([12.4206012, 12.0, 12.6583475, 11.9672361])      # M2 S2 N2 K2
