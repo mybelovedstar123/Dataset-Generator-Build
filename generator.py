@@ -22773,3 +22773,301 @@ def _c128_infra_prom(r, L):
     n = max(2, min(n, L))
     k = int(np.searchsorted(_C128_INFRA_PROM_CUM, r.random() * 0.999999))
     return _C128_INFRA_PROM_BUILD[k](r, n)
+
+
+# ─────────────────────────────── entry ───────────────────────────────
+
+def _c128_infra(r, L):
+    L = int(L)
+    if L < 2:
+        return None
+    c = np.cumsum(_C128_INFRA_MIX) / np.sum(_C128_INFRA_MIX)
+    for _ in range(4):
+        u = r.random()
+        try:
+            with np.errstate(all="ignore"):
+                if u < c[0]:
+                    x = _c128_infra_ixp(r, L)
+                elif u < c[1]:
+                    x = _c128_infra_wmf(r, L)
+                else:
+                    x = _c128_infra_prom(r, L)
+            x = np.asarray(x, dtype=np.float64).reshape(-1)
+        except (ValueError, IndexError, FloatingPointError, OverflowError):
+            continue
+        if x.size < 2 or not np.all(np.isfinite(x)) or np.all(x == x[0]):
+            continue
+        out = np.empty(L, dtype=np.float64)
+        if x.size >= L:
+            out[:] = x[x.size - L:]
+        else:
+            out[:L - x.size] = x[0]   # left-pad short feeds with their first value, as the evaluator does
+            out[L - x.size:] = x
+        if np.all(out == out[0]):
+            continue
+        return out
+    return None
+
+# ─────────────── c128 mobility: commute flows, car-park occupancy, bike docks ───────────────
+# Statistics-only shapes for the public-pool mobility feeds the lineage gets WORSE on after training
+# (MTA bridge/tunnel hourly crossings, city bike counters, Gent car-park free spaces, GBFS / nextbike docks).
+# Measured failure: the trained king damps the daily profile (median std ratio 0.82 -> 0.79 on MTA H256, 0.70 -> 0.65
+# on counters H64), biases low (-6% -> -8% MTA H256), under-disperses (80% band coverage 0.64 -> 0.54) and flattens the
+# ~1190-sample car-park cycle (H720 mid-horizon median 112 -> 49 when the truth refills to 368). Each sub-builder
+# keeps a FULL-amplitude, saturating daily cycle that repeats faithfully over 64..720 steps, on integer grids, with
+# exact holds only where the real feeds hold (quiet nights, capacity plateaus, idle docks).
+# Every number below is a range or a handful of shape scalars summarising pool statistics; no pool values are stored.
+# builder contract: _c128_mobility(r, L) -> float64 (L,) or None; all randomness from the passed Generator r.
+
+_C128_MOBILITY_KINDS = (("flow", 0.45), ("park", 0.25), ("dock", 0.30))
+_C128_MOBILITY_CUM = np.cumsum([w for _, w in _C128_MOBILITY_KINDS])
+
+
+def _c128_mobility_sig(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -60.0, 60.0)))
+
+
+def _c128_mobility_bump(u, c, w):
+    # circular gaussian bump on the day phase u in [0, 1)
+    d = (u - c + 0.5) % 1.0 - 0.5
+    return np.exp(-0.5 * (d / w) ** 2)
+
+
+def _c128_mobility_ar1(r, n, phi, sd):
+    phi = float(np.clip(phi, -0.999, 0.999))
+    e = (r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-8)))).tolist()
+    v = float(r.standard_normal() * sd)
+    out = [0.0] * n
+    for i in range(n):
+        v = phi * v + e[i]
+        out[i] = v
+    return np.asarray(out, dtype=np.float64)
+
+
+def _c128_mobility_pad(x, L):
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    out = np.empty(L, dtype=np.float64)
+    if x.size >= L:
+        out[:] = x[x.size - L:]
+    else:
+        out[:L - x.size] = x[0]
+        out[L - x.size:] = x
+    return out
+
+
+# ---------- flow: hourly crossings / bike-counter counts with a weekly profile ----------
+def _c128_mobility_flow(r, L):
+    u = r.random()
+    P = 24 if u < 0.80 else (96 if u < 0.90 else (48 if u < 0.95 else 288))
+    v = r.random()
+    if v < 0.32:
+        n = int(r.integers(300, 900))      # counter feeds: ~2-5 weeks of hourly history
+    elif v < 0.72:
+        n = int(r.integers(1300, 2600))    # bridge feeds: ~1 quarter of hourly history
+    else:
+        n = L
+    n = max(96, min(n, L))
+    bike = r.random() < 0.5
+    off = int(r.integers(0, P))
+    t = np.arange(n, dtype=np.int64) + off
+    if r.random() < 0.35 and n > 3 * P:   # clock change: the profile shifts by one hour for the rest of the feed
+        k = int(r.integers(P, n - P))
+        t = t + np.where(np.arange(n) >= k, max(1, P // 24) * (1 if r.random() < 0.5 else -1), 0)
+    t = t - min(int(t.min()), 0)
+    day = t // P
+    nd = int(day.max()) + 1
+    hr = max(1, P // 24)   # irregular days: the whole profile runs an hour early / late
+    jit = np.where(r.random(nd) < r.uniform(0.0, 0.3), hr * np.where(r.random(nd) < 0.5, 1, -1), 0)
+    pos = (t + jit[day]) % P
+    ub = np.arange(P, dtype=np.float64) / P
+    if bike:
+        night = r.uniform(0.005, 0.06)
+        env = _c128_mobility_sig((ub - r.uniform(0.24, 0.30)) / 0.02) * _c128_mobility_sig((r.uniform(0.83, 0.95) - ub) / r.uniform(0.03, 0.06))
+        g = (night + r.uniform(0.2, 0.6) * env
+             + r.uniform(0.4, 1.0) * _c128_mobility_bump(ub, r.uniform(0.31, 0.38), r.uniform(0.018, 0.035))
+             + r.uniform(0.5, 1.0) * _c128_mobility_bump(ub, r.uniform(0.70, 0.78), r.uniform(0.025, 0.05)))
+        gwe = night * r.uniform(1.0, 3.0) + r.uniform(0.25, 0.8) * _c128_mobility_bump(ub, r.uniform(0.50, 0.64), r.uniform(0.08, 0.15))
+        gwe = gwe * g.max()
+    else:
+        night = r.uniform(0.06, 0.35)
+        a, b = r.uniform(0.18, 0.30), r.uniform(0.80, 0.95)
+        env = _c128_mobility_sig((ub - a) / r.uniform(0.02, 0.05)) * _c128_mobility_sig((b - ub) / r.uniform(0.03, 0.07))
+        shape = (1.0 + r.uniform(0.0, 0.3) * _c128_mobility_bump(ub, r.uniform(0.30, 0.36), 0.03)
+                 + r.uniform(0.0, 0.3) * _c128_mobility_bump(ub, r.uniform(0.66, 0.75), 0.04)
+                 + r.uniform(-0.25, 0.25) * (ub - 0.55))
+        g = night + (1.0 - night) * env * shape
+        a2 = a + r.uniform(0.02, 0.08)
+        env2 = _c128_mobility_sig((ub - a2) / r.uniform(0.03, 0.06)) * _c128_mobility_sig((b + r.uniform(-0.02, 0.04) - ub) / r.uniform(0.03, 0.07))
+        gwe = (night * r.uniform(0.9, 1.5) + (1.0 - night) * env2 * (1.0 + r.uniform(-0.15, 0.1) * (ub - 0.55))) * r.uniform(0.75, 1.0) * g.max()
+    gm = max(float(g.max()), 1e-9)
+    g = g / gm
+    gwe = gwe / gm
+    dow0 = int(r.integers(0, 7))
+    dd = np.arange(nd)
+    weekly = r.random() >= 0.08
+    is_we = (((dd + dow0) % 7) >= 5) if weekly else np.zeros(nd, dtype=bool)
+    hol = (r.random(nd) < r.uniform(0.0, 0.04)) & ~is_we
+    use_we = is_we | hol
+    dowf = np.exp(r.normal(0.0, 0.04, 7))
+    if bike:
+        dsd, phid = r.uniform(0.05, 0.18), r.uniform(0.3, 0.85)
+    else:
+        dsd, phid = r.uniform(0.02, 0.06), r.uniform(0.3, 0.85)
+    dfac = _c128_mobility_ar1(r, nd, phid, dsd)
+    if bike:
+        rain = r.random(nd) < r.uniform(0.0, 0.08)
+        dfac = dfac + np.where(rain, np.log(r.uniform(0.3, 0.7, nd)), 0.0)
+    trend = r.normal(0.0, 0.25 if bike else 0.08) * (dd / max(nd - 1, 1))
+    dlog = dfac + trend + np.log(dowf[(dd + dow0) % 7])
+    prof = np.where(use_we[day], gwe[pos], g[pos])
+    phi_h = r.uniform(0.2, 0.85) if P == 24 else r.uniform(0.6, 0.95)
+    hsd = r.uniform(0.03, 0.10) if bike else r.uniform(0.02, 0.07)
+    # each day bends its own profile a little (two smooth harmonics in log, per day)
+    shp = r.uniform(0.03, 0.12)
+    c1, s1, c2, s2 = (r.normal(0.0, shp, nd) for _ in range(4))
+    phv = pos / float(P) * 2.0 * np.pi
+    bend = c1[day] * np.cos(phv) + s1[day] * np.sin(phv) + c2[day] * np.cos(2.0 * phv) + s2[day] * np.sin(2.0 * phv)
+    lam = prof * np.exp(dlog[day] + bend + _c128_mobility_ar1(r, n, phi_h, hsd))
+    if not bike:   # events: a few hours of extra traffic
+        for _ in range(int(r.poisson(nd * r.uniform(0.0, 0.03)))):
+            s0 = int(r.integers(0, n))
+            lam[s0:s0 + max(1, int(r.uniform(2.0, 5.0) * P / 24.0))] *= r.uniform(1.2, 2.0)
+    if not bike:
+        for _ in range(int(r.poisson(nd * r.uniform(0.0, 0.08)))):
+            s = int(r.integers(0, n))
+            dur = max(1, int(r.uniform(2.0, 7.0) * P / 24.0))
+            lam[s:s + dur] *= r.uniform(0.03, 0.5)
+    peak = float(np.exp(r.uniform(np.log(40.0), np.log(1800.0)) if bike else r.uniform(np.log(300.0), np.log(16000.0))))
+    lam = np.clip(lam * peak * 24.0 / P, 0.0, 1e7)
+    if bike:
+        k = r.uniform(8.0, 60.0)
+        lam = lam * r.gamma(k, 1.0 / k, n)
+    return r.poisson(lam).astype(np.float64)
+
+
+# ---------- park: car-park occupancy / free spaces, saturating daily cycle, irregular polling ----------
+def _c128_mobility_park(r, L):
+    u = r.random()
+    irregular = False
+    if u < 0.60:
+        P, irregular = r.uniform(1080.0, 1320.0), True
+    elif u < 0.75:
+        P = 1440.0
+    elif u < 0.90:
+        P = 288.0
+    else:
+        P = 96.0
+    # fast polling resolves single cars: a few hundred spaces per poll-day; coarse feeds can be larger
+    C = float(np.round(np.exp(r.uniform(np.log(200.0), np.log(800.0)) if P > 1000.0 else r.uniform(np.log(150.0), np.log(1500.0)))))
+    n = L if r.random() < 0.85 else int(r.integers(min(600, L), L + 1))
+    if irregular:
+        kk = r.uniform(3.0, 20.0)
+        dt = r.gamma(kk, 1.0 / kk, n) / P
+    else:
+        dt = np.full(n, 1.0 / P)
+    tau = r.uniform(0.0, 7.0) + np.cumsum(dt)
+    dayi = np.floor(tau).astype(np.int64)
+    ph = tau - dayi
+    d0 = int(dayi[0])
+    D = dayi - d0
+    nd = int(D[-1]) + 1
+    we_day = ((np.arange(nd) + d0) % 7) >= 5
+    pk = r.uniform(0.80, 1.25) * np.exp(r.normal(0.0, r.uniform(0.05, 0.20), nd))
+    pk = np.where(we_day, pk * r.uniform(0.2, 0.9), pk)
+    nightd = r.uniform(0.0, 0.12) * np.exp(r.normal(0.0, 0.4, nd))
+    a = r.uniform(0.22, 0.33) + r.normal(0.0, 0.03, nd) + np.where(we_day, r.uniform(0.02, 0.10), 0.0)
+    b = r.uniform(0.72, 0.88) + r.normal(0.0, 0.03, nd) + np.where(we_day, r.uniform(-0.05, 0.08), 0.0)
+    wa, wb = r.uniform(0.02, 0.06), r.uniform(0.03, 0.08)
+    env = _c128_mobility_sig((ph - a[D]) / wa) * _c128_mobility_sig((b[D] - ph) / wb)
+    f = nightd[D] + (pk[D] - nightd[D]) * env
+    f = f - r.uniform(0.0, 0.15) * env * _c128_mobility_bump(ph, r.uniform(0.49, 0.56), r.uniform(0.03, 0.05))
+    evb = np.where(r.random(nd) < r.uniform(0.0, 0.8), r.uniform(0.05, 0.35, nd), 0.0)
+    f = f + evb[D] * _c128_mobility_bump(ph, r.uniform(0.80, 0.90), r.uniform(0.03, 0.05))
+    act = 0.12 + 0.88 * env
+    noise = _c128_mobility_ar1(r, n, r.uniform(0.97, 0.995), r.uniform(0.004, 0.02) * C) * act
+    xo = C * np.clip(f, 0.0, None) + noise + r.normal(0.0, r.uniform(0.4, 1.2), n) * env   # turnover: in and out between polls
+    # a full park keeps churning just under capacity instead of freezing on it
+    xo = np.where(xo > C, C - np.abs(r.normal(0.0, r.uniform(0.5, 4.0), n)), xo)
+    occ = np.clip(np.round(xo), 0.0, C)
+    hq, hb = r.uniform(0.7, 0.92), r.uniform(0.0, 0.15)
+    keep = r.random(n) < hq + (hb - hq) * env
+    keep[0] = False
+    occ = occ[np.maximum.accumulate(np.where(keep, 0, np.arange(n)))]
+    free = r.random() < 0.5
+    y = C - occ if free else occ
+    if r.random() < 0.4:   # recount artefacts: the reported plateau shifts between days
+        offd = np.where(r.random(nd) < 0.4, np.round(r.normal(0.0, max(1.0, 0.02 * C), nd)), 0.0)
+        y = np.maximum(y + offd[D], 0.0)
+    if r.random() < 0.5:  # isolated sentinel readings
+        m = 1 + int(r.poisson(4.0))
+        y[r.integers(1, n, m)] = -1.0 if r.random() < 0.6 else 0.0
+    return y
+
+
+# ---------- dock: bike-share station status, bounded small integers, activity by time of day ----------
+def _c128_mobility_dock(r, L):
+    C = int(np.clip(np.round(np.exp(r.normal(np.log(14.0), 0.6))), 2, 60))
+    u = r.random()
+    P = 1440.0 if u < 0.25 else (r.uniform(300.0, 500.0) if u < 0.5 else (288.0 if u < 0.85 else 96.0))
+    n = L if r.random() < 0.8 else int(r.integers(min(300, L), min(2600, L) + 1))
+    t = np.arange(n, dtype=np.float64)
+    ph = ((t + r.uniform(0.0, P)) / P) % 1.0
+    lam = float(np.exp(r.uniform(np.log(0.0005), np.log(0.004)) if r.random() < 0.15 else r.uniform(np.log(0.004), np.log(0.45))))
+    qn = r.uniform(0.0, 0.15)
+    dayenv = _c128_mobility_sig((ph - r.uniform(0.22, 0.30)) / 0.02) * _c128_mobility_sig((r.uniform(0.85, 0.97) - ph) / 0.03)
+    com = r.uniform(0.0, 1.0) * (_c128_mobility_bump(ph, r.uniform(0.30, 0.37), 0.03) + _c128_mobility_bump(ph, r.uniform(0.70, 0.77), 0.04))
+    act = (qn + (1.0 - qn) * (dayenv * r.uniform(0.4, 1.0) + com)) * np.exp(_c128_mobility_ar1(r, n, r.uniform(0.99, 0.999), r.uniform(0.3, 1.2)))
+    p_ev = np.clip(lam * act / max(float(act.mean()), 1e-9), 0.0, 0.9)
+    ev = np.flatnonzero(r.random(n) < p_ev)
+    beta, phs = r.uniform(0.0, 0.35), r.uniform(0.0, 1.0)
+    pplus = (0.5 + beta * np.sin(2.0 * np.pi * (ph[ev] - phs))).tolist()
+    p1 = r.uniform(0.6, 0.97)
+    mag = np.where(r.random(ev.size) < p1, 1, 1 + np.minimum(r.geometric(0.5, ev.size), 5)).tolist()
+    uu = r.random(ev.size).tolist()
+    m = (0.02 + 0.9 * r.random() ** 1.6) * C
+    kap = r.uniform(0.0, 0.6)
+    reb = r.random() < 0.5
+    rebp = r.uniform(0.0, 0.004) if reb else 0.0
+    rr = r.random(ev.size).tolist()
+    rlev = (np.round(r.uniform(0.3, 0.9, ev.size) * C)).tolist()
+    x = int(np.clip(np.round(m + r.normal(0.0, 0.2 * C)), 0, C))
+    start = float(x)
+    vals = [0] * ev.size
+    for j in range(ev.size):
+        if rr[j] < rebp:
+            x = int(rlev[j])
+        else:
+            pp = pplus[j] + kap * (m - x) / C
+            x = x + mag[j] if uu[j] < pp else x - mag[j]
+            x = 0 if x < 0 else (C if x > C else x)
+        vals[j] = x
+    y = np.full(n, start, dtype=np.float64)
+    if ev.size:
+        idx = np.searchsorted(ev, np.arange(n), side="right") - 1
+        va = np.asarray(vals, dtype=np.float64)
+        y = np.where(idx >= 0, va[np.maximum(idx, 0)], start)
+    if r.random() < 0.3:
+        y = C - y
+    return y
+
+
+_C128_MOBILITY_BUILD = {"flow": _c128_mobility_flow, "park": _c128_mobility_park, "dock": _c128_mobility_dock}
+
+
+def _c128_mobility(r, L):
+    L = int(L)
+    if L < 2:
+        return None
+    name = _C128_MOBILITY_KINDS[int(np.searchsorted(_C128_MOBILITY_CUM, r.random() * float(_C128_MOBILITY_CUM[-1]) * 0.999999, side="right"))][0]
+    for _ in range(3):   # a draw can come out constant (an idle dock with no events): redraw the same kind
+        try:
+            with np.errstate(all="ignore"):
+                x = np.asarray(_C128_MOBILITY_BUILD[name](r, L), dtype=np.float64).reshape(-1)
+        except Exception:
+            return None
+        if x.size < 2 or not np.all(np.isfinite(x)):
+            continue
+        out = _c128_mobility_pad(x, L)
+        if np.all(np.isfinite(out)) and not np.all(out == out[0]):
+            return out
+    return None
