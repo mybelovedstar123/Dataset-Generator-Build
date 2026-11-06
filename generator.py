@@ -18134,14 +18134,18 @@ class _TeachStream:
         self._seed = int(seed)
         self._b = 0
         self._buf = None
+        self._fam = None
         self._pos = _TEACH_BATCH
+        self.last_name = None
 
     def next(self):
         if self._pos >= _TEACH_BATCH:
-            self._buf, _ = _teach_batch(self._seed, self._b)
+            self._buf, self._fam = _teach_batch(self._seed, self._b)
             self._b += 1
             self._pos = 0
         row = self._buf[self._pos]
+        if self._fam is not None:
+            self.last_name = _TEACH_FAMILIES[int(self._fam[self._pos])][0]
         self._pos += 1
         return np.array(row)
 
@@ -18996,7 +19000,7 @@ _TEACH_MIX = _TEACH2_MIX
 _teach_batch.__defaults__ = (4096, _TEACH_FAMILIES, None)
 
 # SeedSequence tag of that per-row decision.
-_Q = 0.296
+_Q = 0.25  # c159: partner channel on 25% of rows (king-147 used 0.296). Teach share stays 0.4375.
 _CPL = 0.2
 _TAG = 0x5A17C0DE
 _TMIX = 0.4375
@@ -19081,13 +19085,87 @@ def _t2ed_share(rng, n, L):
     return _t2ed_core(rng, n, L)[0]
 
 
-_TEACH2_FAMILIES = _TEACH2_FAMILIES + (("ed_visit_share", _t2ed_share),)
+def _t2_slow_level(rng, n, L):
+    """Continuous level with no calendar wave: sticky rates, shares, and prices.
+
+    80% daily, 20% hourly. A fifth of the daily rows are nearly flat. Rounded to
+    a few decimals so the row stays non-integer. No weekday or yearly sine.
+    """
+    n = int(n)
+    L = int(L)
+    if n <= 0:
+        return np.zeros((0, L), dtype=np.float64)
+    kind = rng.random(n)
+    signed = kind < 0.12
+    rate = (kind >= 0.12) & (kind < 0.48)
+    share = (kind >= 0.48) & (kind < 0.68)
+    price = (kind >= 0.68) & (kind < 0.80)
+    hourly = kind >= 0.80
+    daily = ~hourly
+    level = np.ones(n, dtype=np.float64)
+    if int(signed.sum()):
+        level[signed] = rng.uniform(-2.0, 3.0, size=int(signed.sum()))
+    if int(rate.sum()):
+        level[rate] = np.exp(rng.uniform(np.log(0.05), np.log(12.0), size=int(rate.sum())))
+    if int(share.sum()):
+        level[share] = rng.uniform(0.01, 0.60, size=int(share.sum()))
+    if int(price.sum()):
+        level[price] = np.exp(rng.uniform(np.log(20.0), np.log(200.0), size=int(price.sum())))
+    if int(hourly.sum()):
+        level[hourly] = np.exp(rng.uniform(np.log(1e-6), np.log(20.0), size=int(hourly.sum())))
+    phi = np.empty(n, dtype=np.float64)
+    if int(daily.sum()):
+        phi[daily] = rng.uniform(0.98, 0.997, size=int(daily.sum()))
+    if int(hourly.sum()):
+        phi[hourly] = rng.uniform(0.99, 0.999, size=int(hourly.sum()))
+    quiet = daily & (rng.random(n) < 0.20)
+    sd = np.empty(n, dtype=np.float64)
+    moving = daily & ~quiet & ~signed
+    if int(moving.sum()):
+        sd[moving] = rng.uniform(0.002, 0.02, size=int(moving.sum()))
+    qpos = quiet & ~signed
+    if int(qpos.sum()):
+        sd[qpos] = rng.uniform(0.0002, 0.0015, size=int(qpos.sum()))
+    if int(hourly.sum()):
+        sd[hourly] = rng.uniform(0.001, 0.008, size=int(hourly.sum()))
+    if int(signed.sum()):
+        sd[signed] = rng.uniform(0.002, 0.03, size=int(signed.sum()))
+    qsigned = quiet & signed
+    if int(qsigned.sum()):
+        sd[qsigned] = rng.uniform(0.0005, 0.003, size=int(qsigned.sum()))
+    phi = np.clip(phi, -0.99, 0.999)
+    innov = sd * np.sqrt(np.maximum(1.0 - phi * phi, 1e-8))
+    eps = rng.standard_normal((n, L)) * innov[:, None]
+    z = np.empty((n, L), dtype=np.float64)
+    z[:, 0] = rng.standard_normal(n) * sd
+    for t in range(1, L):
+        z[:, t] = phi * z[:, t - 1] + eps[:, t]
+    span = np.full(n, 0.20, dtype=np.float64)
+    span[share] = 0.35
+    span[price | hourly] = 0.50
+    x = np.empty((n, L), dtype=np.float64)
+    pos = ~signed
+    x[pos] = level[pos, None] * np.exp(np.clip(z[pos], -span[pos, None], span[pos, None]))
+    if int(signed.sum()):
+        x[signed] = level[signed, None] + z[signed]
+    if int(share.sum()):
+        np.maximum(x[share], 0.0, out=x[share])
+    dp = np.full(n, 4, dtype=np.int64)
+    dp[rate | price] = 3
+    dp[hourly] = 6
+    for i in range(n):
+        x[i] = np.round(x[i], int(dp[i]))
+    return x
+
+
+_TEACH2_FAMILIES = _TEACH2_FAMILIES + (("ed_visit_share", _t2ed_share), ("slow_level", _t2_slow_level),)
 # teach2 row shares (renormalised by the caller). Same teach2 dose as w9nq (Q .296, TMIX .4375):
 # signed_flow cut from its overdose (.22 -> .06), ixp trimmed at 97% saturation (.30 -> .22),
 # sparse trimmed (.14 -> .08), web raised (.24 -> .36, cumulative and players modes), season
 # kept near its still-responding dose (.10 -> .12), new ed_visit_share at .16.
-_TEACH2_MIX = {"ixp_traffic": 0.22, "signed_flow": 0.06, "web_counter": 0.36, "season_onset": 0.12,
-               "sparse_counts": 0.08, "ed_visit_share": 0.16}
+# c159: slow_level 0.16 taken from web_counter (0.36 -> 0.24) and ixp_traffic (0.22 -> 0.18).
+_TEACH2_MIX = {"ixp_traffic": 0.18, "signed_flow": 0.06, "web_counter": 0.24, "season_onset": 0.12,
+               "sparse_counts": 0.08, "ed_visit_share": 0.16, "slow_level": 0.16}
 _TEACH_FAMILIES = _TEACH2_FAMILIES
 _TEACH_MIX = _TEACH2_MIX
 _teach_batch.__defaults__ = (4096, _TEACH_FAMILIES, None)
@@ -19212,7 +19290,10 @@ class Generator(DataGenerator):
         self._cpl_off = False
         if _TMIX > 0.0 and (_TMIX >= 1.0 or np.random.default_rng(
                 np.random.SeedSequence([self._seed, _TMIX_TAG], spawn_key=(i,))).random() < _TMIX):
-            return np.asarray(self._teach.next(), dtype=np.float64)
+            y = np.asarray(self._teach.next(), dtype=np.float64)
+            # slow_level is its own series. Parent steps would paint a cycle onto it.
+            self._cpl_off = self._teach.last_name == "slow_level"
+            return y
         y = np.asarray(next(it1), dtype=np.float64)
         self._cpl_off = getattr(self._g1, '_last_fam', None) in _W9Q_NOCPL_FAMS
         return y
