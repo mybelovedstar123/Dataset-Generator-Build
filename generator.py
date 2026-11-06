@@ -23071,3 +23071,83 @@ def _c128_mobility(r, L):
         if np.all(np.isfinite(out)) and not np.all(out == out[0]):
             return out
     return None
+
+
+_C128_FAMS = (
+    ("tidal", 0.15, _c128_tidal),     # 38.5% of hits: tide gauges, coastal pressure, buoys
+    ("hydro", 0.13, _c128_hydro),     # 33.3% of hits: river stage / flow / temperature, groundwater, geomagnetic, met
+    ("infra", 0.06, _c128_infra),     # 15.4% of hits: IXP traffic, Wikimedia edge rates, Prometheus metrics
+    ("mobility", 0.05, _c128_mobility),  # 12.8% of hits: commute flows, car parks, bike docks
+)
+_C128_CUM = np.cumsum([w for _, w, _ in _C128_FAMS]) / sum(w for _, w, _ in _C128_FAMS)
+_C128_TAG = 0xC128E5B2
+_C128_Q = 1.0
+_C128_OPEN_NUM, _C128_OPEN_DEN = 0, 5  # 0: the window is the whole stream
+_C128_HOST_C = 2  # hosts are exactly two-channel records (the k2 precedent); the added series is channel 2
+_C128_MIN_LEN = 256
+
+
+def _c128_eligible(x):
+    """Host test: an exactly _C128_HOST_C-channel float64 record (length >= _C128_MIN_LEN, all finite) whose channel 0
+    passes the king's own c159 eligibility, i.e. is not constant, not _k87_quiet and not _w86b_intlike (the two king
+    helpers above, unchanged). A univariate record is never a host."""
+    if not (isinstance(x, np.ndarray) and x.ndim == 2 and x.shape[0] == _C128_HOST_C and x.dtype == np.float64
+            and x.shape[1] >= _C128_MIN_LEN):
+        return False
+    if not bool(np.all(np.isfinite(x))):
+        return False
+    x0 = x[0]
+    if bool(np.all(x0 == x0[0])):
+        return False
+    return not _w86b_intlike(x0)   # wsT2: the quiet-tail test is dropped (more hosts; channels 0-1 are never changed)
+
+
+def _c128_keep(w, L):
+    """The added series is kept only as an array of exactly (L,), all finite and not constant."""
+    return (isinstance(w, np.ndarray) and w.shape == (L,) and bool(np.all(np.isfinite(w)))
+            and not bool(np.all(w == w[0])))
+
+
+_C128Parent = Generator
+
+
+class Generator(_C128Parent):
+    """Parent records unchanged; an exactly two-channel float record whose channel 0 passes the king's c159
+    tests (not _k87_quiet, not _w86b_intlike) gains, on its own coin under _C128_Q, ONE extra channel (a
+    weakness-family series) as channel 2. Channels 0 and 1 stay byte-identical; univariate records are
+    never touched."""
+
+    @property
+    def name(self) -> str:
+        return 'c128-wsT2'
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        lo = _C128_OPEN_NUM * int(_C91_CHILD_BUDGET)
+        pos = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                inside = _C128_Q > 0.0 and _C128_OPEN_DEN * pos >= lo
+                pos += _c91_points(x)
+                if inside and _c128_eligible(x):
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _C128_TAG], spawn_key=(i,)))
+                    if r.random() < _C128_Q:
+                        k = min(int(np.searchsorted(_C128_CUM, r.random(), side="right")), len(_C128_FAMS) - 1)
+                        try:
+                            L = int(x.shape[1])
+                            with np.errstate(all="ignore"):
+                                w = _C128_FAMS[k][2](r, L)
+                            if _c128_keep(w, L):
+                                z = np.empty((_C128_HOST_C + 1, L), dtype=np.float64)
+                                z[:_C128_HOST_C] = x
+                                z[_C128_HOST_C] = w
+                                x = z
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
