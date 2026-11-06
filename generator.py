@@ -21397,3 +21397,108 @@ class Generator(_S2Parent):
 # Record i's draws come only from SeedSequence([seed, _C91_TAG], spawn_key=(i,)), so the parent's RNGs advance exactly as
 # without this block. Position = billed points (live rule points+mv20) of the records already yielded by this layer.
 _C91_CHILD_BUDGET = 13_320_000_000  # live per-stream budget: [training] 39_960_000_000 billed points // gen_seed_mix 3
+_C91_OPEN_NUM, _C91_OPEN_DEN = 3, 5
+_C91_P = 0.9
+_C91_MIN_RUN = 32
+_C91_MIN_D = 64
+_C91_MEAN_D = 96.0
+_C91_MAX_D = 512
+_C91_MAX_TOTAL = 2048
+_C91_TAG = 0xC96DB002
+
+
+def _c91_points(x):
+    v = x['values'] if isinstance(x, dict) else x
+    size = int(np.size(v))
+    if np.ndim(v) == 2 and int(np.shape(v)[0]) > 1:
+        return -(-size * 100 // 120)
+    return size
+
+
+def _c91_extend(x, r):
+    v = np.asarray(x)
+    if v.ndim != 1 or v.size < 256 or v.dtype.kind != 'f':
+        return None
+    L = int(v.size)
+    ch = np.flatnonzero(v[1:] != v[:-1]) + 1
+    starts = np.concatenate(([0], ch)).tolist()
+    ends = np.concatenate((ch, [L])).tolist()
+    cand = [(s, e) for s, e in zip(starts, ends) if s > 0 and e - s >= _C91_MIN_RUN]
+    if not cand:
+        return None
+    chosen = {}
+    ins = 0
+    for j in r.permutation(len(cand)).tolist():
+        if r.random() >= _C91_P:
+            continue
+        d = int(min(_C91_MIN_D + int(r.geometric(1.0 / _C91_MEAN_D)), _C91_MAX_D))
+        if ins + d > _C91_MAX_TOTAL:
+            continue
+        chosen[j] = d
+        ins += d
+    if ins == 0:
+        return None
+    pieces = []
+    prev = 0
+    for j, (s, e) in enumerate(cand):
+        d = chosen.get(j)
+        if d is None:
+            continue
+        pieces.append(v[prev:e])
+        pieces.append(np.full(d, v[e - 1], dtype=v.dtype))
+        prev = e
+    pieces.append(v[prev:])
+    w = np.concatenate(pieces)[ins:]
+    return w if w.size == L else None
+
+
+_C91Parent = Generator
+
+
+class Generator(_C91Parent):
+    """Parent records unchanged, except that in the last part of each stream's billed points the exact holds of
+    univariate records are lengthened (same values, same length, same billing)."""
+
+    @property
+    def name(self) -> str:
+        return 'c159-c96hB'
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        lo = _C91_OPEN_NUM * int(_C91_CHILD_BUDGET)
+        pos = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if _C91_P > 0.0 and _C91_OPEN_DEN * pos >= lo and np.ndim(x) == 1:
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _C91_TAG], spawn_key=(i,)))
+                    try:
+                        w = _c91_extend(x, r)
+                        if w is not None and np.all(np.isfinite(w)):
+                            x = w
+                    except Exception:
+                        pass
+                pos += _c91_points(x)
+                yield x
+        finally:
+            base.close()
+
+
+# ═══════════════ c124-b2: quiet-regime gate on the hold layer ═══════════════
+# Every class above is unchanged. This block re-binds the hold layer's per-record function (the c91 layer looks
+# `_c91_extend` and `_C91_TAG` up at call time) and gives the hold layer its own fresh per-record stream. Window, record
+# selection (univariate float, length >= 256), candidate runs (exact runs >= _C91_MIN_RUN that do not start at index 0),
+# the extension law (P, D = MIN_D + Geometric(1/MEAN_D) <= MAX_D, total <= MAX_TOTAL, same-length start crop) and the draw
+# order are the hold layer's own. One rule is added: a candidate run is lengthened only if the _C124B2_W steps before
+# it were a quiet regime, i.e. >= _C124B2_QMIN of those first differences are exact repeats (at least _C124B2_MIN_N
+# differences must exist). Why: in the public pools a run that has reached 32 steps lasts 64 more steps 29-47% of the
+# time after a quiet regime (>= 0.95 repeats in the 256 steps before it) but only 9-19% after an active one, while the
+# ungated hold layer makes 90% of all such runs last >= 64 more; on active small counts (bike docks, civic counts) and
+# drifting sensors that over-holds through the moves the next window brings and suppresses their +-1 move rate. Runs
+# after quiet regimes (exact-hold history, which only a coarse lattice produces) keep the full hold teaching.
+# The gate is decided after the run's draws are taken, so the stream position, record count, record lengths and every
+# record outside the window are untouched; a record whose candidate runs all fail is yielded unchanged.
+_C124B2_W = 256
