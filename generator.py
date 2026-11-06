@@ -22491,3 +22491,285 @@ def _c128_infra_ixp_period(r):
     if u < 0.96:
         return float(r.uniform(418.0, 428.0))
     return float((144.0, 576.0, 864.0)[int(r.integers(0, 3))])
+
+
+def _c128_infra_ixp_faults(r, x):
+    n = x.size
+    if r.random() < 0.5:  # missed polls: short sharp dips
+        for _ in range(1 + int(r.poisson(2.0))):
+            i = int(r.integers(0, n))
+            w = int(r.integers(1, 4))
+            x[i:i + w] = x[i:i + w] * r.uniform(0.0, 0.6)
+    if r.random() < 0.12:  # outage hole
+        i = int(r.integers(0, n))
+        w = int(np.exp(r.uniform(np.log(4.0), np.log(320.0))))
+        x[i:i + w] = x[i:i + w] * (0.0 if r.random() < 0.5 else r.uniform(0.0, 0.06))
+    if r.random() < 0.12:  # up-spikes
+        k = 1 + int(r.poisson(2.0))
+        idx = r.integers(0, n, k)
+        x[idx] = x[idx] * r.uniform(1.3, 3.0, k)
+    if r.random() < 0.1:   # persistent level shift (peering change)
+        i = int(r.integers(n // 8, n))
+        x[i:] = x[i:] * float(np.exp(r.normal(0.0, 0.3)))
+
+
+def _c128_infra_ixp_clean(r, n):
+    P = _c128_infra_ixp_period(r)
+    depth = float(np.clip(np.exp(r.normal(np.log(0.2), 0.55)), 0.03, 0.9))
+    wk_amp = 1.0 - (r.uniform(0.0, 0.45) if r.random() < 0.75 else 0.0)
+    env = _c128_infra_daily(r, n, P, depth, wk_amp, 1.0 - r.uniform(0.0, 0.12), r.uniform(0.01, 0.07))
+    t = np.arange(n, dtype=np.float64)
+    level = 10.0 ** (r.uniform(9.8, 12.5) if r.random() < 0.85 else r.uniform(7.0, 9.8))
+    x = level * env * np.exp(r.normal(0.0, 0.08) * t / n)
+    sd = float(np.exp(r.uniform(np.log(0.0015), np.log(0.03))))
+    phi = r.uniform(0.3, 0.97) if r.random() < 0.85 else 0.0
+    x = x * np.exp(_c128_infra_ar1_t(r, n, phi, sd, r.uniform(0.0, 0.8)))
+    u = r.random()
+    if u < 0.1:   # zig-zag polling artefact: alternating over/under-count
+        z = np.where(np.arange(n) % 2 == 0, 1.0, -1.0)
+        z = np.where(np.cumsum(r.random(n) < r.uniform(0.02, 0.15)) % 2 == 1, -z, z)
+        x = x * (1.0 + r.uniform(0.02, 0.09) * z)
+    elif u < 0.18:  # coarse native interval: every other sample nearly repeats
+        x[1::2] = x[0::2][:x[1::2].size] * (1.0 + r.normal(0.0, 0.002, x[1::2].size))
+    _c128_infra_ixp_faults(r, x)
+    return x
+
+
+def _c128_infra_ixp_noisy(r, n):
+    # small or erratic exchange: weak daily shape under heavy lognormal noise, bursts, dead periods
+    P = _c128_infra_ixp_period(r)
+    env = _c128_infra_daily(r, n, P, r.uniform(0.25, 1.0), 1.0 - r.uniform(0.0, 0.3), 1.0, r.uniform(0.02, 0.15))
+    level = 10.0 ** r.uniform(5.0, 11.0)
+    x = level * env * np.exp(_c128_infra_ar1_t(r, n, r.uniform(0.3, 0.95), r.uniform(0.08, 0.45), r.uniform(0.0, 0.7)))
+    if r.random() < 0.6:  # bursts: decaying pulses
+        rate = 1.0 / np.exp(r.uniform(np.log(25.0), np.log(500.0)))
+        ev = (r.random(n) < rate) * np.exp(r.normal(np.log(r.uniform(1.0, 8.0)), 0.7, n))
+        x = x * (1.0 + _c128_infra_ar1_filter(ev, float(np.exp(-1.0 / r.uniform(1.0, 25.0)))))
+    if r.random() < 0.3:  # dead or zero-traffic stretches
+        for _ in range(1 + int(r.poisson(1.0))):
+            i = int(r.integers(0, n))
+            w = int(np.exp(r.uniform(np.log(5.0), np.log(700.0))))
+            x[i:i + w] = 0.0
+    if r.random() < 0.15:
+        i = int(r.integers(n // 8, n))
+        x[i:] = x[i:] * float(np.exp(r.normal(0.0, 0.5)))
+    return x
+
+
+def _c128_infra_ixp_pulses(r, n):
+    # periodic transfer bursts on a near-idle port
+    level = 10.0 ** r.uniform(4.0, 8.5)
+    per = r.uniform(12.0, 64.0)
+    t = np.arange(n, dtype=np.float64)
+    start = np.floor((t + r.uniform(0.0, per)) / per)
+    first = np.concatenate(([1.0], (start[1:] != start[:-1]).astype(np.float64)))
+    on = np.convolve(first, np.ones(int(r.integers(1, 5))))[:n] > 0.5
+    if r.random() < 0.5:
+        on = on & (r.random(n) < r.uniform(0.6, 1.0))
+    height = level * np.exp(r.normal(0.0, r.uniform(0.2, 0.9), n))
+    base = level * r.uniform(0.005, 0.08) * np.exp(_c128_infra_ar1(r, n, r.uniform(0.3, 0.9), r.uniform(0.2, 0.8)))
+    return base + np.where(on, height, 0.0)
+
+
+def _c128_infra_ixp(r, L):
+    n = L if (r.random() < 0.82 or L < 128) else int(r.integers(L // 2, L + 1))
+    u = r.random()
+    if u < 0.74:
+        x = _c128_infra_ixp_clean(r, n)
+    elif u < 0.95:
+        x = _c128_infra_ixp_noisy(r, n)
+    else:
+        x = _c128_infra_ixp_pulses(r, n)
+    return np.round(np.maximum(x, 0.0))   # bits/s are integers
+
+
+# ─────────────────────────────── wmf: 1-min edge rates ───────────────────────────────
+
+def _c128_infra_wmf(r, L):
+    n = L
+    P = 1440.0 if r.random() < 0.8 else float(r.uniform(1150.0, 1750.0))
+    weak = r.random() < 0.2
+    if weak:   # memcached / mysql / varnish style: shallow cycle, more wander
+        depth = r.uniform(0.45, 0.85)
+        wander = r.uniform(0.03, 0.12)
+    else:
+        depth = float(np.clip(np.exp(r.normal(np.log(0.26), 0.4)), 0.06, 0.85))
+        wander = r.uniform(0.02, 0.09)
+    env = _c128_infra_daily(r, n, P, depth, 1.0 - r.uniform(0.0, 0.25), 1.0 - r.uniform(0.0, 0.08), r.uniform(0.01, 0.08))
+    is_bytes = r.random() < 0.15
+    level = 10.0 ** (r.uniform(7.5, 9.6) if is_bytes else r.uniform(2.8, 5.2))
+    # rate windows smooth everything below the window length: increments come out positively correlated
+    sd = float(np.exp(r.uniform(np.log(0.006), np.log(0.06)))) if r.random() < 0.85 else r.uniform(0.06, 0.14)
+    m = 1 if r.random() < 0.04 else int(r.integers(2, 8))
+    fast = _c128_infra_ar1(r, n, r.uniform(0.98, 0.998), wander) + _c128_infra_ar1_t(r, n, r.uniform(0.6, 0.97), sd, r.uniform(0.0, 0.9))
+    lx = np.log(env) + _c128_infra_ma(fast, m)
+    if r.random() < 0.6:   # persistent small level jumps (pool/backend changes)
+        jr = r.uniform(0.0005, 0.008)
+        lx = lx + np.cumsum((r.random(n) < jr) * r.normal(0.0, r.uniform(0.01, 0.06), n))
+    x = level * np.exp(lx)
+    if r.random() < 0.45:  # traffic re-routing plateaus
+        for _ in range(1 + int(r.poisson(2.0))):
+            i = int(r.integers(0, n))
+            w = int(np.exp(r.uniform(np.log(15.0), np.log(500.0))))
+            x[i:i + w] = x[i:i + w] * float(np.exp(r.normal(0.0, 0.12)))
+    if r.random() < 0.5:   # sharp drops that recover over a few rate windows (negative diff skew)
+        tt = np.arange(n, dtype=np.float64)
+        for _ in range(int(r.poisson(r.uniform(0.3, 4.0)))):
+            i = int(r.integers(0, n))
+            tau = r.uniform(1.0, 12.0)
+            dip = np.where(tt >= i, np.exp(-np.maximum(tt - i, 0.0) / tau), 0.0)
+            x = x * (1.0 - r.uniform(0.03, 0.4) * dip)
+    if r.random() < 0.15:  # spikes
+        k = 1 + int(r.poisson(1.0))
+        idx = r.integers(0, n, k)
+        x[idx] = x[idx] * r.uniform(1.05, 1.6, k)
+    x = np.maximum(x, 0.0)
+    if is_bytes:
+        return np.round(x)
+    return np.round(x, 2 if r.random() < 0.55 else 3)
+
+
+# ─────────────────────────────── prom: 10-s Prometheus series ───────────────────────────────
+
+def _c128_infra_scrape_idx(r, n):
+    """Index of the latest scrape seen by each 10-s query step (15-s scrapes: one repeated value in every three)."""
+    u = r.random()
+    scrape = 15.0 if u < 0.8 else (20.0 if u < 0.9 else 10.0)
+    idx = np.floor((np.arange(n) * 10.0 + r.uniform(0.0, scrape)) / scrape).astype(np.int64)
+    return idx - idx[0], int(idx[-1] - idx[0]) + 1
+
+
+def _c128_infra_prom_gauge(r, n):
+    idx, ns = _c128_infra_scrape_idx(r, n)
+    is_bytes = r.random() < 0.4
+    level = 10.0 ** (r.uniform(9.0, 10.6) if is_bytes else r.uniform(2.5, 5.0))
+    unit = 4096.0 if (is_bytes and r.random() < 0.6) else 1.0
+    sgn = 1.0 if r.random() < 0.5 else -1.0
+    u = r.random()
+    if u < 0.45:  # sawtooth: steady creep, periodic same-direction steps, opposite-sign resets
+        drift = level * 10.0 ** r.uniform(-6.6, -4.4) if is_bytes else r.uniform(0.3, 40.0)
+        inc = sgn * np.maximum(drift * (1.0 + r.uniform(0.0, 0.2) * r.standard_normal(ns)), 0.0)
+        pe = int(r.integers(80, 301))
+        ph = int(r.integers(0, pe))
+        if r.random() < 0.7:
+            inc = inc + np.where((np.arange(ns) + ph) % pe == 0, sgn * drift * r.uniform(20.0, 200.0), 0.0)
+        if r.random() < 0.9:
+            m = int(r.integers(1, 3))
+            rs = (np.arange(ns) + ph) % (pe * m) == (pe * m) // 2
+            inc = inc - np.where(rs, float(np.abs(inc[:pe * m]).sum()) * sgn * r.uniform(0.6, 1.6), 0.0)
+        s = level + np.cumsum(inc)
+    elif u < 0.85:  # noisy gauge around a slow trend (available memory, container memory)
+        sd = level * 10.0 ** r.uniform(-4.0, -2.6)
+        s = level + _c128_infra_ar1(r, ns, r.uniform(0.0, 0.9), sd) + _c128_infra_ar1(r, ns, r.uniform(0.94, 0.993), 2.0 * sd)
+        s = s + sgn * sd * r.uniform(0.0, 1.5) * np.arange(ns) / ns
+    else:          # rarely changing count (series in head, targets up, open fds)
+        level = 10.0 ** r.uniform(0.5, 4.5)
+        unit = 1.0
+        ch = r.random(ns) < r.uniform(0.002, 0.06)
+        mu = sgn * r.uniform(0.5, 30.0) if r.random() < 0.5 else 0.0
+        s = level + np.cumsum(np.where(ch, np.round(r.normal(mu, r.uniform(1.0, 30.0), ns)), 0.0))
+    s = np.round(s / unit) * unit
+    x = s[idx]
+    if r.random() < 0.2 and n > 40:  # staleness lookback: last sample carried for 5 minutes
+        x[-30:] = x[-31]
+    return x
+
+
+def _c128_infra_prom_sparse(r, n):
+    # rate() of a rarely incremented counter: exact zeros, blips that last one rate window
+    q = 1.0 / r.uniform(10.0, 60.0)
+    if r.random() < 0.35:
+        q = q * float(np.exp(r.uniform(np.log(4096.0), np.log(2e6))))
+    w = int((4, 4, 4, 8, 2, 6)[int(r.integers(0, 6))])
+    ev = (r.random(n) < 10.0 ** r.uniform(-3.3, -1.6)) * r.integers(1, 4, n)
+    if not ev.any():
+        ev[int(r.integers(0, n))] = 1
+    x = np.convolve(ev.astype(np.float64), np.ones(w))[:n] * q
+    if r.random() < 0.25:  # iowait-like: tiny positive values about half the time
+        idx, ns = _c128_infra_scrape_idx(r, n)
+        tiny = np.where(r.random(ns) < r.uniform(0.3, 0.7), 0.0, 10.0 ** r.uniform(-4.5, -2.5) * r.exponential(1.0, ns))
+        x = tiny[idx] + 0.1 * x
+    return x
+
+
+def _c128_infra_prom_sine(r, n):
+    idx, ns = _c128_infra_scrape_idx(r, n)
+    level = 10.0 ** r.uniform(-1.0, 3.0)
+    t = np.arange(ns, dtype=np.float64) * (n / ns)
+    s = 1.0 + r.uniform(0.08, 0.4) * np.sin(2.0 * np.pi * (t / r.uniform(320.0, 400.0) + r.random()))
+    if r.random() < 0.6:  # short jagged sub-cycle
+        s = s + r.uniform(0.01, 0.08) * np.sin(2.0 * np.pi * (t / r.uniform(30.0, 80.0) + r.random()))
+    s = s + _c128_infra_ma(_c128_infra_ar1_t(r, ns, r.uniform(0.3, 0.9), r.uniform(0.02, 0.15), 0.5), int(r.integers(1, 5)))
+    s = level * np.maximum(s, 0.0)
+    x = s[idx] if r.random() < 0.7 else np.interp(np.arange(n, dtype=np.float64), t, s)
+    return x if r.random() < 0.5 else np.round(x, int(r.integers(4, 7)))
+
+
+def _c128_infra_prom_cpu(r, n):
+    idx, ns = _c128_infra_scrape_idx(r, n)
+    level = 10.0 ** (r.uniform(-3.0, 0.3) if r.random() < 0.8 else r.uniform(1.5, 4.3))
+    s = level * np.exp(_c128_infra_ar1(r, ns, r.uniform(0.0, 0.85), r.uniform(0.05, 0.5)))
+    s = s * np.exp(r.normal(0.0, 0.3) * np.arange(ns) / ns)
+    k = int(r.poisson(ns * r.uniform(0.0, 0.01)))
+    if k:
+        j = r.integers(0, ns, k)
+        s[j] = s[j] * r.uniform(1.5, 5.0, k)
+    x = s[idx]
+    return x if r.random() < 0.75 else np.round(x, int(r.integers(2, 6)))
+
+
+def _c128_infra_prom_net12(r, n):
+    # interface byte rate repeating a short transfer pattern (8 scrapes = 12 samples = 2 minutes)
+    idx, ns = _c128_infra_scrape_idx(r, n)
+    level = 10.0 ** r.uniform(1.5, 4.0)
+    pp = int((8, 8, 6, 12, 4)[int(r.integers(0, 5))])
+    tmpl = np.exp(r.normal(0.0, r.uniform(0.2, 0.8), pp))
+    s = level * tmpl[(np.arange(ns) + int(r.integers(0, pp))) % pp]
+    s = s * np.exp(_c128_infra_ar1(r, ns, r.uniform(0.0, 0.6), r.uniform(0.03, 0.3)))
+    s = s * np.exp(_c128_infra_ar1(r, ns, 0.995, r.uniform(0.02, 0.1)))
+    return np.round(s[idx], int(r.integers(1, 5)))
+
+
+def _c128_infra_prom_smallint(r, n):
+    idx, ns = _c128_infra_scrape_idx(r, n)
+    lam = r.uniform(0.2, 6.0) * np.exp(_c128_infra_ar1(r, ns, r.uniform(0.5, 0.97), r.uniform(0.2, 0.8)))
+    s = r.poisson(lam).astype(np.float64) + (1.0 if r.random() < 0.3 else 0.0)
+    keep = r.random(ns) < r.uniform(0.0, 0.5)
+    keep[0] = False
+    s = s[np.maximum.accumulate(np.where(keep, 0, np.arange(ns)))]
+    x = s[idx]
+    if r.random() < 0.3 and n > 40:
+        x[-30:] = x[-31]
+    return x
+
+
+def _c128_infra_prom_latency(r, n):
+    base = 10.0 ** r.uniform(-2.4, -0.8)
+    t = np.arange(n, dtype=np.float64)
+    per = r.uniform(18.0, 100.0)
+    on = ((t + r.uniform(0.0, per)) / per) % 1.0 < r.uniform(0.04, 0.45)
+    if r.random() < 0.4:
+        on = on & (r.random(n) < r.uniform(0.85, 1.0))
+    x = base * np.exp(_c128_infra_ar1_t(r, n, r.uniform(0.2, 0.9), r.uniform(0.05, 0.4), 0.5))
+    x = x + np.where(on, base * r.uniform(0.4, 4.0) * np.exp(r.normal(0.0, r.uniform(0.02, 0.4), n)), 0.0)
+    if r.random() < 0.4:
+        x = _c128_infra_ma(x, int(r.integers(2, 6)))
+    return x
+
+
+_C128_INFRA_PROM_BUILD = (_c128_infra_prom_gauge, _c128_infra_prom_sparse, _c128_infra_prom_sine,
+                          _c128_infra_prom_cpu, _c128_infra_prom_net12, _c128_infra_prom_smallint,
+                          _c128_infra_prom_latency)
+
+
+def _c128_infra_prom(r, L):
+    u = r.random()
+    if u < 0.82:
+        n = int(r.integers(980, 1200))
+    elif u < 0.94:
+        n = L
+    else:
+        n = int(r.integers(1200, max(1201, L)))
+    n = max(2, min(n, L))
+    k = int(np.searchsorted(_C128_INFRA_PROM_CUM, r.random() * 0.999999))
+    return _C128_INFRA_PROM_BUILD[k](r, n)
