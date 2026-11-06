@@ -21351,7 +21351,7 @@ class Generator(_S2Parent):
 
     @property
     def name(self) -> str:
-        return 'km2q70b8s1s2hs'
+        return "c159"
 
     def generate(self, n_series: int) -> Iterator[np.ndarray]:
         n = int(n_series)
