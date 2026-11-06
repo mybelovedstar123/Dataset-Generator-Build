@@ -21918,3 +21918,286 @@ def _c128_tidal_buoy(r, L):
         h[0] = False
         x = x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
     return _c128_tidal_pad(x, L)
+
+
+def _c128_tidal(r, L):
+    L = int(L)
+    if L < 2:
+        return None
+    u = r.random() * _C128_TIDAL_SUB_CUM[-1]
+    k = int(np.searchsorted(_C128_TIDAL_SUB_CUM, u))
+    with np.errstate(all="ignore"):
+        if k == 0:
+            x = _c128_tidal_gauge(r, L)
+        elif k == 1:
+            x = _c128_tidal_aux(r, L)
+        elif k == 2:
+            x = _c128_tidal_press(r, L)
+        else:
+            x = _c128_tidal_buoy(r, L)
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    if x.size != L or not np.all(np.isfinite(x)):
+        return None
+    return x
+
+# ─────────────── c128 hydro: river gauges, groundwater, met stations, geomagnetic minute data ───────────────
+# Statistics-only shapes for the USGS NWIS (00010 water temperature, 00060 discharge, 00065 gage height,
+# conductance / turbidity / oxygen), EA flood-monitoring (stage, flow, 15-min rain, water temperature,
+# hourly groundwater), INTERMAGNET minute, Toulouse met-station and SNOTEL SWE feeds. Every parameter is
+# drawn from a range that summarises pool statistics (cadence, grid, hold rate, daily range, skew of the
+# daily wave, event rates, recession constants, sentinel runs); no real value or sequence is embedded.
+# What the warm start keeps and the king loses on these feeds: a daily cycle carried forward at full
+# amplitude (sharp fast-rise / slow-fall water-temperature peaks, a 1440-step geomagnetic day seen only
+# ~2.8 times in context), NO invented daily wiggle on stage and groundwater series that have none,
+# smooth recessions continued at long horizons, grid holds (0.001 m, 0.01 ft, 0.1 C, 3 significant
+# figures), and exact holds of a sentinel tail.
+_C128_HYDRO_KINDS = ("wtemp", "stage", "flow", "ground", "geomag", "meteo", "rain", "snow", "quality")
+_C128_HYDRO_W = np.array([0.18, 0.23, 0.17, 0.07, 0.08, 0.07, 0.06, 0.04, 0.10], dtype=np.float64)
+_C128_HYDRO_CUM = np.cumsum(_C128_HYDRO_W) / np.sum(_C128_HYDRO_W)
+_C128_HYDRO_SENT = -999999.0  # USGS NWIS missing-value code, held exactly
+_C128_HYDRO_SENT_Q = 0.07  # share of NWIS-styled rows that carry sentinel runs
+_C128_HYDRO_M2 = 49.6835  # 12.42 h lunar semidiurnal tide in 15-min steps
+_C128_HYDRO_S2 = 48.0  # 12 h solar semidiurnal tide in 15-min steps
+
+
+def _c128_hydro_conv(a, k, n):
+    m = 1 << int(np.ceil(np.log2(a.size + k.size)))
+    return np.fft.irfft(np.fft.rfft(a, m) * np.fft.rfft(k, m), m)[:n]
+
+
+def _c128_hydro_ar1(r, n, phi, sd):
+    # stationary AR(1) by FFT filtering (burn-in = kernel length)
+    phi = float(np.clip(phi, 0.0, 0.9995))
+    K = 1 if phi <= 0.0 else int(min(max(np.ceil(np.log(1e-3) / np.log(phi)), 1.0), 16384.0))
+    e = r.standard_normal(n + K)
+    y = _c128_hydro_conv(e, phi ** np.arange(K, dtype=np.float64), n + K)[K:]
+    return y * (sd * np.sqrt(1.0 - phi * phi))
+
+
+def _c128_hydro_leak(e, phi):
+    K = int(min(max(np.ceil(np.log(1e-3) / np.log(phi)), 1.0), 16384.0))
+    return _c128_hydro_conv(e, phi ** np.arange(K, dtype=np.float64), e.size)
+
+
+def _c128_hydro_slow(r, n, span, tau, sd):
+    # smooth wander: AR(1) nodes every `span` steps (correlation time tau steps), linearly interpolated
+    span = max(float(span), 1.0)
+    nd = int(n // span) + 3
+    v = _c128_hydro_ar1(r, nd, np.exp(-span / max(tau, span)), sd)
+    return np.interp(np.arange(n, dtype=np.float64), (np.arange(nd, dtype=np.float64) - 1.0) * span, v)
+
+
+def _c128_hydro_logu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+
+def _c128_hydro_dayfac(r, n, P, sd):
+    # smooth day-to-day multiplicative factor (cloud cover, weather)
+    nd = int(n // max(P, 1)) + 3
+    c = (np.arange(nd, dtype=np.float64) - 1.0) * P + 0.5 * P
+    return np.interp(np.arange(n, dtype=np.float64), c, np.exp(r.normal(0.0, sd, nd)))
+
+
+def _c128_hydro_wave(t, P, ph, s, nh=5):
+    # unit half-range periodic wave: s=0 sine, s->1 fast-rise / slow-fall sawtooth
+    th = 2.0 * np.pi * (t / P + ph)
+    w = np.zeros_like(th)
+    for k in range(1, nh + 1):
+        w += (s ** (k - 1)) / k * np.sin(k * th)
+    g = np.linspace(0.0, 2.0 * np.pi, 257)
+    wg = np.zeros_like(g)
+    for k in range(1, nh + 1):
+        wg += (s ** (k - 1)) / k * np.sin(k * g)
+    return (w - 0.5 * (wg.max() + wg.min())) / max(0.5 * (wg.max() - wg.min()), 1e-12)
+
+
+def _c128_hydro_grid(x, g):
+    if g >= 1.0:
+        return np.round(x / g) * g
+    d = int(round(-np.log10(g))) + 1
+    return np.round(np.round(x / g) * g, d)
+
+
+def _c128_hydro_sig(x, sf=3):
+    a = np.abs(x)
+    e = np.floor(np.log10(np.where(a > 0, a, 1.0))) - (sf - 1)
+    q = np.round(x / 10.0 ** e)
+    return np.where(a > 0, np.where(e < 0, q / 10.0 ** (-e), q * 10.0 ** e), 0.0)
+
+
+def _c128_hydro_events(r, n, rate, tr, t1, t2, w1, hsd):
+    # storm hydrograph train: smooth rise over tr steps, two-reservoir recession (t1 fast, t2 slow)
+    K = int(min(max(6.0 * t2, 4.0 * tr + 16.0), 12000.0))
+    pre = int(min(K, 3000))
+    tot = n + pre
+    k = int(r.poisson(rate * tot / 4096.0))
+    imp = np.zeros(tot, dtype=np.float64)
+    if k > 0:
+        np.add.at(imp, r.integers(0, tot, k), np.exp(r.normal(0.0, hsd, k)))
+    tt = np.arange(K, dtype=np.float64)
+    u = np.clip(tt / max(tr, 1.0), 0.0, 1.0)
+    dt = np.maximum(tt - tr, 0.0)
+    ker = (u * u * (3.0 - 2.0 * u)) * (w1 * np.exp(-dt / t1) + (1.0 - w1) * np.exp(-dt / t2))
+    return _c128_hydro_conv(imp, ker, tot)[pre:]
+
+
+def _c128_hydro_wtemp(r, n):
+    u = r.random()
+    P = 96
+    if u < 0.58:  # NWIS stream temperature: 0.1 C grid, 1-8 C daily range, fast afternoon rise
+        lvl, dr, s, g = r.uniform(7.0, 24.0), _c128_hydro_logu(r, 0.8, 8.0), r.uniform(0.35, 0.85), 0.1
+    elif u < 0.84:  # EA river temperature: 0.01 C grid, small daily range
+        lvl, dr, s = r.uniform(8.0, 20.0), _c128_hydro_logu(r, 0.05, 1.8), r.uniform(0.0, 0.6)
+        g = 0.01 if r.random() < 0.85 else 0.001
+    else:  # station dry-bulb air temperature
+        lvl, dr, s, g = r.uniform(2.0, 24.0), r.uniform(3.0, 12.0), r.uniform(0.1, 0.5), 0.1
+        if r.random() < 0.3:
+            P = 24
+    t = np.arange(n, dtype=np.float64)
+    amp = 0.5 * dr * _c128_hydro_dayfac(r, n, P, r.uniform(0.06, 0.3))
+    x = lvl + amp * _c128_hydro_wave(t, P, r.random(), s)
+    x += r.normal(-0.05, 0.08) * t / P  # seasonal drift per day
+    x += _c128_hydro_slow(r, n, P / 2.0, P * r.uniform(1.5, 5.0), r.uniform(0.1, 0.5) * dr + r.uniform(0.05, 0.6))
+    x += _c128_hydro_ar1(r, n, r.uniform(0.6, 0.95), g * r.uniform(0.02, 0.2) + 0.001 * dr) + r.normal(0.0, g * r.uniform(0.05, 0.35), n)
+    if u < 0.84:
+        x = np.maximum(x, 0.0)
+    return _c128_hydro_grid(x, g), u < 0.58
+
+
+def _c128_hydro_stage(r, n):
+    ea = r.random() < 0.6
+    g = 0.001 if ea else 0.01
+    v = r.random()
+    if ea:
+        lvl = _c128_hydro_logu(r, 0.03, 2.5) if v < 0.86 else (r.uniform(20.0, 110.0) if v < 0.93 else -r.uniform(0.1, 1.2))
+        ref = abs(lvl) if v < 0.86 else _c128_hydro_logu(r, 0.1, 2.0)
+    else:
+        lvl = _c128_hydro_logu(r, 0.4, 12.0) if v < 0.93 else r.uniform(100.0, 110.0)
+        ref = abs(lvl) if v < 0.93 else _c128_hydro_logu(r, 0.5, 3.0)
+    t = np.arange(n, dtype=np.float64)
+    A = max(ref * _c128_hydro_logu(r, 0.03, 1.5), 6.0 * g)
+    ev = _c128_hydro_events(r, n, r.uniform(0.0, 7.0), _c128_hydro_logu(r, 2.0, 30.0), _c128_hydro_logu(r, 6.0, 100.0),
+                            _c128_hydro_logu(r, 80.0, 1500.0), r.uniform(0.3, 0.9), 0.8)
+    x = lvl + A * ev
+    x += _c128_hydro_slow(r, n, r.uniform(24.0, 96.0), r.uniform(300.0, 3000.0), A * r.uniform(0.03, 0.3))
+    x += r.normal(0.0, 0.2) * A * t / 4096.0
+    w = r.random()
+    if ea and w < 0.14:  # tidally influenced reach: M2 + S2 spring-neap, M4 asymmetry, drained low water
+        At = max(ref * r.uniform(0.05, 0.6), 8.0 * g)
+        ph = r.uniform(0.0, 2.0 * np.pi, 3)
+        tide = (np.cos(2.0 * np.pi * t / _C128_HYDRO_M2 + ph[0]) + r.uniform(0.15, 0.45) * np.cos(2.0 * np.pi * t / _C128_HYDRO_S2 + ph[1])
+                + r.uniform(0.0, 0.25) * np.cos(4.0 * np.pi * t / _C128_HYDRO_M2 + ph[2]))
+        x = x + At * tide
+        if r.random() < 0.5:
+            x = np.maximum(x, lvl + At * r.uniform(-0.8, 0.0))
+    elif w < 0.30:  # small daily cycle (evapotranspiration, snowmelt, hydropeaking)
+        Ad = max(A * r.uniform(0.02, 0.2), 1.5 * g)
+        x = x + Ad * _c128_hydro_wave(t, 96.0, r.random(), r.uniform(0.0, 0.7))
+    elif w < 0.42:  # regulated reach: held pool levels with abrupt operator steps, or periodic pumping dips
+        if r.random() < 0.6:
+            m = int(r.integers(2, 11))
+            cp = np.sort(r.integers(0, n, m))
+            lv = np.cumsum(r.normal(0.0, 0.5 * A, m + 1))
+            x = lvl + lv[np.searchsorted(cp, np.arange(n), side="right")] + 0.15 * (x - lvl)
+        else:
+            per = r.uniform(60.0, 220.0)
+            ph = (t / per + r.random()) % 1.0
+            x = x - A * r.uniform(0.3, 1.0) * np.exp(-0.5 * (ph / (r.uniform(2.0, 8.0) / per)) ** 2)
+    x = x + r.normal(0.0, g * r.uniform(0.05, 0.7), n)
+    return _c128_hydro_grid(x, g), not ea
+
+
+def _c128_hydro_flow(r, n):
+    usgs = r.random() < 0.55
+    t = np.arange(n, dtype=np.float64)
+    if r.random() < 0.06:  # daily streamflow record: annual snowmelt cycle + storms
+        base = _c128_hydro_logu(r, 5.0, 50000.0)
+        yr = np.exp(r.uniform(0.3, 1.5) * _c128_hydro_wave(t, 365.25, r.random(), r.uniform(0.0, 0.6)))
+        ev = _c128_hydro_events(r, n, r.uniform(10.0, 60.0), r.uniform(1.0, 3.0), r.uniform(3.0, 15.0), r.uniform(30.0, 120.0),
+                                r.uniform(0.4, 0.8), 0.9)
+        q = base * yr * np.exp(_c128_hydro_ar1(r, n, 0.97, r.uniform(0.05, 0.25))) + base * r.uniform(0.2, 3.0) * ev
+        return _c128_hydro_sig(np.maximum(q, 0.0)), True
+    base = _c128_hydro_logu(r, 0.02, 3000.0) if usgs else (_c128_hydro_logu(r, 0.01, 3.0) if r.random() < 0.75 else _c128_hydro_logu(r, 3.0, 30.0))
+    ev = _c128_hydro_events(r, n, r.uniform(0.0, 6.0), _c128_hydro_logu(r, 2.0, 40.0), _c128_hydro_logu(r, 8.0, 150.0),
+                            _c128_hydro_logu(r, 100.0, 2000.0), r.uniform(0.4, 0.9), 1.0)
+    bf = base * np.exp(_c128_hydro_slow(r, n, r.uniform(24.0, 96.0), r.uniform(500.0, 4000.0), r.uniform(0.03, 0.25)))
+    bf = bf * np.exp(-t / _c128_hydro_logu(r, 2000.0, 40000.0))
+    q = bf + base * _c128_hydro_logu(r, 0.3, 40.0) * ev
+    if r.random() < 0.2:
+        q = q * (1.0 + r.uniform(0.02, 0.2) * _c128_hydro_wave(t, 96.0, r.random(), r.uniform(0.0, 0.6)))
+    q = q * np.exp(_c128_hydro_ar1(r, n, r.uniform(0.3, 0.95), r.uniform(0.0001, 0.0015)) + r.normal(0.0, r.uniform(0.0, 0.004), n))
+    if r.random() < 0.08:  # intermittent channel: zero flow between events
+        q = q - base * r.uniform(0.5, 1.2)
+    q = np.maximum(q, 0.0)
+    if usgs:
+        return np.round(_c128_hydro_sig(q), 2), True
+    return _c128_hydro_grid(q, 0.001), False
+
+
+def _c128_hydro_ground(r, n):
+    lvl = r.uniform(20.0, 150.0)
+    t = np.arange(n, dtype=np.float64)
+    tau = _c128_hydro_logu(r, 300.0, 20000.0)
+    D = r.uniform(0.0008, 0.004) * n * (-1.0 if r.random() < 0.78 else 1.0)
+    x = lvl + D * (1.0 - np.exp(-t / tau)) / (1.0 - np.exp(-n / tau))
+    if r.random() < 0.35:  # recharge pulses
+        x += r.uniform(0.05, 1.0) * _c128_hydro_events(r, n, r.uniform(1.0, 6.0), _c128_hydro_logu(r, 3.0, 60.0),
+                                                        _c128_hydro_logu(r, 30.0, 600.0), _c128_hydro_logu(r, 300.0, 3000.0), 0.6, 0.5)
+    if r.random() < 0.12:  # abrupt drawdown that then recovers / keeps receding
+        c = int(r.integers(n // 5, max(n // 5 + 1, 4 * n // 5)))
+        x[c:] -= r.uniform(0.2, 1.5) * (1.0 - r.uniform(0.0, 0.6) * (1.0 - np.exp(-(t[c:] - c) / r.uniform(20.0, 300.0))))
+    if r.random() < 0.6:  # earth-tide / barometric wiggle, millimetres
+        x += r.uniform(0.0003, 0.0015) * np.cos(2.0 * np.pi * t / 12.42 + r.uniform(0, 6.3))
+        x += r.uniform(0.0, 0.001) * np.cos(2.0 * np.pi * t / 24.0 + r.uniform(0, 6.3))
+    x += r.normal(0.0, r.uniform(0.0002, 0.0015), n)
+    return _c128_hydro_grid(x, 0.001 if r.random() < 0.85 else 0.01), False
+
+
+def _c128_hydro_geomag(r, n):
+    v = r.random()
+    lvl = r.uniform(44000.0, 56000.0) if v < 0.45 else (r.uniform(10000.0, 30000.0) if v < 0.85 else r.uniform(-4000.0, 4000.0))
+    P = 1440.0
+    t = np.arange(n, dtype=np.float64)
+    tod = (t / P + r.random()) % 1.0
+    c, w = r.uniform(0.3, 0.7), r.uniform(0.05, 0.11)
+    d = (tod - c + 0.5) % 1.0 - 0.5
+    sq = np.exp(-0.5 * (d / w) ** 2)
+    d2 = (tod - c - r.uniform(0.15, 0.3) + 0.5) % 1.0 - 0.5
+    sq = sq - r.uniform(0.0, 0.4) * np.exp(-0.5 * (d2 / r.uniform(0.06, 0.15)) ** 2)
+    sq = (sq - sq.mean()) / max(np.ptp(sq), 1e-9)
+    pp = _c128_hydro_logu(r, 15.0, 70.0) * (-1.0 if r.random() < 0.75 else 1.0)
+    x = lvl + pp * sq * _c128_hydro_dayfac(r, n, int(P), r.uniform(0.08, 0.3))
+    x += r.uniform(-4.0, 4.0) * t / P
+    x += _c128_hydro_slow(r, n, r.uniform(20.0, 60.0), r.uniform(100.0, 800.0), r.uniform(0.5, 4.0))
+    fast = _c128_hydro_leak(_c128_hydro_ar1(r, n, r.uniform(0.2, 0.5), r.uniform(0.04, 0.6)), r.uniform(0.97, 0.995))
+    if r.random() < 0.2:  # storm: sudden commencement, main-phase depression, slow recovery, noisier field
+        t0 = int(r.integers(0, n))
+        tm = t[t0:] - t0
+        ramp = np.clip(tm / r.uniform(120.0, 720.0), 0.0, 1.0)
+        x[t0:] += r.uniform(5.0, 40.0) * np.exp(-tm / 90.0) - r.uniform(20.0, 250.0) * ramp * np.exp(-np.maximum(tm - 720.0, 0.0) / r.uniform(600.0, 4000.0))
+        fast[t0:] *= 1.0 + r.uniform(1.0, 5.0) * np.exp(-tm / r.uniform(300.0, 2000.0))
+    x += fast + r.normal(0.0, r.uniform(0.0, 0.08), n)
+    return _c128_hydro_grid(x, 0.1 if r.random() < 0.55 else 0.01), False
+
+
+def _c128_hydro_rainlike(r, n):
+    lam = _c128_hydro_logu(r, 0.003, 0.04) * _c128_hydro_dayfac(r, n, int(96 * r.uniform(1.0, 4.0)), 1.0)
+    st = np.flatnonzero(r.random(n) < np.minimum(lam, 0.5))
+    wet = np.zeros(n + 1, dtype=np.float64)
+    if st.size:
+        dur = r.geometric(1.0 / r.uniform(2.0, 12.0), st.size)
+        np.add.at(wet, st, 1.0)
+        np.add.at(wet, np.minimum(st + dur, n), -1.0)
+    wet = np.cumsum(wet[:n]) > 0
+    inten = r.gamma(r.uniform(1.0, 3.0), _c128_hydro_logu(r, 0.01, 0.12), n) * np.exp(_c128_hydro_ar1(r, n, 0.9, 0.8))
+    x = np.where(wet, inten, 0.0)
+    u = r.random()
+    if u < 0.15:  # tipping bucket: whole tips, remainder carried forward
+        tip = 0.2 if r.random() < 0.7 else 0.5
+        c = np.floor(np.cumsum(x) / tip)
+        return np.diff(np.concatenate([[0.0], c])) * tip
+    return _c128_hydro_grid(x, 0.01 if u < 0.85 else 0.1)
+
+
+def _c128_hydro_rain(r, n):
+    return _c128_hydro_rainlike(r, n), False
