@@ -21624,3 +21624,297 @@ class Generator(_C124B2Parent):
 
 # physical tidal constituent periods in hours (constants of astronomy, not fitted values)
 _C128_TIDAL_SEMI_H = np.array([12.4206012, 12.0, 12.6583475, 11.9672361])      # M2 S2 N2 K2
+_C128_TIDAL_DIUR_H = np.array([23.9344697, 25.8193417, 24.0658877, 26.8683567])  # K1 O1 P1 Q1
+_C128_TIDAL_OVER_H = np.array([8.1771399, 6.2103006, 6.1033393, 4.1402004])      # MK3 M4 MS4 M6
+_C128_TIDAL_SEMI_REL = np.array([1.0, 0.46, 0.19, 0.127])
+_C128_TIDAL_DIUR_REL = np.array([1.0, 0.71, 0.33, 0.14])
+_C128_TIDAL_CAD_MIN = np.array([1.0, 2.0, 3.0, 5.0, 6.0, 10.0, 15.0])
+_C128_TIDAL_CAD_CUM = np.cumsum([0.70, 0.09, 0.06, 0.05, 0.03, 0.04, 0.03])
+_C128_TIDAL_SUB_CUM = np.cumsum([0.64, 0.06, 0.16, 0.14])
+_C128_TIDAL_TWO_PI = 2.0 * np.pi
+
+
+def _c128_tidal_lu(r, lo, hi):
+    """log-uniform scalar"""
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+
+def _c128_tidal_fnoise(r, n, f_corner, order=2.0, peak=None):
+    """Unit-std Gaussian noise of length n with a shaped spectrum (FFT filter, no loops).
+    f_corner: low-pass corner in cycles/sample (amplitude ~ (1+(f/fc)^2)^(-order/2));
+    peak=(f0, bw): narrow band around f0 instead (harbour seiche)."""
+    m = 1 << int(np.ceil(np.log2(max(2 * n, 64))))
+    f = np.fft.rfftfreq(m)
+    if peak is None:
+        amp = (1.0 + (f / max(f_corner, 1e-9)) ** 2) ** (-0.5 * order)
+    else:
+        f0, bw = peak
+        amp = 1.0 / (1.0 + ((f - f0) / max(bw, 1e-9)) ** 2)
+    spec = (r.standard_normal(f.size) + 1j * r.standard_normal(f.size)) * amp
+    spec[0] = 0.0
+    x = np.fft.irfft(spec, m)[:n]
+    s = float(x.std())
+    return x / s if s > 0 else x
+
+
+def _c128_tidal_rough(r, n, d_sd, lo=2.0, hi=15.0):
+    """smooth short-scale noise (power ~ f^-4 above a corner of lo..hi samples) whose per-step increments have
+    standard deviation d_sd and are positively correlated (sensor / turbulence wander, not white noise)"""
+    z = _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(lo, hi)), order=2.0)
+    dz = float(np.std(np.diff(z))) if n > 2 else 1.0
+    return z * (d_sd / max(dz, 1e-12))
+
+
+def _c128_tidal_quant(x, q):
+    return np.round(x / q) * q
+
+
+def _c128_tidal_len(r, L, p_full, lo, hi):
+    if r.random() < p_full:
+        return L
+    hi = max(min(hi, L), 8)
+    lo = max(min(lo, hi), 8)
+    return int(min(L, max(8, round(_c128_tidal_lu(r, lo, hi + 1e-9)))))
+
+
+def _c128_tidal_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+
+def _c128_tidal_harm(th, periods_h, amps, phases):
+    """sum_j amps_j * cos(2 pi th / P_j + ph_j) over hours th"""
+    arg = np.outer(_C128_TIDAL_TWO_PI / periods_h, th) + phases[:, None]
+    return (amps[:, None] * np.cos(arg)).sum(axis=0)
+
+
+def _c128_tidal_gauge(r, L):
+    cad = float(_C128_TIDAL_CAD_MIN[int(np.searchsorted(_C128_TIDAL_CAD_CUM, r.random() * _C128_TIDAL_CAD_CUM[-1]))])
+    if cad <= 1.0:
+        n = _c128_tidal_len(r, L, 0.62, 300, L)
+    else:
+        n = _c128_tidal_len(r, L, 0.30, 300, 1700)
+    th = (np.arange(n, dtype=np.float64) + r.uniform(0.0, 1e5)) * (cad / 60.0)
+    # --- astronomy: semidiurnal amplitude log-uniform, diurnal via form factor F = (K1+O1)/(M2+S2)
+    a2 = _c128_tidal_lu(r, 0.02, 1.4)
+    semi = a2 * _C128_TIDAL_SEMI_REL * np.exp(r.normal(0.0, 0.25, 4))
+    semi[0] = a2
+    form = float(np.clip(np.exp(r.normal(np.log(0.6), 0.95)), 0.03, 8.0))
+    a1 = form * (semi[0] + semi[1])
+    k1 = a1 * r.uniform(0.5, 0.66)
+    diur = np.array([k1, a1 - k1, 0.0, 0.0])
+    diur[2] = diur[0] * _C128_TIDAL_DIUR_REL[2] * np.exp(r.normal(0.0, 0.2))
+    diur[3] = diur[1] * 0.19 * np.exp(r.normal(0.0, 0.25))
+    if r.random() < 0.14:      # shallow-water / estuary gauge: strong overtides, asymmetric rise and fall
+        r4 = r.uniform(0.07, 0.3)
+        r6 = r.uniform(0.03, 0.1)
+    else:
+        r4 = float(np.clip(np.exp(r.normal(np.log(0.03), 0.8)), 0.0, 0.25))
+        r6 = float(np.clip(np.exp(r.normal(np.log(0.012), 0.8)), 0.0, 0.08))
+    over = a2 * np.array([float(np.clip(np.exp(r.normal(np.log(0.03), 0.8)), 0.0, 0.2)), r4, r4 * r.uniform(0.3, 0.7), r6])
+    periods = np.concatenate((_C128_TIDAL_SEMI_H, _C128_TIDAL_DIUR_H, _C128_TIDAL_OVER_H))
+    amps = np.concatenate((semi, diur, over))
+    phases = r.uniform(0.0, _C128_TIDAL_TWO_PI, periods.size)
+    x = _c128_tidal_harm(th, periods, amps, phases)
+    a_tot = float(semi[0] + semi[1] + diur[0] + diur[1])
+    # --- surge / non-tidal residual: smooth (power ~ f^-4 above a corner of 6..72 h)
+    s_surge = float(np.clip(a_tot * np.exp(r.normal(np.log(0.1), 0.6)), 0.006, 0.35)) + _c128_tidal_lu(r, 0.003, 0.025)
+    t_corner = r.uniform(2.0, 24.0) * 60.0 / cad        # samples
+    x = x + s_surge * _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * t_corner), order=2.0)
+    # --- harbour seiche: narrow band at 8..90 min, intermittent envelope
+    if r.random() < 0.6:
+        p_s = _c128_tidal_lu(r, 8.0, 90.0) / cad           # samples
+        if p_s >= 2.5:
+            q = r.uniform(4.0, 25.0)
+            amp_s = _c128_tidal_lu(r, 0.0015, 0.035)
+            if a_tot < 0.08 and r.random() < 0.5:        # micro-tidal basin: seiche rivals the tide
+                amp_s = amp_s * r.uniform(1.5, 4.0)
+            env = np.exp(0.45 * _c128_tidal_fnoise(r, n, cad / (60.0 * 18.0), order=2.0))
+            x = x + amp_s * env / max(float(np.sqrt(np.mean(env * env))), 1e-9) * \
+                _c128_tidal_fnoise(r, n, 0.0, peak=(1.0 / p_s, 1.0 / (p_s * q)))
+    # --- sensor noise: mostly quiet (sub-mm..mm), sometimes a noisy pressure/radar sensor (cm)
+    if r.random() < 0.8:
+        s_w = _c128_tidal_lu(r, 0.0005, 0.01)
+    else:
+        s_w = _c128_tidal_lu(r, 0.01, 0.05)
+    if r.random() < 0.35:
+        e = r.standard_t(float(r.uniform(2.5, 6.0)), n)
+        e = e / max(float(e.std()), 1e-9)
+    else:
+        e = r.standard_normal(n)
+    x = x + s_w * e
+    # --- rare sensor events: single-point spikes, a datum step, dropouts to zero
+    if r.random() < 0.12:
+        k = int(r.poisson(max(n * r.uniform(0.0002, 0.001), 0.5))) + 1
+        idx = r.integers(0, n, k)
+        x[idx] += r.choice(np.array([-1.0, 1.0]), k) * r.uniform(4.0, 30.0, k) * max(s_w, 0.004)
+    if r.random() < 0.04:
+        j = int(r.integers(n // 8, max(n // 8 + 1, n - n // 8)))
+        x[j:] += r.choice(np.array([-1.0, 1.0])) * r.uniform(0.02, 0.3)
+    # --- datum: chart datum below the tide (positive), negative datum feeds, large offsets
+    half_range = 1.1 * float(np.max(np.abs(x))) if n else 1.0
+    u = r.random()
+    if u < 0.6:
+        datum = half_range * r.uniform(0.9, 2.2) + r.uniform(0.0, 1.6)
+    elif u < 0.76:
+        datum = r.uniform(2.5, 7.0)
+    elif u < 0.92:
+        datum = -r.uniform(1.2, 8.5)
+    else:                     # datum inside the tidal range: the record crosses zero
+        datum = half_range * r.uniform(-0.8, 0.8)
+    x = x + datum
+    if r.random() < 0.03:
+        k = int(r.integers(1, 4))
+        x[r.integers(0, n, k)] = 0.0
+    u = r.random()
+    qd = 0.001 if u < 0.87 else (0.01 if u < 0.93 else 0.0001)
+    x = _c128_tidal_quant(x, qd)
+    return _c128_tidal_pad(x, L)
+
+
+def _c128_tidal_aux(r, L):
+    cad = float(r.choice(np.array([1.0, 2.0, 3.0, 5.0, 6.0])))
+    n = _c128_tidal_len(r, L, 0.35, 800, L)
+    q = 0.001 if r.random() < 0.75 else 0.01
+    level = r.uniform(0.1, 0.2) if r.random() < 0.55 else _c128_tidal_lu(r, 1.0, 15.0)
+    t = np.arange(n, dtype=np.float64)
+    day = 1440.0 / cad
+    if r.random() < 0.7:
+        # flicker: a value parked near a rounding boundary, slow wander of ~1 quantum, long runs
+        x = level + q * r.uniform(0.3, 1.5) * _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(0.1, 1.0) * day), 2.0)
+        x = x + q * r.uniform(0.3, 0.8) * _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(1.5, 12.0)), 2.0)
+        x = x + q * r.uniform(0.0, 1.0) * np.cos(_C128_TIDAL_TWO_PI * (t / day + r.random()))
+    else:
+        # daily charge cycle of several quanta with sensor wander
+        shape = np.cos(_C128_TIDAL_TWO_PI * (t / day + r.random()))
+        if r.random() < 0.5:
+            shape = np.maximum(shape, r.uniform(-0.2, 0.4))
+        x = level + q * r.uniform(3.0, 15.0) * shape
+        x = x + q * r.uniform(0.5, 3.0) * _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(0.05, 0.5) * day), 2.0)
+        x = x + q * r.uniform(0.2, 0.7) * r.standard_normal(n)
+    if r.random() < 0.4:   # rare multi-quantum blips
+        b = (r.random(n) < r.uniform(0.001, 0.006)).astype(np.float64) * r.choice(np.array([-4.0, -2.0, 2.0, 4.0]), n)
+        x = x + q * b
+    if r.random() < 0.1:   # discharge / recharge step
+        j = int(r.integers(n // 4, max(n // 4 + 1, n - n // 4)))
+        x[j:] += q * r.uniform(2.0, 10.0) * r.choice(np.array([-1.0, 1.0]))
+    return _c128_tidal_pad(_c128_tidal_quant(x, q), L)
+
+
+def _c128_tidal_press(r, L):
+    u = r.random()
+    if u < 0.5:
+        cad = 1.0
+        n = _c128_tidal_len(r, L, 0.85, 1000, L)
+    elif u < 0.92:
+        cad = 60.0
+        n = _c128_tidal_len(r, L, 0.08, 900, 1900)
+    else:
+        cad = float(r.choice(np.array([6.0, 10.0, 15.0])))
+        n = _c128_tidal_len(r, L, 0.6, 800, L)
+    th = (np.arange(n, dtype=np.float64) + r.uniform(0.0, 1e5)) * (cad / 60.0)
+    level = float(np.clip(r.normal(1014.5, 5.0), 990.0, 1030.0))
+    a12 = r.uniform(0.55, 1.3) if r.random() < 0.6 else r.uniform(0.12, 0.6)
+    amps = np.array([a12, a12 * r.uniform(0.15, 0.9), a12 * r.uniform(0.0, 0.15)])
+    x = _c128_tidal_harm(th, np.array([12.0, 24.0, 8.0]), amps, r.uniform(0.0, _C128_TIDAL_TWO_PI, 3))
+    if cad <= 1.0:
+        s_syn = _c128_tidal_lu(r, 0.25, 1.8)
+        t_c = r.uniform(4.0, 30.0) * 60.0 / cad
+        x = x + s_syn * _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * t_c), order=2.0)
+    else:
+        s_syn = _c128_tidal_lu(r, 1.5, 6.5)
+        t_c = r.uniform(12.0, 72.0) * 60.0 / cad
+        x = x + s_syn * _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * t_c), order=2.0)
+    if r.random() < 0.12:   # passing cyclone / deep low
+        c0 = r.uniform(0.15, 1.1) * n
+        w = r.uniform(4.0, 30.0) * 60.0 / cad
+        x = x - r.uniform(3.0, 25.0) * np.exp(-0.5 * ((np.arange(n) - c0) / w) ** 2)
+    if cad <= 1.0:   # per-minute wander of 0.01..0.04 hPa, positively correlated
+        d_sd = _c128_tidal_lu(r, 0.008, 0.035)
+        x = x + _c128_tidal_rough(r, n, d_sd, 1.5, 10.0)
+        e = r.standard_t(float(r.uniform(2.2, 4.0)), n)
+        x = x + d_sd * r.uniform(0.2, 0.6) * e / max(float(e.std()), 1e-9)
+    else:            # hourly mesoscale wiggles of 0.25..0.7 hPa per step
+        x = x + _c128_tidal_rough(r, n, r.uniform(0.2, 0.6), 1.2, 5.0)
+        e = r.standard_t(float(r.uniform(2.2, 4.0)), n)
+        x = x + r.uniform(0.05, 0.25) * e / max(float(e.std()), 1e-9)
+    x = level + x
+    v = r.random()
+    if cad <= 1.0:
+        q = 0.01 if v < 0.85 else 0.001
+    else:
+        q = 0.001 if v < 0.5 else (0.01 if v < 0.8 else 0.1)
+    x = _c128_tidal_quant(x, q)
+    if r.random() < 0.25:   # slow-reporting logger: values held between updates
+        h = r.random(n) < r.uniform(0.1, 0.45)
+        h[0] = False
+        x = x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
+    return _c128_tidal_pad(x, L)
+
+
+def _c128_tidal_buoy(r, L):
+    kind = float(r.random())
+    fifteen = r.random() < 0.35
+    cad = 15.0 if fifteen else 60.0
+    n = _c128_tidal_len(r, L, 0.85 if fifteen else 0.08, 900, L if fifteen else 1900)
+    t = np.arange(n, dtype=np.float64)
+    day = 1440.0 / cad
+    diel = np.cos(_C128_TIDAL_TWO_PI * (t / day + r.random()))
+    syn = _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(0.8, 6.0) * day), 1.7)
+    syn = syn + r.uniform(0.0, 1.2) * r.choice(np.array([-1.0, 1.0])) * (t / max(n, 1) - 0.5)   # seasonal drift
+    syn = syn / max(float(syn.std()), 1e-9)
+    ht = r.standard_t(float(r.uniform(2.2, 5.0)), n)
+    ht = ht / max(float(ht.std()), 1e-9)
+    if kind < 0.3:          # significant wave height: lognormal, storms rise fast, decay slowly
+        lg = np.log(r.uniform(0.3, 1.5)) + r.uniform(0.35, 0.7) * syn
+        k = int(r.poisson(max(n / (day * r.uniform(4.0, 12.0)), 0.3)))
+        for _ in range(k):
+            c = int(r.integers(0, n))
+            rise = r.uniform(0.1, 0.5) * day
+            fall = r.uniform(0.4, 2.0) * day
+            tt = t - c
+            lg = lg + r.uniform(0.5, 1.6) * np.where(tt < 0, np.exp(tt / rise), np.exp(-tt / fall))
+        lg = lg + r.uniform(0.02, 0.08) * r.standard_normal(n)
+        x = np.exp(lg)
+        x = _c128_tidal_quant(x, 0.0001 if r.random() < 0.5 else 0.01)
+    elif kind < 0.42:       # dominant wave period (s): jumpy between spectral bins, sticky
+        lg = np.log(r.uniform(4.0, 9.0)) + r.uniform(0.15, 0.35) * syn + r.uniform(0.08, 0.25) * r.standard_normal(n)
+        x = np.clip(np.exp(lg), 1.5, 22.0)
+        x = _c128_tidal_quant(x, 0.01 if r.random() < 0.5 else 0.001)
+        h = r.random(n) < r.uniform(0.1, 0.35)
+        h[0] = False
+        x = x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
+    elif kind < 0.55:       # relative humidity (%): diurnal, synoptic, capped at 100
+        x = r.uniform(65.0, 90.0) + r.uniform(0.5, 4.0) * diel + r.uniform(3.0, 9.0) * syn + _c128_tidal_rough(r, n, r.uniform(0.6, 2.5), 1.5, 6.0) + r.uniform(0.0, 0.5) * ht
+        x = np.minimum(x, 100.0)
+        x = _c128_tidal_quant(x, 0.01 if r.random() < 0.6 else 0.1)
+    elif kind < 0.76:       # air / water temperature (deg C)
+        if r.random() < 0.5:   # water: small diurnal, slow
+            x = r.uniform(8.0, 31.0) + r.uniform(0.02, 0.4) * diel + r.uniform(0.1, 1.6) * syn
+        else:
+            x = r.uniform(5.0, 30.0) + r.uniform(0.3, 2.0) * diel + r.uniform(0.8, 3.0) * syn
+        x = x + _c128_tidal_rough(r, n, r.uniform(0.04, 0.45), 1.5, 6.0) + r.uniform(0.0, 0.06) * ht
+        x = _c128_tidal_quant(x, 0.01 if r.random() < 0.8 else 0.1)
+    elif kind < 0.82:       # direction (deg): circular walk wrapped to [0, 360)
+        w = np.cumsum(r.uniform(2.0, 25.0) * ht) + r.uniform(0.0, 360.0) + 60.0 * syn
+        x = _c128_tidal_quant(np.mod(w, 360.0), 0.01 if r.random() < 0.7 else 1.0)
+    elif kind < 0.92:       # small positive rough channel (drone wave / precip proxies, 0.01 grid)
+        x = r.uniform(0.015, 0.07) * np.exp(r.uniform(0.25, 0.6) * r.standard_normal(n) + 0.3 * syn)
+        x = np.maximum(_c128_tidal_quant(x, 0.01), 0.01)
+    else:                   # wind speed (m/s): Rayleigh-like magnitude of a smooth vector, weak diurnal
+        s2 = _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(0.2, 1.5) * day), 2.0)
+        m0 = r.uniform(2.0, 8.0)
+        x = np.hypot(m0 + r.uniform(1.0, 4.0) * syn, r.uniform(1.0, 4.0) * s2) * (1.0 + 0.1 * diel)
+        x = x * np.exp(r.uniform(0.03, 0.15) * ht)
+        x = _c128_tidal_quant(x, 0.01 if r.random() < 0.6 else 0.001)
+    if kind >= 0.42 and r.random() < 0.3:   # held reports
+        h = r.random(n) < r.uniform(0.2, 0.5)
+        h[0] = False
+        x = x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
+    return _c128_tidal_pad(x, L)
