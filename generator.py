@@ -20737,6 +20737,270 @@ class Generator(_W86BParent):
             base.close()
 
 
+# ═══════════════ c159: c145's six shapes after king-147's s2 ═══════════════
+# This stage sits where it sits in c145, after the weakness channel and before k. A row that is still one channel draws c145's coin. On a hit,
+# and when the tail is not quiet and the row is not integer-valued, one hardcoded shape is stacked
+# under it as channel 1.
+# Channel 0 stays the parent row. The six shapes are the ones that stay worse than the warm start
+# on every official pool from 2026-09-25 through 2026-09-30 and are not the four c124 modules:
+# a smooth daily share, a jumpy daily panel, a weekday count ledger, a smooth climate level,
+# a weekly cash balance, and a held intraday series (price holds, dispatch counts, latency, sparse notes).
+_P25_Q = 0.90  # leftover eligible rows are scarce once c124 has taken its share; this hits most of them
+_P25_COIN_TAG = 0xC125A001
+_P25_XOR = 0xC1255EED
+_P25_TAG = 0xC125BA4D
+_FORK_DEDUP_TAG = 1110921
+_P25_FAMILIES = (
+    ("daily_share", 0.30),
+    ("daily_quote", 0.24),
+    ("weekday_counts", 0.18),
+    ("smooth_climate", 0.12),
+    ("weekly_cash", 0.08),
+    ("held_intraday", 0.08),
+)
+_P25_CUM = np.cumsum([w for _, w in _P25_FAMILIES])
+
+
+def _p25_len(r, lo, hi):
+    return int(r.integers(lo, hi + 1))
+
+
+def _p25_ar1(r, n, phi, sd):
+    phi = float(np.clip(phi, -0.99, 0.99))
+    e = r.standard_normal(n) * sd * np.sqrt(max(1.0 - phi * phi, 1e-8))
+    out = np.empty(n, dtype=np.float64)
+    out[0] = r.standard_normal() * sd
+    for t in range(1, n):
+        out[t] = phi * out[t - 1] + e[t]
+    return out
+
+
+def _p25_daily_share(r):
+    # smooth daily proportion: strong day-to-day and weekly persistence, small steps
+    n = _p25_len(r, 400, 2500)
+    level = r.uniform(0.04, 0.85) if r.random() < 0.75 else r.uniform(0.85, 8.0)
+    span = level * r.uniform(0.08, 0.45)
+    t = np.arange(n, dtype=np.float64)
+    week = np.sin(2.0 * np.pi * (t + r.uniform(0, 7)) / 7.0)
+    year = np.sin(2.0 * np.pi * (t + r.uniform(0, 365)) / r.uniform(300.0, 380.0))
+    x = level + span * (0.55 * week + 0.35 * year) + span * 0.12 * _p25_ar1(r, n, r.uniform(0.92, 0.985), 1.0)
+    x = np.clip(x, 0.0, None)
+    dp = 4 if r.random() < 0.6 else 5
+    return np.round(x, dp)
+
+
+def _p25_daily_quote(r):
+    # jumpy daily panel: mean-reverting, a single step is a large share of the range, about half the points on a tick
+    n = _p25_len(r, 500, 1600)
+    level = float(np.exp(r.uniform(np.log(40.0), np.log(20000.0))))
+    phi = r.uniform(0.35, 0.72)
+    sig = r.uniform(0.12, 0.38)
+    z = _p25_ar1(r, n, phi, sig)
+    x = level * np.exp(np.clip(z, -4.0, 4.0))
+    if r.random() < 0.5:
+        tick = 1.0 if r.random() < 0.7 else 0.5
+        held = r.random(n) < r.uniform(0.35, 0.65)
+        y = np.round(x / tick) * tick
+        x = np.where(held, y, np.round(x, 2))
+    else:
+        x = np.round(x, int(r.integers(1, 4)))
+    return x
+
+
+def _p25_weekday_counts(r):
+    # calendar-daily counts: weekend dip, overdispersed, weekly profile stronger than day-to-day memory
+    n = _p25_len(r, 400, 4096)
+    mu = float(np.exp(r.uniform(np.log(2.0), np.log(8000.0))))
+    dow = np.array([1.05, 1.08, 1.0, 0.98, 0.95, r.uniform(0.15, 0.55), r.uniform(0.08, 0.4)], dtype=np.float64)
+    if r.random() < 0.25:  # seven-day activity, mild weekend change
+        dow[5] = r.uniform(0.7, 1.15)
+        dow[6] = r.uniform(0.55, 1.05)
+    dow = dow / dow.mean()
+    phase = int(r.integers(0, 7))
+    rate = mu * dow[(np.arange(n) + phase) % 7]
+    rate = rate * np.exp(_p25_ar1(r, n, r.uniform(0.2, 0.65), r.uniform(0.15, 0.45)))
+    k = float(np.exp(r.uniform(np.log(1.5), np.log(12.0))))
+    lam = np.clip(rate * r.gamma(k, 1.0 / k, n), 0.0, 1e7)
+    return r.poisson(lam).astype(np.float64)
+
+
+def _p25_smooth_climate(r):
+    # near-unit autocorrelation and tiny steps: a daily seasonal level, or a smoother sub-daily wave
+    if r.random() < 0.65:
+        n = _p25_len(r, 800, 4096)
+        level = r.uniform(-1.5, 32.0)
+        amp = r.uniform(1.5, 10.0)
+        t = np.arange(n, dtype=np.float64)
+        year = np.sin(2.0 * np.pi * (t + r.uniform(0, 365)) / r.uniform(340.0, 380.0))
+        x = level + amp * year + amp * 0.08 * _p25_ar1(r, n, r.uniform(0.97, 0.995), 1.0)
+        return np.round(x, 2 if r.random() < 0.7 else 3)
+    n = 4096 if r.random() < 0.7 else _p25_len(r, 2000, 4096)
+    p = 24 if r.random() < 0.8 else 48
+    level = float(np.exp(r.uniform(np.log(0.4), np.log(40.0))))
+    amp = level * r.uniform(0.15, 0.8)
+    t = np.arange(n, dtype=np.float64)
+    tide = np.sin(2.0 * np.pi * (t + r.uniform(0, p)) / p)
+    slow = np.sin(2.0 * np.pi * (t + r.uniform(0, 24 * 14)) / r.uniform(24.0 * 3, 24.0 * 20))
+    x = level + amp * (0.65 * tide + 0.35 * slow) + amp * 0.04 * _p25_ar1(r, n, r.uniform(0.985, 0.998), 1.0)
+    return np.clip(np.round(x, 2), 0.0, None)
+
+
+def _p25_weekly_cash(r):
+    # large integer balance: mostly flat inside the week, the moves land on a weekly grid
+    n = _p25_len(r, 300, 2000)
+    level = float(np.exp(r.uniform(np.log(2e4), np.log(5e7))))
+    step = 5 if r.random() < 0.7 else 7
+    x = np.empty(n, dtype=np.float64)
+    v = level
+    for t in range(n):
+        if t % step == 0 and t > 0:
+            v = max(v * np.exp(r.normal(0.0, r.uniform(0.04, 0.18))), 1.0)
+        x[t] = v
+    return np.round(x)
+
+
+def _p25_held_intraday(r):
+    u = r.random()
+    if u < 0.45:
+        # sub-daily price with repeated prints and a daily wave
+        n = 4096 if r.random() < 0.6 else _p25_len(r, 1500, 4096)
+        p = 48
+        level = float(np.exp(r.uniform(np.log(5.0), np.log(400.0))))
+        t = np.arange(n, dtype=np.float64)
+        wave = np.sin(2.0 * np.pi * (t + r.uniform(0, p)) / p)
+        x = level * np.exp(0.25 * wave + 0.08 * _p25_ar1(r, n, 0.9, 1.0))
+        h = r.random(n) < r.uniform(0.12, 0.35)
+        h[0] = False
+        x = x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
+        return np.round(x, 2)
+    if u < 0.75:
+        # half-hour or hourly counts that keep empty and held bins
+        p = 48 if r.random() < 0.6 else 24
+        n = _p25_len(r, 800, 4096)
+        mu = float(np.exp(r.uniform(np.log(1.0), np.log(80.0))))
+        prof = 0.35 + 0.9 * np.clip(np.sin(2.0 * np.pi * (np.arange(p) / p - r.uniform(0.15, 0.4))), 0, None)
+        prof = prof / max(prof.mean(), 1e-6)
+        rate = mu * prof[np.arange(n) % p]
+        x = r.poisson(np.clip(rate, 0, 1e6)).astype(np.float64)
+        h = r.random(n) < r.uniform(0.08, 0.4)
+        h[0] = False
+        return x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
+    if u < 0.9:
+        n = 4096 if r.random() < 0.5 else _p25_len(r, 1000, 4096)
+        med = float(np.exp(r.uniform(np.log(2.0), np.log(80.0))))
+        x = med * np.exp(r.normal(0.0, r.uniform(0.25, 0.7), n))
+        spike = r.random(n) < r.uniform(0.01, 0.04)
+        x = np.where(spike, x * r.uniform(3.0, 12.0, n), x)
+        return np.round(x, 3)
+    n = _p25_len(r, 800, 3000)
+    p = 24
+    mu = r.uniform(0.2, 4.0)
+    prof = 0.2 + np.clip(np.sin(2.0 * np.pi * (np.arange(p) / p - 0.3)), 0, None)
+    rate = mu * (0.4 + prof[np.arange(n) % p])
+    x = r.poisson(np.clip(rate, 0, 100)).astype(np.float64)
+    if r.random() < 0.04:
+        inc = r.poisson(r.uniform(1.0, 30.0, n)).astype(np.float64)
+        x = np.cumsum(inc) + float(np.exp(r.uniform(np.log(1e5), np.log(1e9))))
+    return x
+
+
+_P25_BUILD = {
+    "daily_share": _p25_daily_share,
+    "daily_quote": _p25_daily_quote,
+    "weekday_counts": _p25_weekday_counts,
+    "smooth_climate": _p25_smooth_climate,
+    "weekly_cash": _p25_weekly_cash,
+    "held_intraday": _p25_held_intraday,
+}
+
+
+def _p25_one(r):
+    name = _P25_FAMILIES[int(np.searchsorted(_P25_CUM, r.random() * 0.999999))][0]
+    return _P25_BUILD[name](r)
+
+
+def _p25_row(r, L):
+    x = None
+    y = np.zeros(0)
+    for _ in range(4):
+        y = np.nan_to_num(np.asarray(_p25_one(r), dtype=np.float64).reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        if y.size >= 2 and np.any(y != y[0]):
+            x = y
+            break
+    if x is None:
+        x = np.array([0.0, 1.0]) if y.size < 2 else y.copy()
+        x[-1] = x[-1] + max(abs(float(x[-1])) * 1e-3, 1.0)
+    out = np.empty(L, dtype=np.float64)
+    if x.size >= L:
+        out[:] = x[x.size - L:]
+    else:
+        out[:L - x.size] = x[0]
+        out[L - x.size:] = x
+    np.clip(out, -1e30, 1e30, out=out)
+    return out
+
+
+class _P25Stream:
+    def __init__(self, seed):
+        self._seed = int(seed) & ((1 << 64) - 1)
+        self._k = 0
+
+    def next(self, L):
+        r = np.random.default_rng(np.random.SeedSequence([self._seed, _P25_TAG], spawn_key=(self._k,)))
+        self._k += 1
+        with np.errstate(all="ignore"):
+            return _p25_row(r, int(L))
+
+
+def _p25_add(stream, x):
+    if not (isinstance(x, np.ndarray) and x.ndim == 1 and x.dtype == np.float64 and x.size >= 2):
+        return None
+    try:
+        y = stream.next(x.size)
+    except Exception:
+        return None
+    z = np.empty((2, x.size), dtype=np.float64)
+    z[0] = x
+    z[1] = y
+    if (np.all(np.isfinite(z)) and np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12))
+            and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12) and np.array_equal(z[0], x)):
+        return z
+    return None
+
+
+_P25Parent = Generator
+
+
+class Generator(_P25Parent):
+    """king-147 records, plus c145's partner coin, slow_level, and the six-shape channel."""
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        self._p25_stream = _P25Stream((int(self._seed) ^ _P25_XOR) & ((1 << 64) - 1))
+
+    @property
+    def name(self) -> str:
+        return "c159p25"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if _P25_Q > 0.0 and np.ndim(x) == 1:
+                    u = np.random.default_rng(np.random.SeedSequence([seed, _P25_COIN_TAG], spawn_key=(i,))).random()
+                    if u < _P25_Q and not _k87_quiet(x) and not _w86b_intlike(x):
+                        z = _p25_add(self._p25_stream, x)
+                        if z is not None:
+                            x = z
+                yield x
+        finally:
+            base.close()
+
+
 # ═══════════════ k: micro-priced crypto channels (price below the scaler eps floor + huge volume) ═══════════════
 # Parent class unchanged; a record that is STILL univariate draws an independent coin under this block's tag and, on
 # success (same quiet rule), gets two channels stacked under it: an hourly micro-price walk whose level (1e-8..1e-5) and
