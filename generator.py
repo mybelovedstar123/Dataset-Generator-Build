@@ -21382,3 +21382,18 @@ class Generator(_S2Parent):
                 yield x
         finally:
             base.close()
+
+
+# ═══════════════ c91-hold: over-persistent exact holds late in the stream (metric-aligned hold sharpening) ═══════════════
+# The generator above is the parent class and is not changed in any way: every record it yields is yielded here, in
+# order, unchanged, unless (1) the stream position is inside this layer's window (the last part of the stream's billed
+# points) and (2) the record is univariate. Such a record keeps its values, grid and length: each exact run of
+# >= _C91_MIN_RUN identical values that does not start at index 0 (not a padding prefix) is, with probability _C91_P,
+# lengthened by D ~ Geometric(1/_C91_MEAN_D) (<= _C91_MAX_D) bitwise-identical repeats of its own value, and the same
+# number of points is cropped from the record start, so the length (4096) and the billed points are unchanged.
+# Why: the round metric (per-window geomean of WQL and sample-median MASE) pays for sharp forecasts on windows whose
+# history ends in an exact hold, and every lineage checkpoint is too spread there; holds that persist longer in the
+# last part of training teach the model to collapse its quantiles onto the held value. Statistics only, no pool data.
+# Record i's draws come only from SeedSequence([seed, _C91_TAG], spawn_key=(i,)), so the parent's RNGs advance exactly as
+# without this block. Position = billed points (live rule points+mv20) of the records already yielded by this layer.
+_C91_CHILD_BUDGET = 13_320_000_000  # live per-stream budget: [training] 39_960_000_000 billed points // gen_seed_mix 3
