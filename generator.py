@@ -29661,3 +29661,124 @@ _c91_points = _c251_c91_points
 def _c251_row_std(rows, out):
     for r in range(rows.shape[0]):
         out[r, 0] = np.sqrt(_v2_var_nb(rows[r]))
+
+
+def _c251_rows_std_keep(rows):
+    if (type(rows) is np.ndarray and rows.dtype == np.float64 and rows.ndim == 2 and rows.flags.c_contiguous
+            and rows.shape[1] > 0):
+        out = np.empty((rows.shape[0], 1), dtype=np.float64)
+        _c251_row_std(rows, out)
+        return out
+    return rows.std(axis=1, keepdims=True)
+
+
+
+def _c251_apply_nonneg_integer_prior(
+    rng: np.random.Generator, block: np.ndarray, *,
+    integer_min_std: float = 0.0,
+    integer_min_std_frac: float = 1.0,
+    integer_frac: float = _NONNEG_INTEGER_FRAC,
+    flat_level_spread: float = 0.0,
+) -> np.ndarray:
+    n = block.shape[0]
+    if n == 0:
+        return block
+    nonneg_mask = rng.random(n) < _NONNEG_FRAC
+    if not nonneg_mask.any():
+        return block
+    sel = np.nonzero(nonneg_mask)[0]
+
+    whole = sel.size == n
+    rows = block if whole else block[sel]
+    row_min = rows.min(axis=1, keepdims=True)
+    row_scale = np.maximum(_c251_rows_std_keep(rows), 1e-9)
+    floor = row_scale * rng.uniform(0.0, 0.15, size=(sel.size, 1))
+    shift = np.where(row_min < floor, floor - row_min, 0.0)
+    rows += shift
+    int_mask = rng.random(sel.size) < integer_frac
+    if integer_min_std > 0.0 and int_mask.any():
+
+        low = int_mask & (row_scale[:, 0] < integer_min_std)
+        if integer_min_std_frac < 1.0:
+
+            low &= rng.random(sel.size) < integer_min_std_frac
+        if low.any():
+            grow = (integer_min_std / row_scale[low, 0])[:, None]
+            if whole:
+                rows[low] *= grow
+            else:
+                rows[low] = rows[low] * grow
+    if whole and int_mask.all():
+        np.rint(rows, out=rows)
+        _spread_flat_levels(rng, rows, flat_level_spread)
+        return block
+    if int_mask.any():
+        int_sel = sel[int_mask]
+        int_rows = _spread_flat_levels(
+            rng, np.rint(rows[int_mask]), flat_level_spread
+        )
+        block[int_sel] = int_rows
+        keep = ~int_mask
+        if keep.any():
+            block[sel[keep]] = rows[keep]
+    else:
+        block[sel] = rows
+    return block
+
+
+_apply_nonneg_integer_prior = _c251_apply_nonneg_integer_prior
+
+
+# ── c251-P12: np.nan_to_num(np.asarray(x, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0) for a 1-D float64
+# array (partner pt rows): a fresh contiguous copy with NaN / +inf / -inf -> 0.0 and every finite value copied
+# bit for bit -- exactly what nan_to_num(copy=True) returns. Other inputs keep numpy's call.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_nan0_nb(a, out):
+    for k in range(a.shape[0]):
+        v = a[k]
+        out[k] = v if np.isfinite(v) else 0.0
+
+
+def _c251_nan0(x):
+    a = np.asarray(x, dtype=np.float64)
+    if type(a) is np.ndarray and a.ndim == 1:
+        out = np.empty(a.shape[0], dtype=np.float64)
+        _c251_nan0_nb(a, out)
+        return out
+    return np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+# ═══════════════ c251-P8: per-record generator construction through the exact seeding replica (_c251_rng). ═══════════════
+# Six layer methods build one np.random.default_rng(np.random.SeedSequence(...)) per record (C91 0.54/record once
+# open, C128 0.22, YC 0.19, ACUH 0.18, partner pt 0.13, YQH 0.08; ~13.5 us each). Each method below is uid76's
+# method VERBATIM except (a) that one construction -> _c251_rng(same entropy, same spawn key) (identical PCG64
+# state; seed_seq answers entropy/spawn_key/spawn() like the real SeedSequence) and (b) zero-argument super() ->
+# super(<that class>, self) (a function defined outside the class body has no __class__ cell; same MRO step).
+# The methods are installed on the SAME class objects (looked up through the parent aliases uid76 itself binds), and
+# only when the class still carries uid76's original method (line-number + name check), so a stacked layer that
+# already replaced one keeps its own. In the partner pt method the two np.nan_to_num(...) row cleanups also go
+# through the exact _c251_nan0 (c251-P12).
+
+
+def _c251_c91_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    seed = int(self._seed) & ((1 << 64) - 1)
+    lo = _C91_OPEN_NUM * int(_C91_CHILD_BUDGET)
+    pos = 0
+    base = super(_C124B2Parent, self).generate(n)
+    try:
+        for i, x in enumerate(base):
+            if _C91_P > 0.0 and _C91_OPEN_DEN * pos >= lo and np.ndim(x) == 1:
+                r = _c251_rng([seed, _C91_TAG], (i,))
+                try:
+                    w = _c91_extend(x, r)
+                    if w is not None and np.all(np.isfinite(w)):
+                        x = w
+                except Exception:
+                    pass
+            pos += _c91_points(x)
+            yield x
+    finally:
+        base.close()
