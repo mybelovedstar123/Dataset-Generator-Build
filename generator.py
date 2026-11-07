@@ -122,6 +122,248 @@ from threading import Event, Lock, Thread, local
 from typing import Any
 
 from numba import njit
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_ar1_fill(y, p):
+    n = y.shape[0]
+    k = 1
+    while k < n and abs(p) > 1e-12:
+        for t in range(n - 1, k - 1, -1):
+            y[t] = y[t] + p * y[t - k]
+        p = p * p
+        k *= 2
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_all_finite(a):
+    for k in range(a.shape[0]):
+        if not np.isfinite(a[k]):
+            return False
+    return True
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_all_equal_first(a):
+    v = a[0]
+    for k in range(a.shape[0]):
+        if not (a[k] == v):
+            return False
+    return True
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_pw_block(a, lo, n):
+    if n < 8:
+        res = 0.0
+        for i in range(n):
+            res += a[lo + i]
+        return res
+    r0 = a[lo]; r1 = a[lo + 1]; r2 = a[lo + 2]; r3 = a[lo + 3]
+    r4 = a[lo + 4]; r5 = a[lo + 5]; r6 = a[lo + 6]; r7 = a[lo + 7]
+    i = 8
+    m = n - (n % 8)
+    while i < m:
+        r0 += a[lo + i]; r1 += a[lo + i + 1]; r2 += a[lo + i + 2]; r3 += a[lo + i + 3]
+        r4 += a[lo + i + 4]; r5 += a[lo + i + 5]; r6 += a[lo + i + 6]; r7 += a[lo + i + 7]
+        i += 8
+    res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7))
+    while i < n:
+        res += a[lo + i]
+        i += 1
+    return res
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_pw(a, lo, n):
+    if n <= 128:
+        return _v2_pw_block(a, lo, n)
+    f_lo = np.empty(128, dtype=np.int64)
+    f_n = np.empty(128, dtype=np.int64)
+    f_st = np.empty(128, dtype=np.int64)
+    vs = np.empty(128, dtype=np.float64)
+    sp = 1
+    vp = 0
+    f_lo[0] = lo
+    f_n[0] = n
+    f_st[0] = 0
+    while sp > 0:
+        t = sp - 1
+        lo_ = f_lo[t]
+        n_ = f_n[t]
+        if n_ <= 128:
+            sp -= 1
+            vs[vp] = _v2_pw_block(a, lo_, n_)
+            vp += 1
+        else:
+            n2 = n_ // 2
+            n2 -= n2 % 8
+            st = f_st[t]
+            if st == 0:
+                f_st[t] = 1
+                f_lo[sp] = lo_
+                f_n[sp] = n2
+                f_st[sp] = 0
+                sp += 1
+            elif st == 1:
+                f_st[t] = 2
+                f_lo[sp] = lo_ + n2
+                f_n[sp] = n_ - n2
+                f_st[sp] = 0
+                sp += 1
+            else:
+                sp -= 1
+                vs[vp - 2] = vs[vp - 2] + vs[vp - 1]
+                vp -= 1
+    return vs[0]
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_var_nb(x):
+    n = x.shape[0]
+    m = (0.0 + _v2_pw(x, 0, n)) / n
+    d = np.empty(n, dtype=np.float64)
+    for k in range(n):
+        t = x[k] - m
+        d[k] = t * t
+    return (0.0 + _v2_pw(d, 0, n)) / n
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_mean_nb(x):
+    return (0.0 + _v2_pw(x, 0, x.shape[0])) / x.shape[0]
+
+_V2_F64 = np.dtype(np.float64)
+
+def _v2_ok(x):
+    return type(x) is np.ndarray and x.dtype == _V2_F64 and x.ndim == 1 and x.shape[0] > 0 and x.flags.c_contiguous
+
+def _v2_std(x):
+    if _v2_ok(x):
+        return np.float64(np.sqrt(_v2_var_nb(x)))
+    return np.std(x)
+
+def _v2_var(x):
+    if _v2_ok(x):
+        return np.float64(_v2_var_nb(x))
+    return np.var(x)
+
+def _v2_mean(x):
+    if _v2_ok(x):
+        return np.float64(_v2_mean_nb(x))
+    return np.mean(x)
+
+def _v2_stdm(x):
+    if _v2_ok(x):
+        return np.float64(np.sqrt(_v2_var_nb(x)))
+    return x.std()
+
+def _v2_varm(x):
+    if _v2_ok(x):
+        return np.float64(_v2_var_nb(x))
+    return x.var()
+
+def _v2_meanm(x):
+    if _v2_ok(x):
+        return np.float64(_v2_mean_nb(x))
+    return x.mean()
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_state(pool, seqc, outc, i):
+    m32 = np.uint64(0xFFFFFFFF)
+    s16 = np.uint64(16)
+    s32 = np.uint64(32)
+    s63 = np.uint64(63)
+    one = np.uint64(1)
+    ml = np.uint64(0xCA01F9DD)
+    mr = np.uint64(0x4973F715)
+    w = np.uint64(i)
+    p0 = pool[0]
+    p1 = pool[1]
+    p2 = pool[2]
+    p3 = pool[3]
+    v = ((w ^ seqc[0, 0]) * seqc[0, 1]) & m32
+    v = v ^ (v >> s16)
+    r = (ml * p0 - mr * v) & m32
+    p0 = r ^ (r >> s16)
+    v = ((w ^ seqc[1, 0]) * seqc[1, 1]) & m32
+    v = v ^ (v >> s16)
+    r = (ml * p1 - mr * v) & m32
+    p1 = r ^ (r >> s16)
+    v = ((w ^ seqc[2, 0]) * seqc[2, 1]) & m32
+    v = v ^ (v >> s16)
+    r = (ml * p2 - mr * v) & m32
+    p2 = r ^ (r >> s16)
+    v = ((w ^ seqc[3, 0]) * seqc[3, 1]) & m32
+    v = v ^ (v >> s16)
+    r = (ml * p3 - mr * v) & m32
+    p3 = r ^ (r >> s16)
+    ws = np.empty(8, dtype=np.uint64)
+    for j in range(8):
+        jj = j & 3
+        if jj == 0:
+            p = p0
+        elif jj == 1:
+            p = p1
+        elif jj == 2:
+            p = p2
+        else:
+            p = p3
+        v = ((p ^ outc[j, 0]) * outc[j, 1]) & m32
+        ws[j] = v ^ (v >> s16)
+    sh = (ws[1] << s32) | ws[0]
+    sl = (ws[3] << s32) | ws[2]
+    ih0 = (ws[5] << s32) | ws[4]
+    il0 = (ws[7] << s32) | ws[6]
+    ih = (ih0 << one) | (il0 >> s63)
+    il = (il0 << one) | one
+    lo = il + sl
+    hi = ih + sh + (one if lo < il else np.uint64(0))
+    return hi, lo, ih, il
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_mulhi(a, b):
+    m32 = np.uint64(0xFFFFFFFF)
+    s32 = np.uint64(32)
+    a0 = a & m32
+    a1 = a >> s32
+    b0 = b & m32
+    b1 = b >> s32
+    p00 = a0 * b0
+    p01 = a0 * b1
+    p10 = a1 * b0
+    p11 = a1 * b1
+    mid = (p00 >> s32) + (p01 & m32) + (p10 & m32)
+    return p11 + (p01 >> s32) + (p10 >> s32) + (mid >> s32)
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_step(hi, lo, ih, il):
+    mh = np.uint64(2549297995355413924)
+    mlo = np.uint64(4865540595714422341)
+    one = np.uint64(1)
+    nhi = _fcx_nb_mulhi(lo, mlo) + lo * mh + hi * mlo
+    nlo = lo * mlo
+    rlo = nlo + il
+    rhi = nhi + ih + (one if rlo < nlo else np.uint64(0))
+    return rhi, rlo
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_out(hi, lo):
+    x = hi ^ lo
+    rot = hi >> np.uint64(58)
+    o = (x >> rot) | (x << ((np.uint64(64) - rot) & np.uint64(63)))
+    return np.float64(o >> np.uint64(11)) * (1.0 / 9007199254740992.0)
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_one(pool, seqc, outc, i):
+    hi, lo, ih, il = _fcx_nb_state(pool, seqc, outc, i)
+    hi, lo = _fcx_nb_step(hi, lo, ih, il)
+    hi, lo = _fcx_nb_step(hi, lo, ih, il)
+    return _fcx_nb_out(hi, lo)
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_many(pool, seqc, outc, i, size):
+    hi, lo, ih, il = _fcx_nb_state(pool, seqc, outc, i)
+    hi, lo = _fcx_nb_step(hi, lo, ih, il)
+    out = np.empty(size, dtype=np.float64)
+    for k in range(size):
+        hi, lo = _fcx_nb_step(hi, lo, ih, il)
+        out[k] = _fcx_nb_out(hi, lo)
+    return out
+
 from scipy.signal import lfilter
 
 MASK32 = 0xFFFFFFFF
@@ -6046,7 +6288,7 @@ def _sparse_admin_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray
         prof = np.exp((rng.random(7) - 0.5) * rng.uniform(0.3, 0.9))
         wk = rng.choice(7, size=2, replace=False)
         prof[wk] *= rng.uniform(0.55, 0.85)
-        prof /= prof.mean()
+        prof /= _v2_meanm(prof)
         level = float(np.exp(rng.uniform(0.2, 2.4)))
         trend = np.exp(
             np.sin(2.0 * np.pi * t / (L * rng.uniform(0.6, 2.5))
@@ -6144,7 +6386,7 @@ def _store_sales_panel(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         wk = rng.choice(7, size=2, replace=False)
         soft = {0: (0.55, 0.85), 1: (0.5, 0.8), 2: (0.65, 0.95)}[store]
         prof[wk] *= rng.uniform(*soft)
-        prof /= max(float(prof.mean()), 1e-9)
+        prof /= max(float(_v2_meanm(prof)), 1e-9)
         open_mask = np.ones(L, dtype=bool)
         for _ in range(int(rng.poisson(rng.uniform(0.5, 3.0)))):
             z0 = int(rng.integers(0, L))
@@ -6157,7 +6399,7 @@ def _store_sales_panel(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         cust[~open_mask] = 0.0
         active = open_mask & (cust > 0)
         if active.any():
-            cust[active] /= float(np.mean(cust[active]))
+            cust[active] /= float(_v2_mean(cust[active]))
         ticket = float(np.exp(rng.uniform(*[(0.5, 2.0), (1.0, 5.0), (2.0, 12.0)][store])))
         sales = level * cust * ticket
         for _ in range(int(rng.poisson(rng.uniform(0.3, 2.0)))):
@@ -6262,7 +6504,7 @@ def _web_traffic_plateau(rng: np.random.Generator, n: int, L: int) -> np.ndarray
         prof = np.exp((rng.random(7) - 0.5) * rng.uniform(0.3, 0.9))
         wk = rng.choice(7, size=2, replace=False)
         prof[wk] *= rng.uniform(0.55, 0.85)
-        prof /= prof.mean()
+        prof /= _v2_meanm(prof)
         level = float(np.exp(rng.uniform(2.0, 8.0)))
         lam = level * prof[dow]
         fano = rng.uniform(1.5, 6.0)
@@ -6309,7 +6551,7 @@ def _biz_day_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         low = np.log(0.8) if listed else np.log(5.0)
         level = float(np.exp(rng.uniform(low, np.log(300.0))))
         drift = np.cumsum(rng.normal(0.0, rng.uniform(0.001, 0.012), size=m))
-        drift -= drift.mean()
+        drift -= _v2_meanm(drift)
         annual = rng.uniform(0.0, 0.35) * np.sin(
             2.0 * np.pi * day[:m] / 365.0 + rng.uniform(0.0, 2.0 * np.pi))
         lam = level * base * np.exp(np.clip(drift + annual, -2.5, 2.5))
@@ -6347,7 +6589,7 @@ def _weekly_web_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             if len(seg):
                 lv = logtrend[seg[-1]]
             prev = cp
-        logtrend -= logtrend.mean()
+        logtrend -= _v2_meanm(logtrend)
         level = float(np.exp(rng.uniform(np.log(50.0), np.log(1e6))))
         wk_dip = float(rng.uniform(0.30, 0.75))
         prof = np.exp(rng.normal(0.0, 0.06, size=7))
@@ -6440,7 +6682,7 @@ def _web_session_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             if seg.size > 1:
                 decay = np.exp(-np.arange(seg.size) / max(seg.size * rng.uniform(0.3, 1.2), 1.0))
                 shape[start:end] = seg * decay
-        m = float(np.mean(shape[active])) if active.any() else 1.0
+        m = float(_v2_mean(shape[active])) if active.any() else 1.0
         if m > 0:
             shape[active] /= m
         out[i] = np.round(np.maximum(level * day_scale * shape, 0.0))
@@ -6467,7 +6709,7 @@ def _broadband_path_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray
             zl = int(rng.integers(1, max(2, L // 20)))
             path[z0:z0 + zl] = 0.0
         path = np.maximum(path, 0.0)
-        m = float(np.mean(path[path > 0])) if np.any(path > 0) else 1.0
+        m = float(_v2_mean(path[path > 0])) if np.any(path > 0) else 1.0
         if m > 0:
             path = path / m
         out[i] = base * path
@@ -6498,7 +6740,7 @@ def _cluster_job_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             shape[:alive_len] *= day[:alive_len]
         active = shape > 0
         if active.any():
-            shape[active] /= float(np.mean(shape[active]))
+            shape[active] /= float(_v2_mean(shape[active]))
         series = level * shape
         if job == 0 and rng.random() < 0.25 and alive_len < L - 2:
             z0 = int(rng.integers(alive_len, L))
@@ -7505,9 +7747,9 @@ class _BaseGenerator(DataGenerator):
 
                                 unit = []
                                 for part in parts:
-                                    s = float(np.mean(np.abs(part)))
+                                    s = float(_v2_mean(np.abs(part)))
                                     unit.append(part / s if s > 1e-12 else part)
-                                source_scale = float(np.mean(np.abs(source)))
+                                source_scale = float(_v2_mean(np.abs(source)))
                                 combined = weights[0] * unit[0]
                                 for j, part in enumerate(unit[1:]):
                                     combined = combined + weights[j + 1] * part
@@ -7604,7 +7846,8 @@ class _BaseGenerator(DataGenerator):
             stop.set()
             producer.join(timeout=1.0)
 
-def _ar1_kernel(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
+@njit(cache=False, fastmath=False, nogil=True)
+def _ar1_kernel_nb(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
     n, L = innov.shape
     x = np.empty((n, L), dtype=np.float64)
     for i in range(n):
@@ -7614,6 +7857,23 @@ def _ar1_kernel(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
             prev = innov[i, t] + p * prev
             x[i, t] = prev
     return x
+
+def _ar1_kernel_py(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
+    n, L = innov.shape
+    x = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        p = phi[i]
+        prev = 0.0
+        for t in range(L):
+            prev = innov[i, t] + p * prev
+            x[i, t] = prev
+    return x
+
+def _ar1_kernel(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
+    if (type(innov) is np.ndarray and type(phi) is np.ndarray and innov.dtype == np.float64
+            and phi.dtype == np.float64 and innov.ndim == 2 and phi.ndim == 1 and phi.shape[0] >= innov.shape[0]):
+        return _ar1_kernel_nb(innov, phi)
+    return _ar1_kernel_py(innov, phi)
 
 def _cycle_profile(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     if n <= 0:
@@ -7636,8 +7896,8 @@ def _cycle_profile(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             ) / 4.0
         knot_y = np.concatenate([knot_y, knot_y[:1]])
         profile = np.interp(np.arange(period, dtype=np.float64), knot_x, knot_y)
-        profile -= profile.mean()
-        profile /= max(float(profile.std()), 1e-9)
+        profile -= _v2_meanm(profile)
+        profile /= max(float(_v2_stdm(profile)), 1e-9)
 
         phase = int(rng.integers(0, period))
         shifted = t + phase
