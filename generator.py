@@ -9665,35 +9665,10 @@ def _wc_ar1(rng: np.random.Generator, n: int, m: int, phi: np.ndarray) -> np.nda
     return a
 
 def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Annual epidemic waves on an endemic floor after a decaying pandemic
-    excess: rki / ukhsa / cdc_nssp / rivm / wikimedia-RSV at h720.
-
-    Floor = endemic level (slow log random walk sd U[0.004,0.02]/d + slope
-    U[-0.15,0.15]/yr, soft-capped) x (1 + pandemic excess): on 70% of rows an
-    excess of ratio log-U[3,100] rises over U[20,90] d from an onset anywhere in
-    [-1500, 0.85 L] and decays with tau U[150,900] d -- a decline the model can
-    read off the context and continue, never an AR(1) that snaps back.
-    Waves: log-parabola bumps centred at phi0 + 365 k + N(0, sigma) with
-    sigma U[3,15] d (phase-locked year to year), log peak/floor a_row
-    log-U[3,150] per row, drifting U[-0.15,0.05] per year (waves shrink after
-    the pandemic years) and jittered N(0, U[0.15,0.4]) per year, rise U[20,60] d,
-    fall = rise x U[1.2,2.5]; 35% of rows add a summer wave 180 +- 25 d later
-    at U[0.15,0.6] of the winter amplitude. Weekly profile weekend U[0.6,1.0],
-    Monday U[1,1.2] on 30%. Observation: 45% NB counts (floor log-U[0.3,300],
-    r log-U[5,60]); 25% percent-of-visits rows (cdc_nssp: NB numerator over
-    visits log-U[300,30000], 0.01 tick); 30% 7-day rolling mean of the counts
-    on a 0.01 tick (rki / ukhsa smoothed incidence).
-
-    Every (n, L) intermediate is carried in a reused buffer: the latent level,
-    the wave accumulator and the observed counts are the only full-width arrays
-    alive at any point, and the per-row observation branches are evaluated on
-    their own row slices instead of on the whole block.
-    """
     if n <= 0:
         return np.empty((0, L), dtype=np.float64)
     t = _time_index(L)
 
-    # ── endemic floor: slow random walk + gentle slope, soft-capped at ±3 ───
     slope = rng.uniform(-0.15, 0.15, size=(n, 1)) / _HC_YEAR
     rw_sd = rng.uniform(0.004, 0.02, size=(n, 1))
     log_end = rng.normal(0.0, 1.0, size=(n, L))
@@ -9704,7 +9679,6 @@ def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     np.tanh(log_end, out=log_end)
     log_end *= 3.0
 
-    # ── pandemic excess: onset, rise, then a long decay to the endemic floor ─
     has_pand = rng.random((n, 1)) < 0.7
     t0 = rng.uniform(-1500.0, 0.85 * L, size=(n, 1))
     ratio = np.exp(rng.uniform(np.log(3.0), np.log(100.0), size=(n, 1)))
@@ -9728,7 +9702,6 @@ def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     floor = excess
     del excess, log_end
 
-    # ── phase-locked annual waves (+ optional summer wave) ──────────────────
     K = int(L // _HC_YEAR) + 4
     sig_phase = rng.uniform(3.0, 15.0, size=(n, 1))
     phi0 = rng.uniform(-_HC_YEAR, 0.0, size=(n, 1))
@@ -9750,11 +9723,7 @@ def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     root2 = np.sqrt(np.log(5.0) / amp2)
     w_l, w_r = rise / root, fall / root
     w2_l, w2_r = rise2 / root2, fall2 / root2
-    # Log-shape exponent per wave and side over the same support: 2 is the
-    # smooth log-parabola. Respiratory ED / admission waves climb almost
-    # log-linearly right up to a sharp turnover and start falling at once, so
-    # 75% of rows take a rise exponent U[0.8, 1.5] and a fall exponent
-    # U[0.7, 1.4].
+
     sharp = rng.random((n, 1)) < 0.75
     p_l = np.where(sharp, rng.uniform(0.8, 1.5, size=(n, K)), 2.0)
     p_r = np.where(sharp, rng.uniform(0.7, 1.4, size=(n, K)), 2.0)
@@ -9772,8 +9741,7 @@ def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
                 (c, w_l[:, k:k + 1], w_r[:, k:k + 1], amp[:, k:k + 1], None),
                 (c2[:, k:k + 1], w2_l[:, k:k + 1], w2_r[:, k:k + 1],
                  amp2[:, k:k + 1], no2)):
-            # a bump is exactly zero outside [cen - wl, cen + wr], so only the
-            # columns inside some row's support are computed
+
             j0 = max(int(np.floor((cen - wl).min())), 0)
             j1 = min(int(np.ceil((cen + wr).max())) + 1, L)
             if j1 <= j0:
@@ -9800,11 +9768,10 @@ def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     waves *= floor
     del floor
     level = waves
-    # total dynamic range of the latent, per row, capped at 3000x its minimum
+
     lo = level.min(axis=1, keepdims=True)
     np.minimum(level, lo * 3000.0, out=level)
 
-    # ── weekly profile ──────────────────────────────────────────────────────
     phase = rng.integers(0, 7, size=(n, 1))
     wk = np.exp(rng.normal(0.0, 0.03, size=(n, 5)))
     mon = np.where(rng.random((n, 1)) < 0.3, rng.uniform(1.0, 1.2, size=(n, 1)), 1.0)
@@ -9812,12 +9779,10 @@ def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     we = rng.uniform(0.6, 1.0, size=(n, 1))
     prof = np.concatenate([wk, we * rng.uniform(0.9, 1.1, size=(n, 1)), we], axis=1)
     prof = prof / prof[:, :5].mean(axis=1, keepdims=True)
-    # the day-of-week factor of column j is prof[(j + phase) % 7]: rotate the
-    # seven columns once per row and apply them to the seven strided views
+
     prof_rot = np.take_along_axis(
         prof, (np.arange(7, dtype=phase.dtype)[None, :] + phase) % 7, axis=1)
 
-    # ── observation ─────────────────────────────────────────────────────────
     kind = rng.random((n, 1))
     is_pct = kind < 0.25
     is_smooth = kind >= 0.7
@@ -9839,8 +9804,7 @@ def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     out = g
     np.copyto(out, pois)
     del pois, g
-    # 7-day rolling mean and percent-of-visits are needed on their own rows
-    # only, and those row sets are disjoint, so both run on row slices
+
     rows = np.flatnonzero(is_smooth[:, 0])
     if rows.size:
         smooth = out[rows]
@@ -9867,18 +9831,7 @@ def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         del pct
     return _epi_feed_fade(rng, out, is_pct | is_smooth)
 
-
 def _epi_feed_fade(rng: np.random.Generator, x: np.ndarray, ticked: np.ndarray) -> np.ndarray:
-    """Right-truncated reporting at the live edge of a surveillance feed.
-
-    Real-time hospitalisation / ED feeds are scored on their newest points,
-    where late reports have not arrived yet: completeness ramps down toward
-    the edge ((s/K)^g over the last K days, s = days before the edge), and
-    discontinued feeds end in a run of exact zeros. Integer rows are thinned
-    binomially; rate / smoothed rows are scaled and re-ticked. Draws come
-    after every native draw, so unfaded rows keep their exact values. ``x`` is
-    faded in place and returned: the caller hands over its only reference.
-    """
     n, L = x.shape
     fade = rng.random(n) < 0.4
     K = rng.integers(60, 361, size=n)
@@ -9900,17 +9853,7 @@ def _epi_feed_fade(rng: np.random.Generator, x: np.ndarray, ticked: np.ndarray) 
             out[i, L - int(min(Z[i], k)):] = 0.0
     return out
 
-
 def _epi_feed_fade(rng: np.random.Generator, x: np.ndarray, ticked: np.ndarray) -> np.ndarray:
-    """Right-truncated reporting at the live edge of a surveillance feed.
-
-    Real-time hospitalisation / ED feeds are scored on their newest points,
-    where late reports have not arrived yet: completeness ramps down toward
-    the edge ((s/K)^g over the last K days, s = days before the edge), and
-    discontinued feeds end in a run of exact zeros. Integer rows are thinned
-    binomially; rate / smoothed rows are scaled and re-ticked. Draws come
-    after every native draw, so unfaded rows keep their exact values.
-    """
     n, L = x.shape
     fade = rng.random(n) < 0.4
     K = rng.integers(60, 361, size=n)
@@ -9932,24 +9875,7 @@ def _epi_feed_fade(rng: np.random.Generator, x: np.ndarray, ticked: np.ndarray) 
             out[i, L - int(min(Z[i], k)):] = 0.0
     return out
 
-
 def _weekday_ledger_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Weekday-processed ledger counts whose level PERSISTS for years: vaers,
-    openfda daily event/recall/label feeds, nyc_ems / nola dispatch volumes.
-
-    Level: log(base log-U[5,2e4]) + a single log-linear trend U[-0.3,0.3]/yr
-    held for the whole row (soft-capped at +-3) + a log random walk sd
-    U[0.002,0.012]/d + rare permanent shifts (U[0,0.5]/yr, +-U[0.15,0.6]) --
-    no AR(1) term at all, so the 720-step continuation is the current level
-    carried by the visible trend. Day-of-week: five weekdays exp(N(0,0.06)),
-    Monday x U[1,1.3] on 40%, weekend factor log-U[0.05,0.7] (Sun = Sat x
-    U[0.7,1.3]); holidays U[6,12]/yr at the weekend factor; a year-end dip
-    U[7,14] d deep U[0.3,0.7] on half the rows; weekday spikes x U[1.5,2.5] at
-    U[0.5,3]%/d; NB noise r log-U[5,80]; isolated zeros U[0,1]%/d. 30% of
-    rows start mid-row: a constant prefix of U[0.3,0.95] L at the first real
-    value -- exactly the validator's left-padding of a short feed, so the
-    scaler geometry of a 192-real-step window (vaers) is a training case.
-    """
     if n <= 0:
         return np.empty((0, L), dtype=np.float64)
     days = np.arange(L, dtype=np.int64)[None, :]
@@ -9968,7 +9894,7 @@ def _weekday_ledger_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarr
     sgn = rng.random((n, L)) < 0.5
     np.negative(mag, out=mag, where=sgn)
     del sgn
-    mag *= ev                       # == np.where(ev, mag, 0.0)
+    mag *= ev
     del ev
     np.cumsum(mag, axis=1, out=mag)
     np.add(trend, np.log(base), out=trend)
@@ -9995,9 +9921,9 @@ def _weekday_ledger_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarr
     hol = rng.random((n, L)) < (rng.uniform(6.0, 12.0, size=(n, 1)) / _HC_YEAR)
     hol &= weekday
     fac = rng.uniform(0.5, 1.5, size=(n, L))
-    fac *= we                       # == we * rng.uniform(...)
+    fac *= we
     np.logical_not(hol, out=hol)
-    np.copyto(fac, 1.0, where=hol)  # == np.where(hol, we*u, 1.0)
+    np.copyto(fac, 1.0, where=hol)
     del hol
     h0 = rng.uniform(0.0, _HC_YEAR, size=(n, 1))
     wdip = rng.uniform(7.0, 14.0, size=(n, 1))
@@ -10008,12 +9934,12 @@ def _weekday_ledger_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarr
     np.divide(d, wdip, out=d)
     np.cos(d, out=d)
     d *= -0.5
-    d += 0.5                        # == 0.5 - 0.5*cos(2*pi*d/wdip)
+    d += 0.5
     d *= depth
     np.logical_not(indip, out=indip)
     np.copyto(d, 0.0, where=indip)
     del indip
-    np.subtract(1.0, d, out=d)      # dip
+    np.subtract(1.0, d, out=d)
     spike = rng.random((n, L)) < rng.uniform(0.005, 0.03, size=(n, 1))
     spike &= weekday
     del weekday
@@ -10030,10 +9956,10 @@ def _weekday_ledger_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarr
     del d
     level *= sfac
     del sfac
-    np.minimum(level, 1.0e6, out=level)     # lam
+    np.minimum(level, 1.0e6, out=level)
     r = np.exp(rng.uniform(np.log(5.0), np.log(80.0), size=(n, 1)))
     g = rng.gamma(r, 1.0 / r, size=(n, L))
-    np.multiply(level, g, out=g)            # lam * g
+    np.multiply(level, g, out=g)
     del level
     np.maximum(g, 0.0, out=g)
     counts = rng.poisson(g)
@@ -10044,7 +9970,6 @@ def _weekday_ledger_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarr
     np.copyto(y, 0.0, where=zero)
     del zero
 
-    # mid-row start: constant prefix at the first real value (validator padding)
     pre = rng.random((n, 1)) < 0.3
     cut = (rng.uniform(0.3, 0.95, size=(n, 1)) * L).astype(np.int64)
     cut = np.where(pre, cut, 0)
@@ -10052,44 +9977,7 @@ def _weekday_ledger_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarr
     np.copyto(y, first, where=days < cut)
     return y
 
-
 def _surveillance_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Epidemic-wave surveillance feeds (cdc_nssp ED visits by state, nys
-    covid testing, rki hospitalisations): waves on a floor, mild day-of-week
-    reporting artifacts, tick-quantised or small-count observation.
-
-    Fitted on 150 healthcare/D/P=7 series. The cdc_nssp members are NOT
-    counts but PERCENT of ED visits quantised to a 0.01 tick: rsv sits at a
-    0.05 median (5 ticks) with 15% exact zeros, covid at 0.34, influenza at
-    0.15, ari at 10.4. Waves: peak/floor 22x (covid), 157x (rsv), 240x
-    (influenza), 3.6x (ari); rise (20%->peak) 21-69 d, fall 69-76 d; between
-    waves the 7-day level sits within 2x of its floor 20-30% of the time
-    (76% for ari); 28-day log-level step sd 0.5-0.9, log-range 3-5. ACF1
-    0.93-0.98 (smooth), weekend/weekday 0.92-0.95 (nys counts: 0.58, Monday
-    1.11), residual cv 0.26-0.70 (mostly tick noise at small values),
-    >2x spikes 1-12% (small-number effects). nys testing: median 1 count,
-    39% zeros, Fano 1.3, zero runs mean 2.7 / max 17.
-
-    Construction: floor x (1 + sum_k (exp(bump_k) - 1)) where each wave is
-    a log-parabola with peak/floor log-uniform [3, 300], rise U[20,80] d
-    and fall = rise x U[1,2.2]; seasonal rows (60%) space waves 365 +- 25 d
-    with correlated amplitudes, the rest U[120,500] d apart; the floor
-    wanders (AR(1) sd U[0.1,0.35]). Percent rows (55%) are a RATIO of counts,
-    which is what makes one law fit rsv (0.05%, 15% zeros, cv 0.7), covid
-    (0.34%, cv 0.26) and ari (10%, cv 0.07) at once: numerator ~ NB with
-    mean floor_pct/100 x N x waves x DOW (floor_pct log-uniform [0.01,1]
-    (75%) or [1,20]; denominator visits N log-uniform [300, 30000];
-    r log-uniform [5,50]), weekend U[0.85,0.98], mild extra lognormal noise
-    (sigma U[0.02,0.15], AR(1) phi U[0.2,0.8]), reporting dumps U[0,2]/yr at
-    x U[1.5,3], repeat-last-value holds on 15% of rows, then 100 x num / N
-    rounded to a 0.01 (90%) / 0.1 tick -- Poisson zeros in the numerator
-    and the tick make the between-wave tail zero-inflated as measured.
-    Count rows (45%): NB counts (r
-    log-uniform [2,40]) at a floor level log-uniform [0.15,60], weekend
-    U[0.4,0.8], Monday U[1,1.3] on half the rows, dumps U[0.5,4]/yr at
-    x U[2,5] with a next-day backfill dip x U[0.2,0.7]; 25% publish the
-    7-day rolling sum (rki-style).
-    """
     if n <= 0:
         return np.empty((0, L), dtype=np.float64)
     days = np.arange(L, dtype=np.int64)[None, :]
@@ -10114,15 +10002,11 @@ def _surveillance_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray
     amp = np.clip(amp, np.log(1.5), np.log(1000.0))
     rise = rng.uniform(20.0, 80.0, size=(n, K))
     fall = rise * rng.uniform(1.0, 2.2, size=(n, K))
-    # log-parabola half-widths chosen so the 20%-of-peak points sit rise/fall
-    # days from the centre: a (1 - (d/w)^2) = a - ln 5  =>  w = d / sqrt(ln5 / a)
+
     root = np.sqrt(np.log(5.0) / amp)
     w_l = rise / root
     w_r = fall / root
-    # Rise and fall exponents per wave over the same support: 2 is the smooth
-    # log-parabola. Respiratory ED waves climb almost log-linearly right up
-    # to a sharp turnover and start falling at once, so 75% of rows take a
-    # rise exponent U[0.8, 1.5] and a fall exponent U[0.7, 1.4].
+
     sharp = rng.random((n, 1)) < 0.75
     p_l = np.where(sharp, rng.uniform(0.8, 1.5, size=(n, K)), 2.0)
     p_r = np.where(sharp, rng.uniform(0.7, 1.4, size=(n, K)), 2.0)
@@ -10133,8 +10017,7 @@ def _surveillance_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray
             break
         wl = w_l[:, k:k + 1]
         wr = w_r[:, k:k + 1]
-        # a bump is exactly zero outside [c - wl, c + wr], so only the columns
-        # inside some row's support are computed
+
         j0 = max(int(np.floor((c - wl).min())), 0)
         j1 = min(int(np.ceil((c + wr).max())) + 1, L)
         if j1 <= j0:
@@ -10168,7 +10051,6 @@ def _surveillance_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray
     prof = prof / prof[:, :5].mean(axis=1, keepdims=True)
     prof_t = np.take_along_axis(prof, dow, axis=1)
 
-    # percent-of-visits rows: 100 x (NB numerator) / (visit denominator)
     floor = np.where(
         rng.random((n, 1)) < 0.75,
         np.exp(rng.uniform(np.log(0.01), np.log(1.0), size=(n, 1))),
@@ -10195,7 +10077,6 @@ def _surveillance_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray
     tick = np.where(rng.random((n, 1)) < 0.9, 0.01, 0.1)
     pct = np.rint(pct / tick) * tick
 
-    # count rows
     lvl = np.exp(rng.uniform(np.log(0.15), np.log(60.0), size=(n, 1)))
     dump_c = rng.random((n, L)) < (rng.uniform(0.5, 4.0, size=(n, 1)) / 365.0)
     dfac = np.where(dump_c, rng.uniform(2.0, 5.0, size=(n, L)), 1.0)
@@ -10213,44 +10094,15 @@ def _surveillance_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray
 
     return np.where(is_pct, pct, cnt)
 
-
 def _pull_counter_ramp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Monotone cumulative pull / download / table-size counters at a huge base
-    level: dockerhub_library_pull_counts, potaroo_bgp_table_size, hn_max_item.
-
-    Increment rate per step = base (log-U[0.3, 6e4]) x diurnal profile (P=48
-    on 60% of rows, 24 on 40%; log-depth U[0.1, 0.6], h1 share 0.5..0.85) x
-    weekday profile (weekend U[0.45, 0.95]) x CI-calendar dips (60% of rows:
-    U[2,4]-day dips of depth U[0.3, 0.55] every U[7, 16] days) x day scatter
-    (AR(1) over days, phi U[0.2, 0.6], sd U[0.15, 0.5]) x slow rate walk (sd
-    U[0.005, 0.025] per day) x a log-linear deceleration U[-0.1, 0.08] per
-    30 days (the feeds' last-15-day rate is 0.81..1.01x the 15 days before;
-    there are NO rate steps -- the rate over the next 720 steps is the rate the
-    context shows) x step noise (AR(1) lognormal, phi U[0.3, 0.8], sd
-    U[0.15, 0.6]). Increments are Poisson at that rate (sparse rows get their
-    flats from the law itself), plus explicit flats at U[0, 1]%. Base level
-    solved from the measured level/increment ratio log-U[8e4, 4e6]. 85% of
-    rows open with a constant prefix of U[0.3, 0.55] L at the first value
-    (the validator's left-padding of a 2459-step feed: the h720 pad fraction
-    lands on the feeds' 0.59 at the median) and 90% carry a
-    U[3, 8]-day launch PLATEAU right after it, at an amplitude (clipped to
-    2..10x) sized so the excess mass is U[0.38, 0.8] of the visible context's
-    steady mass: every dockerhub feed opens its VISIBLE context with that
-    scrape-start burst (days 0-6 at 2-8x), so the target rate is ~0.64x the
-    context-mean rate (IQR 0.53-0.68) while equal to the recent rate -- the
-    lesson is "continue the recent slope, not the average slope".
-    Exempt from the tail rebase (_NO_TAIL_REBASE): a collapse inside the last
-    1024 steps is exactly the target region this family exists to teach.
-    """
     if n <= 0:
         return np.empty((0, L), dtype=np.float64)
     t = _time_index(L)
     ti = np.arange(L, dtype=np.int64)
     P = np.where(rng.random((n, 1)) < 0.6, 48, 24)
     nd = L // 24 + 2
-    day = ti[None, :] // P                                   # (n, L) day index per row
+    day = ti[None, :] // P
 
-    # diurnal profile (evaluated at the row's own period)
     prof48 = _wc_profile(rng, n, 48, 0.5, 0.85)
     prof24 = _wc_profile(rng, n, 24, 0.5, 0.85)
     ph = rng.integers(0, 48, size=(n, 1))
@@ -10258,7 +10110,6 @@ def _pull_counter_ramp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     shape = np.where(P == 48, np.take_along_axis(prof48, idx, axis=1), np.take_along_axis(prof24, idx % 24, axis=1))
     diur = np.exp(rng.uniform(0.1, 0.6, size=(n, 1)) * shape)
 
-    # weekday profile + CI-calendar dips + day scatter + slow walk + deceleration
     dow = (day + rng.integers(0, 7, size=(n, 1))) % 7
     we = rng.uniform(0.45, 0.95, size=(n, 1))
     wk = np.where(dow >= 5, we, np.exp(rng.normal(0.0, 0.05, size=(n, 7)))[np.arange(n)[:, None], dow])
@@ -10272,23 +10123,16 @@ def _pull_counter_ramp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     dip_d = np.where(has_dip & in_dip, 1.0 - depth, 1.0)
     scat_d = np.exp(rng.uniform(0.15, 0.5, size=(n, 1)) * _wc_ar1(rng, n, nd, rng.uniform(0.2, 0.6, size=(n, 1))))
     walk_d = np.cumsum(rng.normal(0.0, 1.0, size=(n, nd)) * rng.uniform(0.005, 0.025, size=(n, 1)), axis=1)
-    # mild deceleration of the settled rate (the feeds' last-15-day rate is
-    # 0.81..1.01x the 15 days before): log-linear U[-0.15, 0.05] per 30 days
+
     trend_d = rng.uniform(-0.1, 0.08, size=(n, 1)) / 30.0 * (dd - 0.5 * nd)
     day_fac = dip_d * scat_d * np.exp(walk_d + trend_d)
     day_t = np.take_along_axis(day_fac, np.minimum(day, nd - 1), axis=1)
 
-    # step noise
     noise = np.exp(rng.uniform(0.15, 0.6, size=(n, 1)) * _wc_ar1(rng, n, L, rng.uniform(0.3, 0.8, size=(n, 1))))
 
     base_rate = np.exp(rng.uniform(np.log(0.3), np.log(6.0e4), size=(n, 1)))
     rate = base_rate * diur * wk * day_t * noise
 
-    # constant prefix + launch plateau. The plateau's excess mass is sized
-    # against the context the validator's h720 window will actually show
-    # (the row minus the prefix minus the 720-step target), so the target
-    # rate / visible-mean-rate ratio lands on the feeds' 0.53..0.68 band
-    # whatever the prefix length; one-day linear step-down at its end.
     pre = rng.random((n, 1)) < 0.85
     cut = np.where(pre, (rng.uniform(0.3, 0.55, size=(n, 1)) * L).astype(np.int64), 0)
     burst = rng.random((n, 1)) < 0.9
@@ -10308,7 +10152,6 @@ def _pull_counter_ramp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     base = np.rint(base_rate * rel)
     return base + np.cumsum(inc, axis=1)
 
-
 """intraday_event_counts -- coverage family for the pool class
 ``intraday_event_counts_lowcorr`` (288 eval windows over 3 chain panels,
 99 series / 80 source clusters: 911 / fire / police dispatch and CAD volumes,
@@ -10319,16 +10162,8 @@ number comes from the ``rng`` argument.  Style follows the c030 isolated
 stream builders (``_weekday_ledger_counts`` etc.).
 """
 
-
 def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
                                 emit_empty: bool = False):
-    """Row bodies WITHOUT the validator-style constant prefix (see the public
-    builder below for the docstring with the measured statistics).
-
-    With ``emit_empty`` the empty bins keep their zero counts (no max(1, .))
-    and the call returns ``(y, drops_empty, is_event)``: which rows publish
-    only their non-empty bins, and which rows are event counts at all (the
-    arrival-prediction rows are not)."""
     if n <= 0:
         if emit_empty:
             return (np.empty((0, L), dtype=np.float64), np.zeros(0, dtype=bool),
@@ -10339,7 +10174,7 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
     two_pi = 2.0 * np.pi
 
     def ar1(innov: np.ndarray, phi: np.ndarray, sd: np.ndarray) -> np.ndarray:
-        # causal exponential kernel by FFT: stationary AR(1) with sd ``sd``
+
         K = min(L, 320)
         ker = phi ** np.arange(K, dtype=np.float64)[None, :]
         m = L + K
@@ -10348,27 +10183,20 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
         return x * sd * np.sqrt(1.0 - phi * phi)
 
     mode = rng.random((n, 1))
-    is_b = mode < 0.15            # registration / submission streams with batch bursts
-    is_c = mode >= 0.85           # bounded arrival-prediction draws
-    # else: dispatch / incident counts (0.70)
+    is_b = mode < 0.15
+    is_c = mode >= 0.85
 
-    # day length in SAMPLES: hourly 24, minute 60, half-hour 48, 5-min 288, ...
     per_tab = np.array([24.0, 60.0, 48.0, 288.0, 96.0, 144.0])
     per_cdf = np.cumsum(np.array([0.48, 0.22, 0.14, 0.12, 0.03, 0.01]))
     P = per_tab[np.searchsorted(per_cdf, rng.random(n) * per_cdf[-1])][:, None]
-    tau = (t + rng.uniform(0.0, 1.0, size=(n, 1)) * P) / P    # time in days
+    tau = (t + rng.uniform(0.0, 1.0, size=(n, 1)) * P) / P
     day = np.floor(tau)
     frac = tau - day
     di = day.astype(np.int64)
 
-    # daily profile: log-cosine with a second harmonic, (max-min)/mean ~ 2a.
-    # Hourly / half-hourly dispatch feeds carry a clear daily cycle: the
-    # hour-of-day profile holds 0.39 (2-15 events per bin) to 0.48 (more)
-    # of the variance and the lag-one-day autocorrelation is 0.34 / 0.50,
-    # so the amplitude starts at 0.2 rather than at a near-flat 0.08.
     a = np.exp(rng.uniform(np.log(0.2), np.log(1.5), size=(n, 1)))
     a = np.where(is_b, a * rng.uniform(0.15, 0.7, size=(n, 1)), a)
-    a = np.where(P >= 60.0, a * rng.uniform(0.2, 0.7, size=(n, 1)), a)   # minute/5-min feeds: tiny counts hide the cycle
+    a = np.where(P >= 60.0, a * rng.uniform(0.2, 0.7, size=(n, 1)), a)
     b = rng.uniform(0.0, 0.5, size=(n, 1))
     psi = rng.uniform(0.0, two_pi, size=(n, 1))
     ang = two_pi * frac
@@ -10376,7 +10204,6 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
     prof /= prof.mean(axis=1, keepdims=True)
     del ang
 
-    # day-of-week profile
     sw = rng.uniform(0.01, 0.10, size=(n, 1))
     sw = np.where(is_b, rng.uniform(0.03, 0.2, size=(n, 1)), sw)
     wk = np.exp(rng.normal(0.0, 1.0, size=(n, 7)) * sw)
@@ -10387,7 +10214,6 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
     wk_t = np.take_along_axis(wk, dow, axis=1)
     del dow
 
-    # slow level: AR(1) on daily knots, linearly interpolated inside the day
     nk = int(L // 24) + 3
     tau_d = np.exp(rng.uniform(np.log(0.3), np.log(3.0), size=n))
     phi_d = np.exp(-1.0 / tau_d)
@@ -10400,7 +10226,7 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
     for k in range(1, nk):
         knots[:, k] = phi_d * knots[:, k - 1] + s * e[:, k]
     knots *= sd_s[:, None]
-    # multi-week drift on the same knots (tau log-U[10,60] d)
+
     tau_m = np.exp(rng.uniform(np.log(10.0), np.log(60.0), size=n))
     phi_m = np.exp(-1.0 / tau_m)
     sd_m = rng.uniform(0.03, 0.25, size=n)
@@ -10415,18 +10241,15 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
             + np.take_along_axis(knots, di + 1, axis=1) * frac)
     del tau, day, frac, di
 
-    # fast within-day clustering of the latent rate; around its hour-of-day
-    # profile a dispatch feed has a variance of about 1.4x (2-15 events per
-    # bin) to 3.8x (more) its mean, so the per-bin log noise stays <= 0.3
     phi_f = rng.uniform(0.2, 0.7, size=(n, 1))
     sd_f = rng.uniform(0.05, 0.3, size=(n, 1))
     sd_f = np.where(is_b, rng.uniform(0.05, 0.35, size=(n, 1)), sd_f)
     fast = ar1(rng.normal(0.0, 1.0, size=(n, L)), phi_f, sd_f)
 
     m = np.exp(rng.uniform(np.log(0.8), np.log(40.0), size=(n, 1)))
-    m = np.where(P >= 60.0, np.exp(rng.uniform(np.log(0.5), np.log(8.0), size=(n, 1))), m)   # minute/5-min bins
+    m = np.where(P >= 60.0, np.exp(rng.uniform(np.log(0.5), np.log(8.0), size=(n, 1))), m)
     m = np.where(is_b, np.exp(rng.uniform(np.log(0.5), np.log(30.0), size=(n, 1))), m)
-    # one small permanent log-step on 20% of rows (long-horizon level uncertainty)
+
     st_rows = rng.random((n, 1)) < 0.2
     st_pos = (rng.uniform(0.1, 0.95, size=(n, 1)) * L).astype(np.int64)
     st_mag = rng.normal(0.0, 0.35, size=(n, 1))
@@ -10434,7 +10257,6 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
     lam = m * prof * wk_t * np.exp(slow + fast + step)
     del prof, wk_t, slow, fast, step
 
-    # batch bursts (stream rows): x(1+B), B log-U[2,60], 70% with a 6-step decaying tail
     pb = rng.uniform(0.005, 0.08, size=(n, 1))
     ev = (rng.random((n, L)) < pb) & is_b
     burst = np.where(ev, np.exp(rng.uniform(np.log(2.0), np.log(60.0), size=(n, L))), 0.0)
@@ -10450,7 +10272,6 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
     lam = lam * (1.0 + tail) * exc
     del ev, burst, tail, exc
 
-    # gamma-Poisson observation, then the feed's empty-bin drop (max(1, .))
     r = np.exp(rng.uniform(np.log(4.0), np.log(80.0), size=(n, 1)))
     r = np.where(is_b, np.exp(rng.uniform(np.log(4.0), np.log(40.0), size=(n, 1))), r)
     g = rng.gamma(r, 1.0 / r, size=(n, L))
@@ -10460,7 +10281,6 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
     if not emit_empty:
         y = np.where(trunc, np.maximum(y, 1.0), y)
 
-    # unit lattice (baton-rouge style): counts x a piecewise-constant unit 2..12
     lat = np.nonzero(((~is_b) & (~is_c) & (rng.random((n, 1)) < 0.05))[:, 0])[0]
     if lat.size:
         nl = lat.size
@@ -10471,8 +10291,6 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
         unit = np.take_along_axis(rng.integers(2, 13, size=(nl, L)).astype(np.float64), src, axis=1)
         y[lat] = y[lat] * unit
 
-    # bounded arrival-prediction rows: iid mixture (near-zero exponential +
-    # uniform up to the cap) rank-matched to a Gaussian AR(1) for lag1 0-0.4
     idx_c = np.nonzero(is_c[:, 0])[0]
     if idx_c.size:
         nc = idx_c.size
@@ -10493,16 +10311,12 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
         return y, trunc[:, 0] & is_event, is_event
     return y
 
-
 """intraday_spot_price -- coverage family for the electricity_price_intraday
 pool class (day-ahead / market-index / hourly spot / real-time dispatch prices
 at 5-30 min and hourly cadence).  Deterministic seeded numpy only.
 """
 
-
 def _isp_ar1(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
-    """y[t] = phi * y[t-1] + innov[t] along axis 1; phi is (n, 1).  Runs on the
-    transposed array so every step touches one contiguous vector."""
     n, L = innov.shape
     x = np.ascontiguousarray(innov.T)
     p = np.reshape(phi, -1)
@@ -10510,44 +10324,19 @@ def _isp_ar1(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
         x[k] += p * x[k - 1]
     return x.T
 
-
 def _isp_day_ar1(rng: np.random.Generator, n: int, nd: int,
                  phi: np.ndarray, sd: np.ndarray) -> np.ndarray:
-    """Stationary AR(1) across days: (n, nd) with per-row phi, sd (both (n,1))."""
     e = rng.normal(0.0, 1.0, size=(n, nd)) * sd * np.sqrt(1.0 - phi * phi)
     e[:, :1] = rng.normal(0.0, 1.0, size=(n, 1)) * sd
     return _isp_ar1(e, phi)
 
-
 def _isp_runs(rng: np.random.Generator, idx: np.ndarray, start: np.ndarray,
               mean_len: np.ndarray) -> np.ndarray:
-    """Mask covering geometric-length runs (mean ``mean_len``) that begin at
-    the ``start`` samples; the run's first sample is included."""
     ln = rng.geometric(np.clip(1.0 / mean_len, 1e-3, 1.0), size=start.shape)
     reach = np.maximum.accumulate(np.where(start, idx + ln - 1, -1), axis=1)
     return idx <= reach
 
-
 def _road_commute_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Road / bridge / tunnel vehicle counts: mta_bridges_tunnels_hourly_crossings,
-    npra_norway_traffic_volume_hourly, truck-toll and airport-operation feeds.
-
-    Measured on the revealed pool: integer counts, no zeros, CV 0.40-0.56, lag-1
-    acf ~0.92, day-lag acf ~0.90 and week-lag acf 0.90-0.97 -- a near-deterministic
-    commute rhythm that repeats week to week, with the variance carried by the
-    cycle itself rather than by noise.
-
-    Weekday profile = night floor + AM peak + broader PM peak (von Mises bumps,
-    AM at U[0.26, 0.36] of the day, PM at U[0.66, 0.78]); weekend = one broad
-    blend (U[0.3, 0.7]) of a broad midday hump and the weekday shape at
-    U[0.75, 1.05] of the weekday mass, Saturday above Sunday.
-    Day level carries a small AR(1) (phi U[0.3, 0.8], sd U[0.02, 0.08]) and the
-    step level a smaller iid term (sd U[0.005, 0.02]), so the weekly shape is
-    what the context teaches and what the horizon continues. 80% of rows are
-    hourly (P=24), 20% quarter-hourly (P=96). 20% of rows carry 1-2 closure dips
-    (flow to U[0.15, 0.6] for 2..12 hours). Counts are Poisson at the rate,
-    level log-U[150, 9000], so the lattice and the low-count floor are both real.
-    """
     if n <= 0:
         return np.empty((0, L), dtype=np.float64)
     ti = np.arange(L, dtype=np.float64)[None, :]
@@ -10555,10 +10344,10 @@ def _road_commute_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray
     ph0 = rng.random((n, 1))
     dow0 = rng.integers(0, 7, size=(n, 1))
 
-    day_pos = ti / P + ph0                                    # (n, L) days elapsed
+    day_pos = ti / P + ph0
     day_idx = np.floor(day_pos).astype(np.int64)
-    frac = day_pos - day_idx                                  # position within the day
-    dow = (day_idx + dow0) % 7                                # 5, 6 = weekend
+    frac = day_pos - day_idx
+    dow = (day_idx + dow0) % 7
 
     m_am = rng.uniform(0.26, 0.36, size=(n, 1))
     m_pm = rng.uniform(0.66, 0.78, size=(n, 1))
