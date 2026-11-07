@@ -8059,7 +8059,50 @@ def _linspace_segments(L: int, k: int) -> tuple:
         for j in range(k - 1)
     )
 
+_V2_ILS = {}
+
+def _v2_ils_plan(L, k):
+    key = (L, k)
+    e = _V2_ILS.get(key)
+    if e is None:
+        segs = _linspace_segments(L, k)
+        starts = np.array([sg[1] for sg in segs], dtype=np.int64)
+        stops = np.array([sg[2] for sg in segs], dtype=np.int64)
+        dts = np.array([sg[4] for sg in segs], dtype=np.float64)
+        toff = np.zeros(L, dtype=np.float64)
+        for sg in segs:
+            toff[sg[1]:sg[2]] = sg[3]
+        e = (starts, stops, dts, toff)
+        if len(_V2_ILS) < 64:
+            _V2_ILS[key] = e
+    return e
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_ils_fill(knot_a, starts, stops, dts, toff, out):
+    n = knot_a.shape[0]
+    L = out.shape[1]
+    k = knot_a.shape[1]
+    for j in range(starts.shape[0]):
+        st = starts[j]
+        sp = stops[j]
+        dt = dts[j]
+        for i in range(n):
+            sl = (knot_a[i, j + 1] - knot_a[i, j]) / dt
+            kj = knot_a[i, j]
+            for t in range(st, sp):
+                out[i, t] = sl * toff[t] + kj
+    for i in range(n):
+        out[i, L - 1] = knot_a[i, k - 1]
+
 def _interp_linspace_rows(knot_a: np.ndarray, L: int) -> np.ndarray:
+    if (type(knot_a) is np.ndarray and knot_a.dtype == np.float64 and knot_a.ndim == 2
+            and isinstance(L, (int, np.integer)) and not isinstance(L, bool)
+            and int(L) >= 2 and knot_a.shape[1] >= 2 and knot_a.shape[0] > 0):
+        L = int(L)
+        starts, stops, dts, toff = _v2_ils_plan(L, int(knot_a.shape[1]))
+        out = np.empty((knot_a.shape[0], L), dtype=np.float64)
+        _v2_ils_fill(np.ascontiguousarray(knot_a), starts, stops, dts, toff, out)
+        return out
     out = np.empty((knot_a.shape[0], L), dtype=np.float64)
     for j, start, stop, toff, dt in _linspace_segments(L, knot_a.shape[1]):
         slope = ((knot_a[:, j + 1] - knot_a[:, j]) / dt)[:, None]
@@ -8474,7 +8517,7 @@ def _measurement_artifacts(
             for row in drift_rows:
                 n_knots = int(rng.integers(3, 8))
                 knot_a = np.cumsum(rng.normal(0.0, 0.15, size=n_knots))
-                knot_a = knot_a - knot_a.mean()
+                knot_a = knot_a - _v2_meanm(knot_a)
                 by_k.setdefault(n_knots, []).append(knot_a)
                 row_by_k.setdefault(n_knots, []).append(int(row))
             for n_knots, knots in by_k.items():
@@ -9691,8 +9734,8 @@ def _tirex2_marginal_augments(
 
         steps = warp_rng.normal(0.0, 1.0, size=L).cumsum()
         bridge = steps - (t / max(L - 1, 1)) * steps[-1]
-        bridge = bridge - bridge.mean()
-        bstd = float(bridge.std()) or 1.0
+        bridge = bridge - _v2_meanm(bridge)
+        bstd = float(_v2_stdm(bridge)) or 1.0
         amp = float(warp_rng.uniform(0.5, 3.0))
         lag = amp * (bridge / bstd)
         src = np.clip(t + lag, 0.0, float(L - 1))
@@ -9784,17 +9827,113 @@ def _empirical_cycle_tail(history, lag, length, rng, mode):
 _LONG_CYCLE_ENABLED = True
 _LONG_CYCLE_LAGS = tuple(range(97, 257))
 
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_lcp_template(history, lag, count, out):
+    rows = history.shape[0]
+    base = history.shape[1] - count * lag
+    for r in range(rows):
+        for p in range(lag):
+            q = base + p
+            if count == 7:
+                a0 = history[r, q]; a1 = history[r, q + lag]; a2 = history[r, q + 2 * lag]
+                a3 = history[r, q + 3 * lag]; a4 = history[r, q + 4 * lag]; a5 = history[r, q + 5 * lag]
+                a6 = history[r, q + 6 * lag]
+                t = a0 if a0 < a5 else a5; a5 = a5 if a0 < a5 else a0; a0 = t
+                t = a0 if a0 < a3 else a3; a3 = a3 if a0 < a3 else a0; a0 = t
+                t = a1 if a1 < a6 else a6; a6 = a6 if a1 < a6 else a1; a1 = t
+                t = a2 if a2 < a4 else a4; a4 = a4 if a2 < a4 else a2; a2 = t
+                t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+                t = a3 if a3 < a5 else a5; a5 = a5 if a3 < a5 else a3; a3 = t
+                t = a2 if a2 < a6 else a6; a6 = a6 if a2 < a6 else a2; a2 = t
+                t = a2 if a2 < a3 else a3; a3 = a3 if a2 < a3 else a2; a2 = t
+                t = a3 if a3 < a6 else a6; a6 = a6 if a3 < a6 else a3; a3 = t
+                t = a4 if a4 < a5 else a5; a5 = a5 if a4 < a5 else a4; a4 = t
+                t = a1 if a1 < a4 else a4; a4 = a4 if a1 < a4 else a1; a1 = t
+                t = a1 if a1 < a3 else a3; a3 = a3 if a1 < a3 else a1; a1 = t
+                t = a3 if a3 < a4 else a4; a4 = a4 if a3 < a4 else a3; a3 = t
+                out[r, p] = a3
+            elif count == 5:
+                a0 = history[r, q]; a1 = history[r, q + lag]; a2 = history[r, q + 2 * lag]
+                a3 = history[r, q + 3 * lag]; a4 = history[r, q + 4 * lag]
+                t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+                t = a3 if a3 < a4 else a4; a4 = a4 if a3 < a4 else a3; a3 = t
+                t = a0 if a0 < a3 else a3; a3 = a3 if a0 < a3 else a0; a0 = t
+                t = a1 if a1 < a4 else a4; a4 = a4 if a1 < a4 else a1; a1 = t
+                t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+                t = a2 if a2 < a3 else a3; a3 = a3 if a2 < a3 else a2; a2 = t
+                t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+                out[r, p] = a2
+            elif count == 3:
+                a0 = history[r, q]; a1 = history[r, q + lag]; a2 = history[r, q + 2 * lag]
+                t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+                t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+                t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+                out[r, p] = a1
+            else:
+                out[r, p] = history[r, q]
+
 def _long_cycle_predict(history, lag, length):
     history = np.asarray(history, dtype=float)
     if history.ndim != 2 or lag < 1 or length < 1 or lag > history.shape[1]:
         raise ValueError('Need a 2-D history, available positive lag and length')
     count = min(7, history.shape[1] // lag)
     count -= int(count % 2 == 0)
+    if count in (1, 3, 5, 7) and history.dtype == np.float64 and history.shape[0] > 0 and bool(np.isfinite(history).all()):
+        template = np.empty((history.shape[0], lag), dtype=np.float64)
+        _v2_lcp_template(np.ascontiguousarray(history), int(lag), int(count), template)
+        return template[:, np.arange(length) % lag]
     cycles = history[:, -count * lag:].reshape(len(history), count, lag)
     template = np.partition(cycles, count // 2, axis=1)[:, count // 2, :]
     return template[:, np.arange(length) % lag]
 
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_lcv_kernel(history, observed, lag, count, span, error, hold, away):
+    rows = history.shape[0]
+    H = history.shape[1]
+    m = observed.shape[1]
+    tmpl = np.empty((rows, lag), dtype=np.float64)
+    _v2_lcp_template(history, lag, count, tmpl)
+    d = np.empty(m, dtype=np.float64)
+    b16 = np.empty(16, dtype=np.float64)
+    for r in range(rows):
+        for t in range(m):
+            d[t] = abs(observed[r, t] - tmpl[r, t % lag])
+        error[r] = ((0.0 + _v2_pw(d, 0, m)) / m) / span[r]
+        for k in range(16):
+            x = history[r, H - 16 + k]
+            j = k
+            while j > 0 and b16[j - 1] > x:
+                b16[j] = b16[j - 1]
+                j -= 1
+            b16[j] = x
+        anchor = (0.0 + ((0.0 + b16[7]) + b16[8])) / 2.0
+        for t in range(m):
+            d[t] = abs(observed[r, t] - anchor)
+        hold[r] = ((0.0 + _v2_pw(d, 0, m)) / m) / span[r]
+        thr = .05 * span[r]
+        c = 0
+        for t in range(H):
+            if abs(history[r, t] - anchor) > thr:
+                c += 1
+        away[r] = c / H
+
 def _long_cycle_validation(history, observed, lag, span):
+    if (type(history) is np.ndarray and type(observed) is np.ndarray and type(span) is np.ndarray
+            and history.dtype == np.float64 and observed.dtype == np.float64 and span.dtype == np.float64
+            and history.ndim == 2 and observed.ndim == 2 and span.ndim == 1
+            and history.shape[0] == observed.shape[0] == span.shape[0] and history.shape[0] > 0
+            and history.shape[1] >= 16 and observed.shape[1] >= 1 and type(lag) is int and 1 <= lag <= history.shape[1]):
+        cnt = min(7, history.shape[1] // lag)
+        cnt -= int(cnt % 2 == 0)
+        if cnt in (1, 3, 5, 7) and bool(np.isfinite(history).all()) and bool(np.isfinite(observed).all()):
+            n_ = history.shape[0]
+            error = np.empty(n_, dtype=np.float64)
+            hold = np.empty(n_, dtype=np.float64)
+            away = np.empty(n_, dtype=np.float64)
+            _v2_lcv_kernel(np.ascontiguousarray(history), np.ascontiguousarray(observed), lag, cnt,
+                           np.ascontiguousarray(span), error, hold, away)
+            accepted = (error <= .12) & (error <= .75 * hold) & (away >= .15)
+            return error, accepted
     anchor = np.median(history[:, -16:], axis=1)
     error = np.mean(np.abs(observed - _long_cycle_predict(history, lag, observed.shape[1])), axis=1) / span
     hold = np.mean(np.abs(observed - anchor[:, None]), axis=1) / span
@@ -9872,6 +10011,62 @@ def _pairwise_sum(a, n):
     raise ValueError("unsupported validation length")
 
 @njit(cache=False, nogil=True)
+def _v2_cm_medians(h, base, lag, count, start, stop, median, buf):
+    if count == 7:
+        for p in range(start, stop):
+            q = base + p
+            a0 = h[q]; a1 = h[q + lag]; a2 = h[q + 2 * lag]; a3 = h[q + 3 * lag]
+            a4 = h[q + 4 * lag]; a5 = h[q + 5 * lag]; a6 = h[q + 6 * lag]
+            t = a0 if a0 < a5 else a5; a5 = a5 if a0 < a5 else a0; a0 = t
+            t = a0 if a0 < a3 else a3; a3 = a3 if a0 < a3 else a0; a0 = t
+            t = a1 if a1 < a6 else a6; a6 = a6 if a1 < a6 else a1; a1 = t
+            t = a2 if a2 < a4 else a4; a4 = a4 if a2 < a4 else a2; a2 = t
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            t = a3 if a3 < a5 else a5; a5 = a5 if a3 < a5 else a3; a3 = t
+            t = a2 if a2 < a6 else a6; a6 = a6 if a2 < a6 else a2; a2 = t
+            t = a2 if a2 < a3 else a3; a3 = a3 if a2 < a3 else a2; a2 = t
+            t = a3 if a3 < a6 else a6; a6 = a6 if a3 < a6 else a3; a3 = t
+            t = a4 if a4 < a5 else a5; a5 = a5 if a4 < a5 else a4; a4 = t
+            t = a1 if a1 < a4 else a4; a4 = a4 if a1 < a4 else a1; a1 = t
+            t = a1 if a1 < a3 else a3; a3 = a3 if a1 < a3 else a1; a1 = t
+            t = a3 if a3 < a4 else a4; a4 = a4 if a3 < a4 else a3; a3 = t
+            median[p] = a3
+    elif count == 5:
+        for p in range(start, stop):
+            q = base + p
+            a0 = h[q]; a1 = h[q + lag]; a2 = h[q + 2 * lag]; a3 = h[q + 3 * lag]; a4 = h[q + 4 * lag]
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            t = a3 if a3 < a4 else a4; a4 = a4 if a3 < a4 else a3; a3 = t
+            t = a0 if a0 < a3 else a3; a3 = a3 if a0 < a3 else a0; a0 = t
+            t = a1 if a1 < a4 else a4; a4 = a4 if a1 < a4 else a1; a1 = t
+            t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+            t = a2 if a2 < a3 else a3; a3 = a3 if a2 < a3 else a2; a2 = t
+            t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+            median[p] = a2
+    elif count == 3:
+        for p in range(start, stop):
+            q = base + p
+            a0 = h[q]; a1 = h[q + lag]; a2 = h[q + 2 * lag]
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            median[p] = a1
+    elif count == 1:
+        for p in range(start, stop):
+            median[p] = h[base + p]
+    else:
+        mid = count // 2
+        for p in range(start, stop):
+            for c in range(count):
+                x = h[base + p + c * lag]
+                k = c
+                while k > 0 and buf[k - 1] > x:
+                    buf[k] = buf[k - 1]
+                    k -= 1
+                buf[k] = x
+            median[p] = buf[mid]
+
+@njit(cache=False, nogil=True)
 def _cycle_menu_errors(history, observed, span, limit, lags, cols, count, fit_points, errors):
 
     rows = history.shape[0]
@@ -9880,12 +10075,13 @@ def _cycle_menu_errors(history, observed, span, limit, lags, cols, count, fit_po
     median = np.empty(points, dtype=np.float64)
     diff = np.empty(points, dtype=np.float64)
     buf = np.empty(count, dtype=np.float64)
-    mid = count // 2
     for r in range(rows):
         if not limit[r] >= 0.0:
             for j in range(lags.shape[0]):
                 errors[r, cols[j]] = np.inf
             continue
+        h = history[r]
+        o = observed[r]
         for j in range(lags.shape[0]):
             lag = lags[j]
             base = fit_points - count * lag
@@ -9897,18 +10093,18 @@ def _cycle_menu_errors(history, observed, span, limit, lags, cols, count, fit_po
                 lo = leaf * 128
                 hi = lo + 128
                 need = hi if hi < lag else lag
-                while done < need:
-                    for c in range(count):
-                        x = history[r, base + done + c * lag]
-                        k = c
-                        while k > 0 and buf[k - 1] > x:
-                            buf[k] = buf[k - 1]
-                            k -= 1
-                        buf[k] = x
-                    median[done] = buf[mid]
-                    done += 1
-                for v in range(lo, hi):
-                    diff[v] = abs(observed[r, v] - median[v % lag])
+                if done < need:
+                    _v2_cm_medians(h, base, lag, count, done, need, median, buf)
+                    done = need
+                v = lo
+                while v < hi:
+                    m0 = v % lag
+                    seg = hi - v
+                    if lag - m0 < seg:
+                        seg = lag - m0
+                    for t in range(seg):
+                        diff[v + t] = abs(o[v + t] - median[m0 + t])
+                    v += seg
                 value = _pairwise_leaf(diff, lo, 128)
                 if leaves == 2:
                     bound = value if leaf == 0 else partial + value
@@ -10510,16 +10706,6 @@ def _pull_counter_ramp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     base = np.rint(base_rate * rel)
     return base + np.cumsum(inc, axis=1)
 
-"""intraday_event_counts -- coverage family for the pool class
-``intraday_event_counts_lowcorr`` (288 eval windows over 3 chain panels,
-99 series / 80 source clusters: 911 / fire / police dispatch and CAD volumes,
-crime-incident and 311 request feeds, jail bookings, naloxone/crisis calls,
-DOI / package / CVE / malware-sample registration streams and TfL
-arrival-prediction feeds).  Self-contained: ``numpy`` only, every random
-number comes from the ``rng`` argument.  Style follows the c030 isolated
-stream builders (``_weekday_ledger_counts`` etc.).
-"""
-
 def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
                                 emit_empty: bool = False):
     if n <= 0:
@@ -10668,11 +10854,6 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
         is_event = ~is_c[:, 0]
         return y, trunc[:, 0] & is_event, is_event
     return y
-
-"""intraday_spot_price -- coverage family for the electricity_price_intraday
-pool class (day-ahead / market-index / hourly spot / real-time dispatch prices
-at 5-30 min and hourly cadence).  Deterministic seeded numpy only.
-"""
 
 def _isp_ar1(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
     n, L = innov.shape
@@ -11427,7 +11608,7 @@ def _pt_harmonics_plus_ar_noise(rng, n):
 def _pt_poisson_exp_gp_counts(rng, n):
     base_rate = float(np.exp(rng.uniform(np.log(0.05), np.log(60.0))))
     gp_multiplier = np.exp(0.6 * _pt_random_kernel_gp_draw(rng, n) * rng.uniform(0.3, 1.2))
-    rate = base_rate * gp_multiplier / max(1e-09, gp_multiplier.mean())
+    rate = base_rate * gp_multiplier / max(1e-09, _v2_meanm(gp_multiplier))
     x = rng.poisson(np.clip(rate, 0.0, 1000000.0)).astype(np.float64)
     if rng.random() < 0.3:
         keep_mask = rng.random(n) < rng.uniform(0.6, 0.97)
@@ -11538,7 +11719,7 @@ def _pt_warp_increments_stochastic_vol(rng, x, vol_strength):
     n = d.size
     ln = _pt_ar1_filter(n, rng.standard_normal(n) * np.sqrt(1.0 - 0.995 ** 2), 0.995, 0.0)
     vol_multiplier = np.exp(vol_strength * ln)
-    vol_multiplier = vol_multiplier / np.sqrt(np.mean(vol_multiplier * vol_multiplier))
+    vol_multiplier = vol_multiplier / np.sqrt(_v2_mean(vol_multiplier * vol_multiplier))
     return np.concatenate([[x[0]], x[0] + np.cumsum(d * vol_multiplier)])
 
 def _pt_add_heavy_tailed_level_shifts(rng, x, shift_rate, shift_scale):
@@ -11546,7 +11727,7 @@ def _pt_add_heavy_tailed_level_shifts(rng, x, shift_rate, shift_scale):
     k = int(rng.poisson(max(0.0, shift_rate * n)))
     if k <= 0 or n < 8:
         return x
-    step_scale = float(np.std(np.diff(x))) or float(np.std(x)) or 1.0
+    step_scale = float(_v2_std(np.diff(x))) or float(_v2_std(x)) or 1.0
     at = np.sort(rng.integers(1, n, size=k))
     shift_sizes = rng.standard_t(2.5, size=k) * step_scale * shift_scale
     level_offset = np.zeros(n)
@@ -11626,7 +11807,7 @@ def _pt_diurnal_activity_shape(rng, period, steady):
     else:
         floor = np.exp(rng.normal(np.log(0.012), 1.2))
     shape = floor + (1.0 - floor) * shape / shape.max()
-    return shape / shape.mean()
+    return shape / _v2_meanm(shape)
 
 def _pt_hourly_profile_counts(rng, n, steady):
     steps_per_day = 24
@@ -11634,7 +11815,7 @@ def _pt_hourly_profile_counts(rng, n, steady):
     phase_offset = int(rng.integers(0, steps_per_day))
     day_profile = _pt_diurnal_activity_shape(rng, steps_per_day, steady)
     wk = np.exp(rng.normal(0.0, 0.035 if steady else 0.08, 7))
-    wk /= wk.mean()
+    wk /= _v2_meanm(wk)
     day_index = (t + phase_offset) // steps_per_day
     seasonal_factor = day_profile[(t + phase_offset) % steps_per_day] * wk[(day_index + int(rng.integers(0, 7))) % 7]
     if steady:
@@ -11673,7 +11854,7 @@ def _pt_ixp_traffic_5min(rng, n):
     trough_frac = float(np.clip(np.exp(rng.normal(np.log(0.3), 0.7)), 0.05, 0.97))
     harmonic_shape = _pt_normalized_harmonic_profile(rng, steps_per_day, int(rng.integers(2, 6)), 1.0) ** rng.uniform(0.5, 1.3)
     day_profile = trough_frac + (1.0 - trough_frac) * harmonic_shape
-    day_profile /= day_profile.mean()
+    day_profile /= _v2_meanm(day_profile)
     phase_offset = int(rng.integers(0, steps_per_day))
     wk = np.ones(7)
     wd = int(rng.integers(0, 7))
@@ -11725,7 +11906,7 @@ def _pt_daily_download_counts(rng, n):
     wk = np.array([1.0, 1.04, 1.04, 1.03, 1.0, weekend_factor, weekend_factor * rng.uniform(0.95, 1.1)])
     wk[4] = rng.uniform(0.8, 0.95)
     wk *= np.exp(rng.normal(0.0, 0.015, 7))
-    wk /= wk.mean()
+    wk /= _v2_meanm(wk)
     weekday_offset = int(rng.integers(0, 7))
     weekday_factor = wk[(t + weekday_offset) % 7]
     lg = np.log(10.0) * rng.uniform(4.6, 8.0)
@@ -11759,7 +11940,7 @@ def _pt_half_hourly_cumulative_counter(rng, n):
     daily_cycle = 1.0 + rng.uniform(0.0, 0.3) * np.cos(_pt_WEB_TWO_PI * (t / steps_per_day + rng.random()))
     weekend_factor = rng.uniform(0.15, 0.6)
     wk = np.array([1.0, 1.0, 1.0, 1.0, 1.0, weekend_factor, weekend_factor])
-    wk /= wk.mean()
+    wk /= _v2_meanm(wk)
     seasonal_factor = daily_cycle * wk[(t // steps_per_day + int(rng.integers(0, 7))) % 7]
     seasonal_factor *= np.exp(rng.normal(-0.4, 0.4) * (t / n - 0.5))
     rate = mu * seasonal_factor * np.exp(_pt_interpolated_coarse_ar1(rng, n, steps_per_day, rng.uniform(0.3, 0.8), rng.uniform(0.1, 0.5)) + _pt_stationary_ar1_noise(rng, n, rng.uniform(0.85, 0.99), rng.uniform(0.2, 0.7)))
@@ -11799,7 +11980,7 @@ def _pt_env_smooth_noise(rng, n, corr_len, beta=2.0):
         y = np.interp(np.arange(n, dtype=np.float64) / coarse_step, np.arange(nc, dtype=np.float64), y)
     else:
         y = y[:n]
-    s = y.std()
+    s = _v2_stdm(y)
     return y / s if s > 0 else y
 
 def _pt_env_diurnal_bump(cycle_phase, peak_phase, concentration):
@@ -11957,7 +12138,7 @@ def _pt_hydro_rain_runoff_series(rng, n):
     if kind == 3:
         fast_decay = np.exp(-1.0 / max(2.0, rng.uniform(0.5, 3.0) * steps_per_day))
         routing_decay = np.exp(-1.0 / max(2.0, rng.uniform(2.0, 10.0) * steps_per_day))
-    mean_rain = float(u.mean()) if n_storms else 0.0
+    mean_rain = float(_v2_meanm(u)) if n_storms else 0.0
     w0 = float(np.exp(rng.normal(0.0, 0.5)))
     q1 = lfilter([1.0 - fast_decay], [1.0, -fast_decay], u, zi=[fast_decay * mean_rain * w0])[0]
     quickflow = lfilter([1.0 - routing_decay], [1.0, -routing_decay], q1, zi=[routing_decay * mean_rain * w0])[0]
@@ -12101,7 +12282,7 @@ def _pt_rainfall_or_air_pollutant(rng, n):
         daily_profile = 0.6 * np.exp(3.0 * (np.cos(_pt_ENV_TWO_PI * (day_phase - 0.33)) - 1)) + 0.8 * np.exp(2.5 * (np.cos(_pt_ENV_TWO_PI * (day_phase - 0.8)) - 1))
     else:
         daily_profile = np.exp(2.0 * (np.cos(_pt_ENV_TWO_PI * (day_phase - 0.6)) - 1))
-    log_signal = rng.uniform(0.3, 0.8) * ep + rng.uniform(0.2, 0.9) * (daily_profile - daily_profile.mean()) + rng.uniform(0.15, 0.45) * lfilter([1.0], [1.0, -rng.uniform(0.6, 0.92)], rng.standard_normal(n)) * 0.5
+    log_signal = rng.uniform(0.3, 0.8) * ep + rng.uniform(0.2, 0.9) * (daily_profile - _v2_meanm(daily_profile)) + rng.uniform(0.15, 0.45) * lfilter([1.0], [1.0, -rng.uniform(0.6, 0.92)], rng.standard_normal(n)) * 0.5
     x = scale * np.exp(log_signal)
     s = rng.random(n) < rng.uniform(0.0, 0.01)
     x = x + s * scale * rng.exponential(2.0, n)
@@ -12133,8 +12314,8 @@ def _pt_gaussian_lowpass_noise(rng, n, sigma_steps):
     f = np.fft.rfftfreq(m)
     spectrum *= np.exp(-0.5 * (_pt_ENERGY_TWO_PI * f * sigma_steps) ** 2)
     y = np.fft.irfft(spectrum, m)[:n]
-    y -= y.mean()
-    s = y.std()
+    y -= _v2_meanm(y)
+    s = _v2_stdm(y)
     return y / s if s > 1e-12 else y
 
 class _pt_DayClock:
@@ -12219,7 +12400,7 @@ def _pt_grid_net_load(rng, n):
     wn = rng.standard_t(rng.uniform(3.0, 6.0), n) if q > 1 else 0.0
     net_shape = demand - solar_gen
     g = np.abs(np.diff(net_shape, append=net_shape[-1]))
-    ramp_noise_scale = 0.25 + np.minimum(g / (g.mean() + 1e-12), 4.0)
+    ramp_noise_scale = 0.25 + np.minimum(g / (_v2_meanm(g) + 1e-12), 4.0)
     net_load += L0 * (0.4 + 0.6 * D) * ramp_noise_scale * (rng.uniform(0.04, 0.12) * hourly_noise + rng.uniform(0.01, 0.035) * wn)
     stale_mask = rng.random(n) < rng.uniform(0.0, 0.05)
     stale_mask[0] = False
@@ -12647,12 +12828,12 @@ def _pt_diurnal_activity_counts(rng, n):
         phase_offset = int(rng.integers(0, period * 7))
         ph = (t + phase_offset) % period
         day = (t + phase_offset) // period % 7
-        lg = log_profile[ph] + log_profile.mean() * 0.0
+        lg = log_profile[ph] + _v2_meanm(log_profile) * 0.0
         lg += rng.uniform(0.05, 0.3) * _pt_knot_interpolated_noise(rng, n, rng.uniform(1.0, 4.0) * period)
         if period in (24, 144, 288):
             lg += np.where(day >= 5, np.log(rng.uniform(0.25, 1.1)), 0.0)
         mu = _pt_counts_log_uniform(rng, 1.0, 200.0)
-        mean_rate = mu * np.exp(lg - lg.mean())
+        mean_rate = mu * np.exp(lg - _v2_meanm(lg))
         if rng.random() < 0.35:
             mean_rate *= 1.0 + _pt_decaying_spike_train(rng, n, _pt_counts_log_uniform(rng, 0.002, 0.02), 2.0, 60.0, rng.uniform(0.3, 0.9))
         c = _pt_negative_binomial_counts(rng, mean_rate, _pt_counts_log_uniform(rng, 2.0, 50.0))
@@ -12668,7 +12849,7 @@ def _pt_diurnal_activity_counts(rng, n):
         lg = log_profile[ph] + np.where(day >= 5, np.log(rng.uniform(0.95, 1.2)), 0.0)
         lg += rng.uniform(0.03, 0.2) * _pt_knot_interpolated_noise(rng, n, rng.uniform(1.0, 5.0) * period)
         lg += lfilter([1.0], [1.0, -0.97], rng.normal(0.0, rng.uniform(0.001, 0.006), n))
-        x = np.round(_pt_counts_log_uniform(rng, 500.0, 500000.0) * np.exp(lg - lg.mean()))
+        x = np.round(_pt_counts_log_uniform(rng, 500.0, 500000.0) * np.exp(lg - _v2_meanm(lg)))
         hold_mask = rng.random(n) < rng.uniform(0.02, 0.2)
         hold_mask[0] = False
         src_index = np.where(hold_mask, 0, t)
@@ -12701,7 +12882,7 @@ def _pt_market_price_series(rng, n):
         t = np.arange(n)
         lg += rng.uniform(0.0, 0.08) * np.sin(_pt_COUNTS_TWO_PI * t / 252.0 + rng.uniform(0, _pt_COUNTS_TWO_PI))
         lg += (rng.uniform(0.0, 0.012) if rng.random() < 0.5 else 0.0) * rng.standard_normal(n)
-        x = base_price * np.exp(lg - lg.mean())
+        x = base_price * np.exp(lg - _v2_meanm(lg))
         hold_mask = rng.random(n) < (rng.uniform(0.0, 0.1) if rng.random() < 0.3 else 0.0)
         hold_mask[0] = False
         x = x[np.maximum.accumulate(np.where(hold_mask, 0, t))]
@@ -12735,7 +12916,7 @@ def _pt_smooth_random_curve(rng, n, length_scale):
     spectral_gain[0] = 0.0
     c = (rng.standard_normal(len(f)) + 1j * rng.standard_normal(len(f))) * spectral_gain
     y = np.fft.irfft(c, m)[:n]
-    s = y.std()
+    s = _v2_stdm(y)
     return y / s if s > 1e-12 else y
 _pt_TOD_BIN_COUNT = 1024
 _pt_TOD_BIN_CENTERS = (np.arange(_pt_TOD_BIN_COUNT) + 0.5) / _pt_TOD_BIN_COUNT
@@ -12748,7 +12929,7 @@ def _pt_smooth_random_curve_pair(rng, n, length_scale):
     w = rng.standard_normal((2, len(f))) * spectral_gain
     z = np.fft.fft(np.concatenate((w[0] + 1j * w[1], np.zeros(m - len(f)))))[:n]
     a, b = (z.real, z.imag)
-    return (a / max(a.std(), 1e-12), b / max(b.std(), 1e-12))
+    return (a / max(_v2_stdm(a), 1e-12), b / max(_v2_stdm(b), 1e-12))
 
 def _pt_daily_gaussian_bump(tod_bin, center, width):
     d = (_pt_TOD_BIN_CENTERS - center + 0.5) % 1.0 - 0.5
@@ -12847,7 +13028,7 @@ def _pt_dock_and_parking_availability(rng, n):
     am_pm_asymmetry = rng.uniform(0.15, 0.8) * (1.0 if rng.random() < 0.5 else -1.0)
     midday_weight = rng.uniform(0.2, 1.2)
     activity_profile = activity_floor + wk * (am + pm) + midday_weight * np.where(is_weekend, 1.5, 0.6) * midday_bump
-    activity_profile = activity_profile / activity_profile.mean()
+    activity_profile = activity_profile / _v2_meanm(activity_profile)
     flow_imbalance = wk * am_pm_asymmetry * (am - pm)
     imbalance_noise, activity_noise = _pt_smooth_random_curve_pair(rng, n, rng.uniform(1.5, 4.0) * steps_per_day)
     flow_imbalance = flow_imbalance + rng.uniform(0.05, 0.4) * imbalance_noise
@@ -12937,13 +13118,13 @@ def _pt_diurnal_counts_or_occupancy(rng, n):
         weekday_factors[int(rng.integers(0, 7))] *= rng.uniform(1.05, 1.5)
         log_level_drift = rng.uniform(0.5, 1.4) * _pt_smooth_random_curve(rng, n, rng.uniform(15.0, 90.0))
         base_rate = _pt_mobility_log_uniform(rng, 0.5, 20.0)
-        rate = base_rate * weekday_factors[dow] * np.exp(log_level_drift - 0.5 * log_level_drift.var())
+        rate = base_rate * weekday_factors[dow] * np.exp(log_level_drift - 0.5 * _v2_varm(log_level_drift))
         return _pt_overdispersed_poisson_counts(rng, rate, _pt_mobility_log_uniform(rng, 2.0, 40.0))
     steps_per_day = _pt_pick_option_by_weight(rng, (24.0, 48.0, 96.0, 288.0), (0.5, 0.3, 0.1, 0.1))
     tod, dow = _pt_time_of_day_and_weekday(rng, n, steps_per_day)
     lo = rng.uniform(0.4, 0.85)
     diurnal_profile = lo + (1.0 - lo) * (_pt_daily_gaussian_bump(tod, rng.uniform(0.55, 0.85), rng.uniform(0.12, 0.25)) + rng.uniform(0.0, 0.5) * _pt_daily_gaussian_bump(tod, rng.uniform(0.35, 0.45), 0.08))
-    diurnal_profile = diurnal_profile / diurnal_profile.mean()
+    diurnal_profile = diurnal_profile / _v2_meanm(diurnal_profile)
     wk = np.exp(rng.normal(0.0, 0.06, 7))[dow]
     slow_drift = np.exp(rng.uniform(0.1, 0.45) * _pt_smooth_random_curve(rng, n, rng.uniform(3.0, 20.0) * steps_per_day))
     if mode == 0:
@@ -13097,17 +13278,17 @@ def _pt_periodic_profile_series(rng, n):
         slow_wave = rng.normal() * np.sin(t * (_pt_PROFILE_TWO_PI / (p * rng.uniform(0.6, 5.0))) + rng.uniform(0, _pt_PROFILE_TWO_PI))
         for _ in range(2):
             slow_wave += rng.normal() * np.sin(t * (_pt_PROFILE_TWO_PI / (p * rng.uniform(0.6, 5.0))) + rng.uniform(0, _pt_PROFILE_TWO_PI))
-        profile = profile + rng.uniform(0.15, 0.6) * profile.std() * slow_wave / (slow_wave.std() + 1e-12)
+        profile = profile + rng.uniform(0.15, 0.6) * _v2_stdm(profile) * slow_wave / (_v2_stdm(slow_wave) + 1e-12)
     level_scale = np.exp(rng.normal(np.log(80.0), 2.2))
     x = level_scale * profile
-    signal_sd = level_scale * profile.std()
+    signal_sd = level_scale * _v2_stdm(profile)
     rl = rng.random()
     if rl >= 0.15:
         drift_amp = signal_sd * (rng.uniform(0.05, 0.3) if rl < 0.6 else rng.uniform(0.3, 0.9))
         x += drift_amp * _pt_slow_sine_mixture(rng, t, n, int(rng.integers(1, 3)))
     if rng.random() < 0.1:
         x += signal_sd * rng.normal(0.0, 0.6) * (t / n - 0.5)
-    series_sd = x.std() + 1e-12 * (1.0 + level_scale)
+    series_sd = _v2_stdm(x) + 1e-12 * (1.0 + level_scale)
     ev = rng.random()
     if ev < 0.12:
         k = int(rng.integers(n // 5, 4 * n // 5))
@@ -13119,7 +13300,7 @@ def _pt_periodic_profile_series(rng, n):
         k = int(rng.integers(n // 4, 3 * n // 4))
         g = np.ones(n)
         g[k:] = rng.uniform(0.15, 0.5)
-        x = (x - x.mean()) * g + x.mean()
+        x = (x - _v2_meanm(x)) * g + _v2_meanm(x)
     if p <= 7:
         noise_frac = rng.uniform(0.03, 0.22)
     elif rng.random() < (0.62 if p <= 48 else 0.5):
@@ -13140,7 +13321,7 @@ def _pt_periodic_profile_series(rng, n):
     if rq < 0.25:
         q = 1.0 if rq < 0.1 and series_sd > 60.0 else series_sd / float(np.exp(rng.uniform(np.log(20.0), np.log(2000.0))))
         xq = np.round(x / q) * q
-        if np.mean(np.diff(xq) == 0) < 0.045:
+        if _v2_mean(np.diff(xq) == 0) < 0.045:
             x = xq
     x = np.where(np.isfinite(x), x, 0.0)
     return x.astype(np.float64)
@@ -13160,7 +13341,7 @@ def _pt_ar_smoothed_unit_noise(rng, n, timescale, n_passes):
     y = _pt_ar1_filter_stationary(rng.standard_normal(n), ar_coef)
     if n_passes == 2:
         y = _pt_ar1_filter_stationary(y, ar_coef)
-    s = y.std()
+    s = _v2_stdm(y)
     return y / s if s > 0 else y
 
 def _pt_ar1_student_t_noise(rng, n):
@@ -13312,12 +13493,12 @@ def _pt_smooth_log_level_series(rng, n):
     x = x * (10.0 ** lg / median_abs)
     if lg > 2.3 and rng.random() < 0.35:
         r = np.round(x)
-        if np.mean(np.diff(r) == 0) < 0.03:
+        if _v2_mean(np.diff(r) == 0) < 0.03:
             x = r
     elif rng.random() < 0.5:
         q = 10.0 ** (np.floor(lg) - 3)
         r = np.round(x / q) * q
-        if np.mean(np.diff(r) == 0) < 0.03:
+        if _v2_mean(np.diff(r) == 0) < 0.03:
             x = r
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     return np.ascontiguousarray(x, dtype=np.float64)
@@ -13738,7 +13919,7 @@ def _pt_interconnector_net_flow(rng, n):
     z = z + float(rng.uniform(0.02, 0.09)) * rng.standard_normal(n)
     if rng.random() < 0.4:
         z = z + float(rng.uniform(-0.4, 0.4)) * (z * z - 1.0)
-    sd = float(np.std(z)) + 1e-12
+    sd = float(_v2_std(z)) + 1e-12
     z = z / sd
     mu = flow_scale * float(rng.uniform(-0.9, 0.9))
     flow_spread = flow_scale * float(rng.uniform(0.12, 0.6))
@@ -13888,10 +14069,10 @@ def _pt_outlier_contaminated_noise(rng, n, scale):
 def _pt_zero_diff_fraction(x):
     if x.shape[0] < 2:
         return 0.0
-    return float(np.mean(np.diff(x) == 0.0))
+    return float(_v2_mean(np.diff(x) == 0.0))
 
 def _pt_is_rounded_to_constant(y, x):
-    return float(np.std(x)) > 0.0 and float(np.std(y)) == 0.0
+    return float(_v2_std(x)) > 0.0 and float(_v2_std(y)) == 0.0
 
 def _pt_quantize_to_flat_fraction(rng, x, target_flat_frac):
     if rng.random() < _pt_QUANT_SKIP_PROB:
@@ -14101,11 +14282,11 @@ def _pt_sparse_pulse_response_series(rng, n):
     noise_timescale = float(np.exp(rng.uniform(np.log(30.0), np.log(600.0))))
     noise_ar_coef = float(np.clip(np.exp(-1.0 / noise_timescale), 0.0, 0.99999))
     ar_noise = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - noise_ar_coef * noise_ar_coef)), np.zeros(n), noise_ar_coef, 0.0, 1.0, 0.0)
-    ms = float(np.std(ar_noise))
+    ms = float(_v2_std(ar_noise))
     log_level = log_level + rng.uniform(0.0, 0.2) * pulse_decades * ar_noise / (ms if ms > 0 else 1.0)
     log_level += _pt_outlier_contaminated_noise(rng, n, rng.uniform(0.00015, 0.0022) if sharp_regime else rng.uniform(0.0008, 0.016))
     base_level = float(np.exp(rng.uniform(np.log(0.03), np.log(400.0))))
-    x = base_level * np.exp(log_level - log_level.mean())
+    x = base_level * np.exp(log_level - _v2_meanm(log_level))
     mode = rng.random()
     if mode < 0.35:
         x = np.sign(x) * np.abs(x) ** rng.uniform(0.35, 0.65)
@@ -14113,7 +14294,7 @@ def _pt_sparse_pulse_response_series(rng, n):
         if rng.random() < 0.75:
             x = x + float(np.exp(rng.uniform(np.log(0.5), np.log(8000.0))))
         elif rng.random() < 0.4:
-            x = x - rng.uniform(0.2, 4.0) * float(np.std(x) + 1e-09)
+            x = x - rng.uniform(0.2, 4.0) * float(_v2_std(x) + 1e-09)
     elif mode < 0.5:
         x = x - x.min() + float(np.exp(rng.uniform(np.log(1.0), np.log(300.0))))
     target_flat_frac = float(np.clip(rng.beta(3.0, 2.6), 0.02, 0.94))
@@ -14129,7 +14310,7 @@ def _pt_integrated_ar_mixture_series(rng, n):
     mean_reversion = float(np.exp(rng.uniform(np.log(2e-05), np.log(0.003))))
     e = rng.standard_normal(n)
     x = _pt_leaky_integrate_ar1_velocity(e, velocity_ar_coef, mean_reversion)
-    s = float(np.std(x))
+    s = float(_v2_std(x))
     if s <= 0.0:
         s = 1.0
     x = x / s
@@ -14155,10 +14336,10 @@ def _pt_integrated_ar_mixture_series(rng, n):
     noise_timescale = float(np.exp(rng.uniform(np.log(20.0), np.log(400.0))))
     noise_ar_coef = float(np.clip(np.exp(-1.0 / noise_timescale), 0.0, 0.99999))
     ar_noise = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - noise_ar_coef * noise_ar_coef)), np.zeros(n), noise_ar_coef, 0.0, 1.0, 0.0)
-    ms = float(np.std(ar_noise))
+    ms = float(_v2_std(ar_noise))
     x = x + rng.uniform(0.0, 0.7) * ar_noise / (ms if ms > 0 else 1.0)
     x = x + _pt_outlier_contaminated_noise(rng, n, float(np.exp(rng.uniform(np.log(0.0025), np.log(0.1)))))
-    x = x / (float(np.std(x)) + 1e-12)
+    x = x / (float(_v2_std(x)) + 1e-12)
     cv = float(np.exp(rng.uniform(np.log(0.005), np.log(1.5))))
     base_level = float(np.exp(rng.uniform(np.log(0.05), np.log(1500.0))))
     x = base_level * (1.0 + cv * x)
@@ -14183,7 +14364,7 @@ def _pt_two_timescale_weather_series(rng, n):
     n1 = np.sqrt(max(1e-12, 1.0 - a1 * a1))
     n2 = np.sqrt(max(1e-12, 1.0 - a2 * a2))
     ar_mix = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * n1, rng.standard_normal(n) * n2, a1, a2, 1.0 - slow_weight, slow_weight)
-    rs = float(np.std(ar_mix))
+    rs = float(_v2_std(ar_mix))
     ar_mix = ar_mix / (rs if rs > 0 else 1.0)
     nh = 1 + int(rng.integers(0, 3))
     a0 = float(np.exp(rng.uniform(np.log(0.1), np.log(3.0))))
@@ -14198,8 +14379,8 @@ def _pt_two_timescale_weather_series(rng, n):
         slow_wave = _pt_slow_sine_with_end_phase(rng, n, P * float(np.exp(rng.uniform(np.log(20.0), np.log(400.0)))), rng.uniform(0.15, 1.1), 0.6)
     y = seasonal + ar_mix + slow_wave
     y = y + _pt_outlier_contaminated_noise(rng, n, rng.uniform(0.0015, 0.055))
-    y = y - y.mean()
-    ys = float(np.std(y))
+    y = y - _v2_meanm(y)
+    ys = float(_v2_std(y))
     y = y / (ys if ys > 0 else 1.0)
     sensor_kind = _pt_draw_weighted_value(rng, np.array([0, 1, 2, 3, 4]), np.array([0.44, 0.1, 0.08, 0.14, 0.24]))
     if sensor_kind == 0:
@@ -14221,7 +14402,7 @@ def _pt_two_timescale_weather_series(rng, n):
         target_flat_frac = float(np.clip(rng.beta(2.2, 7.0), 0.01, 0.6))
     else:
         slow_baseline = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - a2 * a2)), np.zeros(n), min(0.99999, float(np.exp(-1.0 / (slow_timescale * rng.uniform(3.0, 30.0))))), 0.0, 1.0, 0.0)
-        bs = float(np.std(slow_baseline))
+        bs = float(_v2_std(slow_baseline))
         slow_baseline = slow_baseline / (bs if bs > 0 else 1.0)
         x = rng.uniform(4.0, 30.0) + slow_baseline * rng.uniform(0.3, 6.0) + 0.05 * y
         target_flat_frac = float(np.clip(rng.beta(2.5, 6.0), 0.01, 0.7))
@@ -14239,7 +14420,7 @@ def _pt_markov_intermittent_precip_series(rng, n):
     envelope_timescale = float(np.exp(rng.uniform(np.log(30.0), np.log(600.0))))
     envelope_ar_coef = float(np.clip(np.exp(-1.0 / envelope_timescale), 0.0, 0.9999))
     envelope = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - envelope_ar_coef * envelope_ar_coef)), np.zeros(n), envelope_ar_coef, 0.0, 1.0, 0.0)
-    es = float(np.std(envelope))
+    es = float(_v2_std(envelope))
     envelope = np.exp(rng.uniform(0.3, 1.4) * envelope / (es if es > 0 else 1.0) + _pt_slow_sine_with_end_phase(rng, n, max(200.0, n * rng.uniform(0.4, 2.0)), rng.uniform(0.0, 0.9), 0.68))
     intensity_ar_coef = float(np.clip(rng.uniform(0.0, 0.85), 0.0, 0.99))
     lm = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - intensity_ar_coef * intensity_ar_coef)), np.zeros(n), intensity_ar_coef, 0.0, 1.0, 0.0)
@@ -14463,7 +14644,7 @@ def _pt_occupancy_arrival_departure_counts(rng, n):
     wk = np.where(is_weekend, rng.uniform(0.25, 0.85), 1.0)
     flow_profile = baseline_flow + wk * (rng.uniform(0.5, 1.0) * am + rng.uniform(0.5, 1.0) * pm)
     flow_profile = flow_profile + rng.uniform(0.3, 1.1) * np.where(is_weekend, 1.4, 0.7) * midday
-    flow_profile = flow_profile / max(flow_profile.mean(), 1e-09)
+    flow_profile = flow_profile / max(_v2_meanm(flow_profile), 1e-09)
     flow_skew = rng.uniform(0.1, 0.65) * (1.0 if rng.random() < 0.5 else -1.0)
     flow_skew = flow_skew * wk * (am - pm) / max(float(np.abs(am - pm).max()), 1e-09)
     log_rate_noise = _pt_occ_ar1_noise(rng, n, rng.uniform(0.4, 3.0) * steps_per_day, rng.uniform(0.1, 0.4))
@@ -14583,10 +14764,10 @@ def _pt_random_daily_profile(rng: np.random.Generator, p: int) -> np.ndarray:
     floor = 10.0 ** rng.uniform(-2.3, -0.03)
     gamma = rng.uniform(0.6, 1.5)
     profile = floor + (1.0 - floor) * b ** gamma
-    profile /= profile.mean()
+    profile /= _v2_meanm(profile)
     if rng.random() < 0.3:
         profile = 1.0 + rng.uniform(0.12, 0.85) * (profile - 1.0)
-    return profile / profile.mean()
+    return profile / _v2_meanm(profile)
 
 def _pt_poisson_or_overdispersed_counts(rng: np.random.Generator, mu: np.ndarray) -> np.ndarray:
     mu = np.maximum(mu, 0.0)
@@ -14636,7 +14817,7 @@ def _pt_daily_profile_counts_with_drift(rng: np.random.Generator, n: int) -> np.
             log_drift[s:] += rng.uniform(-0.35, 0.35)
     ar_noise = _pt_ar1_noise_from_coef(rng, n, rng.uniform(0.55, 0.95), rng.uniform(0.03, 0.42))
     base_level = 10.0 ** (rng.uniform(4.0, 6.0) if rng.random() < 0.15 else rng.uniform(0.6, 4.0))
-    mu = base_level * seasonal * np.exp(log_drift + ar_noise - 0.5 * ar_noise.var())
+    mu = base_level * seasonal * np.exp(log_drift + ar_noise - 0.5 * _v2_varm(ar_noise))
     x = _pt_poisson_or_overdispersed_counts(rng, mu)
     median_count = float(np.median(x))
     if rng.random() < 0.35 and median_count > 8.0:
@@ -14664,7 +14845,7 @@ def _pt_long_period_seasonal_levels(rng: np.random.Generator, n: int) -> np.ndar
     n_harmonics = int(rng.integers(2, 4))
     for h in range(1, n_harmonics + 1):
         shape += rng.uniform(0.35, 1.0) / h * np.cos(2.0 * np.pi * h * t / p + rng.uniform(0.0, 2.0 * np.pi))
-    sd = float(shape.std())
+    sd = float(_v2_stdm(shape))
     if sd > 1e-12:
         shape *= season_amp / sd
     slow_wander = _pt_ar1_noise_from_coef(rng, n, min(0.9999, float(np.exp(-rng.uniform(1.5, 8.0) / max(n, 2)))), rng.uniform(0.03, 0.22))
@@ -14742,7 +14923,7 @@ def _pt_cumulative_download_counter(rng: np.random.Generator, n: int) -> np.ndar
         rate[s:] *= rng.uniform(0.45, 2.2)
     start_total = 10.0 ** rng.uniform(5.0, 11.0)
     growth_frac = max(10.0 ** rng.uniform(-2.75, -1.5), 120.0 / start_total)
-    m = rate.mean()
+    m = _v2_meanm(rate)
     rate = rate * (start_total * growth_frac / n / (m if m > 1e-12 else 1.0))
     increments = _pt_poisson_or_overdispersed_counts(rng, rate)
     if rng.random() < 0.1:
@@ -14819,11 +15000,11 @@ def _pt_epidemic_weekly_sums(rng, n):
     g = 10.0 ** (-rng.uniform(0.5, 1.7) * np.clip((ramp_in_end - t) / max(ramp_in_end, 1.0), 0.0, 1.0)) * 10.0 ** (-rng.uniform(0.5, 1.9) * np.clip((t - ramp_out_start) / max(m - ramp_out_start, 1.0), 0.0, 1.0))
     count_scale = 10.0 ** float(np.clip(rng.normal(2.25, 0.76), 0.95, 3.25))
     log_noise = rng.uniform(0.08, 0.3) * _pt_smooth_random_curve(rng, m + 6, rng.uniform(25.0, 90.0))
-    daily_mean = count_scale * (background_frac * g + (1.0 - background_frac) * wave_curve) * np.exp(log_noise - 0.5 * log_noise.var())
+    daily_mean = count_scale * (background_frac * g + (1.0 - background_frac) * wave_curve) * np.exp(log_noise - 0.5 * _v2_varm(log_noise))
     dow = (np.arange(m + 6, dtype=np.int64) + int(rng.integers(0, 7))) % 7
     wk = np.exp(rng.normal(0.0, rng.uniform(0.04, 0.16), 7))
     wk[5:] *= rng.uniform(0.7, 0.97)
-    daily_mean = daily_mean * (wk[dow] / wk.mean())
+    daily_mean = daily_mean * (wk[dow] / _v2_meanm(wk))
     c = _pt_overdispersed_poisson_counts(rng, np.maximum(daily_mean, 0.0) / 7.0, float(np.exp(rng.uniform(np.log(3.0), np.log(45.0)))))
     x = np.rint(np.convolve(c, _pt_SEVEN_DAY_SUM_KERNEL, mode='valid'))
     np.maximum(x, 0.0, out=x)
@@ -14927,7 +15108,7 @@ class _pt_Generator(DataGenerator):
         if fam in _pt_NATIVE_SCALE_FAMILIES:
             return x
         if fam not in ('poisson_gp_intensity_counts', 'bounded_integer_walk', 'weekday_poisson_counts'):
-            sd = float(x.std())
+            sd = float(_v2_stdm(x))
             if sd > 1e-12:
                 x = x / sd
             x = x * float(np.exp(rng.uniform(np.log(0.05), np.log(500.0))))
@@ -14966,7 +15147,7 @@ class _pt_Generator(DataGenerator):
                 x = self._randomize_scale(rng, x, fam)
             if was_integer:
                 x = np.round(x)
-            repeat_frac = float(np.mean(np.diff(x) == 0.0)) if x.size > 1 else 1.0
+            repeat_frac = float(_v2_mean(np.diff(x) == 0.0)) if x.size > 1 else 1.0
             hold_allowed = (repeat_frac >= self._hold_gate_min_repeat_frac) | (rng.random() < self._hold_gate_bypass_prob)
             if rng.random() < self._tail_hold_prob and (not is_raw) and hold_allowed:
                 x = _pt_apply_tail_hold(rng, x, self._tail_hold_max_len)
@@ -15525,11 +15706,11 @@ class _TeachStream:
 def _teach_pair_ok(a, b):
     if a.ndim != 1 or b.shape != a.shape or not np.isfinite(a).all() or not np.isfinite(b).all():
         return False
-    sa = float(a.std())
-    sb = float(b.std())
+    sa = float(_v2_stdm(a))
+    sb = float(_v2_stdm(b))
     if sa <= 1e-9 * (float(np.abs(a).mean()) + 1e-12) or sb <= 1e-9 * (float(np.abs(b).mean()) + 1e-12):
         return False
-    c = float(np.dot(a - a.mean(), b - b.mean()) / (a.size * sa * sb))
+    c = float(np.dot(a - _v2_meanm(a), b - _v2_meanm(b)) / (a.size * sa * sb))
     return abs(c) < 0.99
 
 import math
@@ -16459,11 +16640,11 @@ def _w9q_rki_endemic_sums(rng, n):
     count_scale = 10.0 ** float(np.clip(rng.normal(2.25, 0.76), 0.95, 3.25))
     log_noise = rng.uniform(0.08, 0.3) * _pt_smooth_random_curve(rng, m + 6, rng.uniform(25.0, 90.0))
     daily_mean = count_scale * (background_frac * g + (1.0 - background_frac) * wave_curve) \
-        * np.exp(log_noise - 0.5 * log_noise.var())
+        * np.exp(log_noise - 0.5 * _v2_varm(log_noise))
     dow = (np.arange(m + 6, dtype=np.int64) + int(rng.integers(0, 7))) % 7
     wk = np.exp(rng.normal(0.0, rng.uniform(0.04, 0.16), 7))
     wk[5:] *= rng.uniform(0.7, 0.97)
-    daily_mean = daily_mean * (wk[dow] / wk.mean())
+    daily_mean = daily_mean * (wk[dow] / _v2_meanm(wk))
     c = _pt_overdispersed_poisson_counts(rng, np.maximum(daily_mean, 0.0) / 7.0,
                                          float(np.exp(rng.uniform(np.log(3.0), np.log(45.0)))))
     x = np.rint(np.convolve(c, _pt_SEVEN_DAY_SUM_KERNEL, mode='valid'))
@@ -16494,8 +16675,7 @@ class Generator(DataGenerator):
 
     def _partner_row(self, i, it1):
         self._cpl_off = False
-        if _TMIX > 0.0 and (_TMIX >= 1.0 or np.random.default_rng(
-                np.random.SeedSequence([self._seed, _TMIX_TAG], spawn_key=(i,))).random() < _TMIX):
+        if _TMIX > 0.0 and (_TMIX >= 1.0 or _fcx_coin(self._seed, _TMIX_TAG, i) < _TMIX):
             y = np.asarray(self._teach.next(), dtype=np.float64)
 
             self._cpl_off = self._teach.last_name == "slow_level"
@@ -16520,7 +16700,7 @@ class Generator(DataGenerator):
                 except StopIteration:
                     return
                 if live and _Q > 0.0:
-                    u = np.random.default_rng(np.random.SeedSequence([self._seed, _TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(self._seed, _TAG, i)
                     if u < _Q:
                         try:
                             y = self._partner_row(i, it1)
@@ -16530,13 +16710,13 @@ class Generator(DataGenerator):
                             a = x.reshape(-1, x.shape[-1]); b = y.reshape(-1, y.shape[-1]); L = min(a.shape[-1], b.shape[-1])
                             z = np.concatenate([a[:, a.shape[-1] - L:], b[:, b.shape[-1] - L:]], axis=0)
                             if _CPL > 0.0 and z.shape[0] == 2 and not self._cpl_off:
-                                d0 = np.diff(z[0]); s0 = float(np.std(d0)); d1 = np.diff(z[1]); s1 = float(np.std(d1))
+                                d0 = np.diff(z[0]); s0 = float(_v2_std(d0)); d1 = np.diff(z[1]); s1 = float(_v2_std(d1))
                                 if s0 > 0.0 and s1 > 0.0 and np.isfinite(s0) and np.isfinite(s1):
-                                    zz = np.concatenate([[0.0], np.clip((d0 - d0.mean()) / s0, -6.0, 6.0)])
+                                    zz = np.concatenate([[0.0], np.clip((d0 - _v2_meanm(d0)) / s0, -6.0, 6.0)])
                                     p = int(np.argmax(z[1] != z[1][0]))
                                     zz[:p] = 0.0
                                     z = np.stack([z[0], z[1] + (_CPL * s1) * zz])
-                            if np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12)) and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12):
+                            if np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12)) and _v2_std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12):
                                 x = np.ascontiguousarray(z)
                 yield x
         finally:
@@ -16548,6 +16728,8 @@ _BAND_TEACH_XOR = 0x71A2B3C8
 _BAND_MIX = {"ixp_traffic": 0.30, "signed_flow": 0.0, "web_counter": 0.30, "season_onset": 0.10,
              "sparse_counts": 0.0, "ed_visit_share": 0.30}
 _FORK_DEDUP_TAG = 1110103
+
+_K87_MEMO = {}
 
 def _k87_quiet(r):
 
