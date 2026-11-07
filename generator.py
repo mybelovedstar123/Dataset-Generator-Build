@@ -5984,7 +5984,6 @@ _RAIN_TICK_CDF = _choice_cdf([0.40, 0.30, 0.18, 0.07, 0.05])
 
 def _rain_alternating(rng: np.random.Generator, off_len: np.ndarray,
                       on_len: np.ndarray, L: int) -> np.ndarray:
-    """Boolean path of alternating off/on runs, entered at a random offset."""
     k = off_len.size
     runs = np.empty(2 * k, dtype=np.int64)
     runs[0::2], runs[1::2] = off_len, on_len
@@ -5997,16 +5996,7 @@ def _rain_alternating(rng: np.random.Generator, off_len: np.ndarray,
         path = np.concatenate([path, np.zeros(L - path.size, dtype=bool)])
     return path
 
-
 def _gauge_rain(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """rain-gauge-class: precipitation totals per reporting interval.
-
-    Storms (short wet bursts broken by short gaps) alternate with heavy-tailed
-    dry spells. Per-step amounts are heavy-tailed, autocorrelated within a
-    storm and rounded to the gauge's published resolution, so drizzle reads
-    as single ticks, amounts under half a tick read as zero and dry spells
-    are exact zeros (~85-99% zeros, median wet run 1-3 steps). Some rows open
-    with a long dry stretch, as a dry-season or late-starting feed does."""
     out = np.zeros((n, L), dtype=np.float64)
     for i in range(n):
         tick = float(_RAIN_TICKS[_RAIN_TICK_CDF.searchsorted(rng.random(), side="right")])
@@ -6032,27 +6022,19 @@ def _gauge_rain(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         amount = med_ticks * storm_level[storm_id] * np.exp(lfilter([1.0], [1.0, -phi], innov))
         out[i] = np.rint(np.where(wet, amount, 0.0)) * tick
         if rng.random() < 0.15:
-            # dry season or a feed that starts late: a long exact-zero lead-in
+
             out[i, :int(rng.integers(L // 8, 3 * L // 4))] = 0.0
         if not out[i].any():
             out[i, int(rng.integers(0, L))] = tick
     return out
 
-
 def _gauge_rain_native(rng: np.random.Generator, n: int, L: int):
-    """Rain rows keep their published law: exact zeros on the gauge lattice.
-
-    Flagged as native rows, so the host restores them after the observation
-    stages and the tail continuation, and never pads or blends them."""
     return _gauge_rain(rng, n, L), {"bounded": np.ones(n, dtype=bool),
                                     "integer": np.zeros(n, dtype=bool)}
 
-
 _gauge_rain.with_metadata = _gauge_rain_native
 
-
 def _store_sales_panel(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """DeepEcho/DoppelGANger-inspired retail sales (v35.11 strengthened)."""
     t = _time_index(L).ravel()
     out = np.empty((n, L), dtype=np.float64)
     for i in range(n):
@@ -6094,13 +6076,7 @@ def _store_sales_panel(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             out[i] = sales
     return out
 
-
 def _sales_promo_stockout_panel(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Retail panel demand with promo lifts and explicit stock-out capping.
-
-    Sales-domain only: multi-store DOW seasonality and closure windows from the
-    panel law, plus Poisson stock-out runs from the retail-promo tail law.
-    """
     out = _store_sales_panel(rng, n, L)
     for row in range(n):
         sales = out[row]
@@ -6120,13 +6096,7 @@ def _sales_promo_stockout_panel(rng: np.random.Generator, n: int, L: int) -> np.
         out[row] = np.maximum(sales, 0.0)
     return out
 
-
 def _settle_hold(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Active history that settles into an EXACT constant tail.
-
-    Transport dock/counter/fuel-hold windows: moving prefix then noise-free
-    plateau tail at a nonzero integer level.
-    """
     t = _time_index(L)
     short = rng.random((n, 1)) < 0.55
     T = np.where(
@@ -6176,13 +6146,7 @@ def _settle_hold(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     lvl = np.where(is_zero, 0.0, lvl)
     return np.where(t >= start, lvl, pre)
 
-
 def _web_traffic_plateau(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Bursty web traffic that freezes into an exact integer plateau tail.
-
-    Dockerhub/npm-style pull counters: diurnal Poisson prefix then a
-    noise-free constant tail at the last active level.
-    """
     t = _time_index(L)
     t_flat = t.ravel()
     short = rng.random((n, 1)) < 0.65
@@ -6214,19 +6178,7 @@ def _web_traffic_plateau(rng: np.random.Generator, n: int, L: int) -> np.ndarray
         out[i] = pre
     return out
 
-
 def _biz_day_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """permit/transfer-class admin panels: 1 step = 1 day, weekday counts at
-    e^U[ln5, ln300], weekends and ~10/yr holidays EXACTLY zero (weekends leak
-    a small residual on ~20% of series), next-business-day backlog rebound,
-    month-end filing spikes, slow log-level drift, NB overdispersion.
-
-    By-type ledgers built from filing records list only the days on which
-    something was filed: the published series has no zeros (its floor is 1),
-    closed weekends and holidays simply drop out, and sparse filing types sit
-    at 1-3 per listed day. 75% of rows are published that way from a 2L-day
-    calendar (levels reach down to e^ln0.8); when the listed days do not fill
-    L the row starts with a constant prefix, as a short feed does."""
     span = 2 * L
     day = np.arange(span, dtype=np.int64)
     dow = day % 7
@@ -6278,11 +6230,7 @@ def _biz_day_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         out[i] = y
     return out
 
-
 def _weekly_web_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """npm-download-class: 1 step = 1 day, piecewise log-linear growth/decay
-    with 1-4 changepoints, deep multiplicative weekend dip, holiday-week
-    collapses, occasional release spikes, wide level range."""
     day = np.arange(L, dtype=np.int64)
     dow = day % 7
     out = np.empty((n, L), dtype=np.float64)
@@ -6326,11 +6274,7 @@ def _weekly_web_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         out[i] = vals
     return out
 
-
 def _dispatch_price(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """nz_emi-class dispatch/spot prices: sub-daily, mean-reverting log price
-    around a double-peaked diurnal profile, weekend softening, rare 3-40x
-    spikes decaying within hours, occasional floor-dips toward zero."""
     t = _time_index(L).ravel()
     out = np.empty((n, L), dtype=np.float64)
     for i in range(n):
@@ -6364,9 +6308,7 @@ def _dispatch_price(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         out[i] = price
     return out
 
-
 def _web_session_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """DoppelGANger-inspired web sessions (attribute → feature)."""
     t = _time_index(L).ravel()
     out = np.empty((n, L), dtype=np.float64)
     for i in range(n):
@@ -6406,9 +6348,7 @@ def _web_session_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         out[i] = np.round(np.maximum(level * day_scale * shape, 0.0))
     return out
 
-
 def _broadband_path_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """DoppelGANger-inspired broadband / path throughput (attribute → feature)."""
     t = _time_index(L).ravel()
     out = np.empty((n, L), dtype=np.float64)
     for i in range(n):
@@ -6435,9 +6375,7 @@ def _broadband_path_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray
         out[i] = base * path
     return out
 
-
 def _cluster_job_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """DoppelGANger-inspired Google-cluster-style job demand (attribute → feature)."""
     t = _time_index(L).ravel()
     out = np.empty((n, L), dtype=np.float64)
     for i in range(n):
@@ -6471,11 +6409,6 @@ def _cluster_job_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         out[i] = np.round(np.maximum(series, 0.0))
     return out
 
-
-# Unique idea: afternoon hockey-stick load on energy families.
-# Eval energy is temperature-driven load with a 96-step daily; the host prior
-# barely teaches that shape. A small MAD-scaled daily carrier is added only
-# to energy-tagged families so every other family stays paired with the host.
 _IDEA_NAME = "hockey_load_96"
 _IDEA_STAGE = 7701
 _IDEA_FAMS = frozenset({
@@ -6483,7 +6416,6 @@ _IDEA_FAMS = frozenset({
     "spiky_price", "dispatch_price", "broadband_path_attr",
     "storm_outage_counts",
 })
-
 
 def _apply_unique_idea(
     family: str,
@@ -6499,19 +6431,11 @@ def _apply_unique_idea(
         np.random.SeedSequence((int(base_seed), int(chunk_index), int(fam), _IDEA_STAGE))
     )
     hour = np.mod(np.arange(L, dtype=np.float64), 96.0) / 96.0
-    # Peak near hour 16 (fraction 0.67 of a 96-step day).
+
     shape = 1.15 - 0.50 * np.cos(2.0 * np.pi * (hour - 0.67))
     depth = rng.uniform(0.05, 0.12, size=(n, 1))
     scale = np.median(np.abs(block), axis=1, keepdims=True) + 1e-9
     return np.ascontiguousarray(block + depth * scale * (shape - 1.0), dtype=np.float64)
-
-# ==============================================================================
-# Generator class and chunked production
-# ==============================================================================
-
-# ==============================================================================
-# V144: native renewal-persistence component (not a frozen suffix)
-# ==============================================================================
 
 _RENEWAL_ELIGIBLE = frozenset({
     "held_rate", "step_level", "conditional_stability", "cs_flat", "cs_drift",
@@ -6519,7 +6443,7 @@ _RENEWAL_ELIGIBLE = frozenset({
 _RENEWAL_DEFAULTS: dict[str, Any] = {
     "rate": 0.0,
     "eligible_families": ["held_rate", "step_level", "conditional_stability"],
-    "mode_weights": [0.50, 0.25, 0.25],  # grid hold / noisy level / seasonal level
+    "mode_weights": [0.50, 0.25, 0.25],
     "quiet_median_min": 128.0,
     "quiet_median_max": 3072.0,
     "active_median_min": 48.0,
@@ -6531,9 +6455,7 @@ _RENEWAL_SELECT_STAGE = 0xC14401
 _RENEWAL_PATH_STAGE = 0xC14402
 _RENEWAL_NOISE_STAGE = 0xC14403
 
-
 def _parse_renewal_persistence(raw: Any) -> dict[str, Any]:
-    """Fail early on invalid or misspelled settings; absent means byte-inert."""
     if not isinstance(raw, dict):
         raise ValueError("renewal_persistence must be a JSON object")
     unknown = set(raw) - set(_RENEWAL_DEFAULTS)
@@ -6575,7 +6497,6 @@ def _parse_renewal_persistence(raw: Any) -> dict[str, Any]:
     settings["mode_weights"] = tuple((weights / weights.sum()).tolist())
     return settings
 
-
 def _renewal_persistence_series(
     path_rng: np.random.Generator,
     noise_rng: np.random.Generator,
@@ -6584,15 +6505,6 @@ def _renewal_persistence_series(
     *,
     return_metadata: bool = False,
 ) -> Any:
-    """Generate a native quiet/active process with its own observation law.
-
-    The renewal clock is independent of the requested length and of forecast
-    origins. Initial residual life uses a length-biased lognormal draw (with
-    integer rounding); this avoids always starting a new regime at sample 0.
-    Quiet runs can end. Seasonal rows retain their carrier in BOTH states.
-    Noise has a separate stream, so extending length cannot move earlier events.
-    Metadata is diagnostic-only; Generator.generate yields bare arrays only.
-    """
     if length < 0:
         raise ValueError("length must be nonnegative")
     if length == 0:
@@ -6604,8 +6516,7 @@ def _renewal_persistence_series(
     signed = bool(path_rng.random() < settings["signed_share"])
     scale = float(np.exp(path_rng.uniform(np.log(2.0), np.log(5000.0))))
     offset = float(path_rng.uniform(-1.5, 1.5))
-    # A recurring grid is a measurement law, not an assertion of zero future
-    # uncertainty: the latent process still changes when it becomes active.
+
     raw_tick = scale * float(np.exp(path_rng.uniform(np.log(0.002), np.log(0.04))))
     power = 10.0 ** float(np.floor(np.log10(raw_tick)))
     tick = power * float(path_rng.choice(np.array([1.0, 2.0, 5.0])))
@@ -6623,8 +6534,7 @@ def _renewal_persistence_series(
     quiet_sd = 0.0 if mode == 0 else float(np.exp(path_rng.uniform(np.log(0.001), np.log(0.015))))
     level_step = float(path_rng.uniform(0.06, 0.30))
     level = float(path_rng.normal(0.0, 0.20))
-    # Explicit cadence: daily samples carry a weekly/yearly pair; sub-daily
-    # samples carry daily/weekly structure. No universal 96-sample carrier.
+
     cadence = float(path_rng.choice(np.array([900.0, 1800.0, 3600.0, 86400.0]),
                                     p=np.array([0.20, 0.10, 0.45, 0.25])))
     day = 86400.0 / cadence
@@ -6657,8 +6567,6 @@ def _renewal_persistence_series(
         median = q_med if quiet else a_med
         remaining = max(1, int(np.ceil(np.exp(path_rng.normal(np.log(median), sigma)))))
 
-    # Draw initialization BEFORE the noise vector; separate streams make this
-    # generator prefix-consistent for any emitted length, including short rows.
     initial = float(noise_rng.standard_normal())
     innovation = noise_rng.standard_normal(length) * np.sqrt(1.0 - phi * phi)
     eps, _ = lfilter([1.0], [1.0, -phi], innovation, zi=np.array([phi * initial]))
@@ -6681,7 +6589,6 @@ def _renewal_persistence_series(
                         "quiet_median": q_med, "active_median": a_med, "tick": tick}
     return values
 
-
 def _apply_renewal_persistence(
     chunk: list[np.ndarray | None],
     fam_ids: np.ndarray,
@@ -6689,13 +6596,6 @@ def _apply_renewal_persistence(
     chunk_index: int,
     settings: dict[str, Any],
 ) -> np.ndarray:
-    """Replace a small, family-gated subset AFTER all existing transforms.
-
-    No earlier array is mutated, no parent RNG is consumed, and no selected row
-    feeds back into TSMixup. Raising rate selects a nested superset with exactly
-    the same native draws on common rows. This is an explicit mixture component,
-    not a claim that the old row's noise or seasonal law has been preserved.
-    """
     selected = np.zeros(len(chunk), dtype=bool)
     rate = settings["rate"]
     if rate <= 0.0:
@@ -6715,11 +6615,6 @@ def _apply_renewal_persistence(
         selected[slot] = True
     return selected
 
-
-# ==============================================================================
-# V145: preserve native support; prevent incompatible post-processing
-# ==============================================================================
-
 _NATIVE_SIGNED_FAMILIES = frozenset({
     "grid_flow", "spiky_price", "price_shock", "tidal_constituents",
     "energy_load_price_solar",
@@ -6731,9 +6626,7 @@ _SUPPORT_DEFAULTS = {
     "repair_degenerate_rollback": False,
 }
 
-
 def _parse_support_contract(raw: Any) -> dict[str, bool]:
-    """All-off is the V144 control; misspellings/implicit bool casts are errors."""
     if not isinstance(raw, dict):
         raise ValueError("support_contract must be a JSON object")
     unknown = set(raw) - set(_SUPPORT_DEFAULTS)
@@ -6746,9 +6639,7 @@ def _parse_support_contract(raw: Any) -> dict[str, bool]:
             raise ValueError(f"support_contract.{name} must be a JSON boolean")
     return result
 
-
 def _native_bounded_mask(flags: Any, n: int) -> np.ndarray:
-    """Copy the builder's actual row mask, not a whole-family approximation."""
     if flags is None:
         return np.zeros(n, dtype=bool)
     mask = np.asarray(flags.get("bounded", np.zeros(n, dtype=bool)), dtype=bool)
@@ -6756,25 +6647,16 @@ def _native_bounded_mask(flags: Any, n: int) -> np.ndarray:
         raise ValueError("native bounded flag has the wrong row count")
     return mask.copy()
 
-
 def _mixup_support_compatible(
     protected: np.ndarray, host: int, donors: np.ndarray,
 ) -> bool:
-    """V145 does not invent a new law by blending protected rows across families.
-
-    Called AFTER donor/weight draws so refusing a mix does not perturb the
-    selection or parameters of later mixes. No resampling or retry loop.
-    """
     return not (bool(protected[host]) or bool(np.any(protected[donors])))
 
-
-# V146: native temporal laws, independently switchable for paired ablations.
 _TEMPORAL_DEFAULTS = {
     "complete_renewals": False,
     "native_integer_flags": False,
     "instance_config": False,
 }
-
 
 def _parse_temporal_integrity(value: Any) -> dict[str, bool]:
     if not isinstance(value, dict):
@@ -6788,9 +6670,7 @@ def _parse_temporal_integrity(value: Any) -> dict[str, bool]:
         out[key] = flag
     return out
 
-
 class _BaseGenerator(DataGenerator):
-
 
     def __init__(self, config_dir: str, *, seed: int) -> None:
         cfg_path = Path(config_dir) / "config.json"
@@ -6883,8 +6763,7 @@ class _BaseGenerator(DataGenerator):
                 cfg.get("integrated_heavy_frac", 0.25)
             ),
             "integrated_sv_frac": float(cfg.get("integrated_sv_frac", 0.30)),
-            # Defaults reproduce the pre-existing hardcoded behaviour exactly, so
-            # a config that omits them emits the same bytes as the parent.
+
             "tsmixup_source_alpha": float(cfg.get("tsmixup_source_alpha", 1.0)),
             "tsmixup_mean_scale": float(cfg.get("tsmixup_mean_scale", 0.0)),
             "step_level_jumps_lo": float(cfg.get("step_level_jumps_lo", 1.0)),
@@ -6966,9 +6845,7 @@ class _BaseGenerator(DataGenerator):
             "observation.nonuniform_quantize_frac": float(
                 observation.get("nonuniform_quantize_frac", 2.0 / 3.0)
             ),
-            # 191 observation grafts (UID 191 / generators/191 p43–p46).
-            # Defaults 0 keep the stock v10 path bit-identical until config
-            # turns them on.
+
             "observation.gamma_warp_rate": float(
                 observation.get("gamma_warp_rate", 0.0)
             ),
@@ -7018,7 +6895,6 @@ class _BaseGenerator(DataGenerator):
         return str(self._cfg.get("name", "cascade-heat3-fast-learn-curriculum"))
 
     def _blend_at(self, token_progress: float) -> float:
-        """Return the shared smoothstep blend for weights and difficulty."""
         if not self._curriculum_enabled:
             return 1.0
         position = (token_progress - self._curriculum_start) / (
@@ -7028,7 +6904,6 @@ class _BaseGenerator(DataGenerator):
         return position * position * (3.0 - 2.0 * position)
 
     def _weights_at(self, token_progress: float) -> np.ndarray:
-        """Blend easy-to-final family weights with a smoothstep schedule."""
         blend = self._blend_at(token_progress)
         if blend >= 1.0:
             return self._weights
@@ -7037,7 +6912,6 @@ class _BaseGenerator(DataGenerator):
         return (1.0 - blend) * self._start_weights + blend * self._weights
 
     def _domain_weights_at(self, token_progress: float) -> np.ndarray | None:
-        """Blend easy-to-final domain shares when domain_mix is enabled."""
         if not self._domain_mix_enabled:
             return None
         blend = self._blend_at(token_progress)
@@ -7048,7 +6922,6 @@ class _BaseGenerator(DataGenerator):
         return (1.0 - blend) * self._domain_start_weights + blend * self._domain_weights
 
     def _parameters_at(self, token_progress: float) -> dict[str, float]:
-        """Blend all within-family, observation, and augmentation settings."""
         blend = self._blend_at(token_progress)
         if blend >= 1.0:
             return dict(self._parameters)
@@ -7061,20 +6934,16 @@ class _BaseGenerator(DataGenerator):
         }
 
     def _progress_at(self, emitted_points: float, target_points: int) -> float:
-        """Calibrate nominal point progress to expected heat consumption."""
         return emitted_points / (target_points * self._expected_budget_fraction)
 
     def generate(self, n_series: int) -> Iterator[np.ndarray]:
-
 
         if n_series <= 0:
             return
         rng = np.random.default_rng(self._seed)
         max_len = self._max_len
-        # stream_cpu requests token_budget // min_length + 2 rows. Recover the
-        # budget so this fixed-length generator follows trainer token progress.
-        target_points = max(1, max(n_series - 2, 1) * self._min_len)
 
+        target_points = max(1, max(n_series - 2, 1) * self._min_len)
 
         queue: Queue[object] = Queue(maxsize=self._prefetch_depth)
         stop = Event()
@@ -7095,12 +6964,9 @@ class _BaseGenerator(DataGenerator):
                 produced = 0
                 emitted_points = 0
                 base_seed = self._seed
-                # Running chunk counter: every isolated stream below is keyed
-                # (base_seed, chunk_index, fam, slot, tag) so an edit anywhere
-                # can only touch the rows its own stream feeds.
+
                 chunk_index = 0
                 while produced < n_series and not stop.is_set():
-
 
                     batch_size = chunk_batch_size(produced)
                     lengths = rng.integers(
@@ -7183,9 +7049,9 @@ class _BaseGenerator(DataGenerator):
                         _rate_counts,
                         _dispersion_counts,
                         _dispatch_blocks,
-                        # grafted chronoforge builders, same order as CF_GRAFT
+
                         *self._cf_builders,
-                        # grafted vanta native builder, LAST index (== cycle_profile)
+
                         _cycle_profile,
                         _transport_flow_tail,
                         _capacity_counts,
@@ -7232,10 +7098,7 @@ class _BaseGenerator(DataGenerator):
                             self._domain_pool_indices,
                         )
                     else:
-                        # Flat family dispatch (legacy path). The master stream
-                        # consumes exactly what the source's ``rng.choice`` did:
-                        # one ``rng.random(batch_size)`` call (verified
-                        # bit-identical, including end state).
+
                         dispatch_u = rng.random(batch_size)
                         fam_base = _DISPATCH_REF_CDF.searchsorted(
                             dispatch_u, side="right"
@@ -7278,17 +7141,9 @@ class _BaseGenerator(DataGenerator):
                                 fam_ids[released] = excess_cdf.searchsorted(
                                     move_u[released], side="right"
                                 )
-                    # Seed words for the whole chunk in one vectorised pass,
-                    # keyed (base_seed, chunk_index, fam, slot, tag). The block
-                    # loop below draws only the anchor slot of each family
-                    # group, so most of these words go unused; deriving them all
-                    # is one vectorised call per tag and cheaper than selecting
-                    # the ~34 anchors out of it.
+
                     slots = np.arange(batch_size, dtype=np.int64)
-                    # Tag 3 belongs to the tail rebase and is derived only when
-                    # that mechanism is on, so the default path pays nothing for
-                    # it. Tags are independent keys, so adding one cannot perturb
-                    # streams 0-2.
+
                     tags = (0, 1, 2, 3) if parameters["tail_rebase_rate"] > 0.0 \
                         else (0, 1, 2)
                     stream_words = []
@@ -7313,7 +7168,7 @@ class _BaseGenerator(DataGenerator):
                         return _row_pool(n_tags).seeded(tag, *words[slot])
 
                     chunk: list[np.ndarray | None] = [None] * batch_size
-                    # Each family group writes disjoint slots; no shared RNG.
+
                     support_protected = np.zeros(batch_size, dtype=bool)
                     native_no_pad = np.zeros(batch_size, dtype=bool)
 
@@ -7326,48 +7181,21 @@ class _BaseGenerator(DataGenerator):
                             "physical_sensors",
                             "seasonal_counts",
                             "intermittent",
-                            # These families intentionally encode signed prices,
-                            # cross-border flow reversals, and below-zero grid
-                            # regimes. The global nonnegative/integer prior
-                            # otherwise shifts 85% of their rows and rounds 70%
-                            # of those rows, erasing the energy-specific signal.
+
                             "grid_flow",
                             "spiky_price",
                             "price_shock",
-                            # Sea level is signed about a site datum; rounding
-                            # or zero-clipping it erases the constituent
-                            # structure this family exists to teach.
+
                             "tidal_constituents",
-                            # Persistent physical levels (stage / hydrograph /
-                            # smooth load). The global integer prior otherwise
-                            # rounds away the continuous recession and the
-                            # 5-min load carrier this family now owns.
+
                             "flow_recession",
-                            # Doubly-stochastic counts/rates: the family owns
-                            # its count semantics (exact-zero runs, Poisson /
-                            # Gamma / Lognormal draws); the global nonneg-
-                            # integer prior would re-round and zero-inflate
-                            # what the observation law already encodes.
+
                             "rate_counts",
-                            # The whole point of this family is that its Fano
-                            # factor is exactly what was requested. The global
-                            # prior would shift the level and re-round, which
-                            # changes variance and mean independently and so
-                            # destroys the one statistic it exists to control.
+
                             "dispersion_counts",
-                            # Off is exactly zero and on holds a level; the
-                            # global prior would shift the floor off zero and
-                            # re-round the held levels, dissolving both.
+
                             "dispatch_blocks",
-                            # Grafted chronoforge families that are non-negative
-                            # by construction and own their count / bound
-                            # semantics (traffic counts, counter resets, queue
-                            # latency, rate plateaus, epidemic renewal counts,
-                            # admin reporting counts, bounded vitals). The two
-                            # signed grafts (ops_deploy_transient,
-                            # physio_quasiperiodic) deliberately go through the
-                            # global prior: healthcare / web_cloudops in the
-                            # eval pool are never negative.
+
                             "ops_diurnal_traffic",
                             "ops_saturating_feedback",
                             "ops_counter_reset",
@@ -7376,17 +7204,14 @@ class _BaseGenerator(DataGenerator):
                             "epi_renewal",
                             "admin_reporting_counts",
                             "clinical_bounded_vitals",
-                            # later grafts that are non-negative by construction
+
                             "met_bounded_atom", "met_wind_speed",
                             "wet_dry_intermittent", "regime_dwell_zerosparse",
                             "hawkes_marked", "transport_flow",
                             "retail_promo_intermittent",
-                            # combo1: energy_load_price_solar carries signed
-                            # prices / below-zero load; exempt it from the global
-                            # nonneg/int prior so the energy signal survives.
+
                             "energy_load_price_solar",
-                            # Moment-matched count/gauge laws own their
-                            # zeros, integer rounding and tick spacing.
+
                             "heavy_traffic_counts",
                             "sparse_admin_counts",
                             "storm_outage_counts",
@@ -7411,7 +7236,7 @@ class _BaseGenerator(DataGenerator):
                             "rate_counts",
                             "dispersion_counts",
                             "dispatch_blocks",
-                            # grafts that already emit integer counts
+
                             "epi_renewal",
                             "admin_reporting_counts",
                             "ops_counter_reset",
@@ -7434,27 +7259,7 @@ class _BaseGenerator(DataGenerator):
                             "long_memory",
                         }
                         allow_range_artifacts = family != "integrated"
-                        # Per-FAMILY-GROUP streams: one stream per
-                        # (chunk, family, tag) rather than one per row, and the
-                        # whole group built and post-processed as a single
-                        # (rows, L) block.
-                        #
-                        # The observation pipeline costs 343us for one row and
-                        # 129us per row at 64 rows a call. The work per row is
-                        # the same either way; what amortises is the row
-                        # selection draws, the calibration medians and ufunc
-                        # dispatch, all of which run once per call instead of
-                        # once per row. Spending the 13.32B-token budget inside
-                        # the hour needs 3.70M points/s and per-row dispatch
-                        # leaves the corpus short of it, so that 2.66x is the
-                        # difference between using the budget and leaving
-                        # tokens on the table.
-                        #
-                        # The cost is coarser isolation than 08-14-3: an edit to
-                        # one stage now moves every row of every family that
-                        # reaches it, not a single row. 08-14-3 keeps the
-                        # per-row keying and stays the reference for bisecting a
-                        # regression to one stage of one family.
+
                         anchor = int(idx[0])
                         policy = self._support_contract
                         builder = builders[fam]
@@ -7476,8 +7281,7 @@ class _BaseGenerator(DataGenerator):
                             if preserve_integers.shape != (idx.size,):
                                 raise ValueError("native integer flags must have one value per row")
                         restore_mask = bounded_mask & policy["restore_bounded_native"]
-                        # Native bounded rows retain their complete emission law:
-                        # clipping an already distorted row is not equivalent.
+
                         native_rows = block[restore_mask].copy() if restore_mask.any() else None
                         signed_family = family in _NATIVE_SIGNED_FAMILIES
                         clip_nonnegative = preserve_nonnegative and not (
@@ -7529,10 +7333,7 @@ class _BaseGenerator(DataGenerator):
                                 ],
                             )
                             block = _apply_zero_inflation(post_rng, block)
-                        # Outside the preserve_nonnegative guard on purpose: a
-                        # recalibration hits a signed price series and a count
-                        # series alike, and the families exempt from the global
-                        # prior are exactly the ones that own their level.
+
                         if (parameters["tail_rebase_rate"] > 0.0
                                 and family not in ("ops_counter_reset", "pull_counter_ramp", "epi_season_decay", "surveillance_counts",
                                            "epi_renewal", "reported_epi_counts", "epi_decay")):
@@ -7573,7 +7374,6 @@ class _BaseGenerator(DataGenerator):
                         for fam, fam_idx in groups:
                             _build_family_group(fam, fam_idx)
 
-
                     if self._min_len == max_len:
                         mix_rate = parameters["augment.tsmixup"]
                         mixed = np.nonzero(rng.random(batch_size) < mix_rate)[0]
@@ -7585,9 +7385,7 @@ class _BaseGenerator(DataGenerator):
                                 continue
                             n_other = int(rng.integers(1, 3))
                             others = rng.integers(0, batch_size, size=n_other)
-                            # Concentration on the source component only. The draw
-                            # count is unchanged, so the stream advances the same
-                            # way whatever the concentration is.
+
                             alpha = np.ones(n_other + 1)
                             alpha[0] = mix_alpha
                             weights = rng.dirichlet(alpha)
@@ -7606,15 +7404,7 @@ class _BaseGenerator(DataGenerator):
                             if not valid:
                                 continue
                             if mix_scaled:
-                                # Chronos TSMixup mixes *mean-scaled* series. Our
-                                # families draw amplitude over three orders of
-                                # magnitude, so combining raw series lets the
-                                # largest component swamp the rest and the mixture
-                                # carries only its pattern. Scale each component to
-                                # unit mean absolute value, combine, then restore
-                                # the source's scale: the observation pipeline's
-                                # integer rounding is not scale-invariant, so the
-                                # result has to come back to the source amplitude.
+
                                 unit = []
                                 for part in parts:
                                     s = float(np.mean(np.abs(part)))
@@ -7631,7 +7421,6 @@ class _BaseGenerator(DataGenerator):
                                     combined = combined + weights[j + 1] * part
                             chunk[series_i] = _sanitize(combined)
 
-
                     pad_rate = parameters["augment.pad_prefix"]
                     padded = np.nonzero(rng.random(batch_size) < pad_rate)[0]
                     for series_i in padded:
@@ -7642,17 +7431,13 @@ class _BaseGenerator(DataGenerator):
                         if native_no_pad[series_i]:
                             continue
                         series[:cut] = series[cut]
-                    # Native small-mixture replacement sees the FINAL emitted
-                    # length, after TSMixup and prefix padding. No later stage
-                    # can re-corrupt its support, noise law or quiet regimes.
+
                     if self._renewal_persistence["rate"] > 0.0:
                         _apply_renewal_persistence(
                             chunk, fam_ids, base_seed, chunk_index,
                             self._renewal_persistence,
                         )
-                    # Run after every parent augmentation so the finite episode
-                    # cannot perturb TSMixup, padding, renewal, or V449's
-                    # terminal-tail classifier through a downstream statistic.
+
                     if _CAS1_INTERIOR_REBASE_RATE > 0.0:
                         for fam, fam_idx in groups:
                             family = _FAMILIES[fam]
@@ -7721,11 +7506,6 @@ class _BaseGenerator(DataGenerator):
             stop.set()
             producer.join(timeout=1.0)
 
-
-# ==============================================================================
-# Kernels, stochastic families, observation
-# ==============================================================================
-
 def _ar1_kernel(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
     n, L = innov.shape
     x = np.empty((n, L), dtype=np.float64)
@@ -7737,29 +7517,10 @@ def _ar1_kernel(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
             x[i, t] = prev
     return x
 
-
 def _cycle_profile(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Repeat a learned cycle shape under slowly evolving cycle-level state.
-
-    Sinusoidal families make the profile known from a few Fourier parameters,
-    while AR families make only nearby samples informative. This process makes
-    an arbitrary smooth profile recur, so several earlier cycles reveal the
-    shape and the latest cycles reveal how its amplitude and level are moving.
-    Those are observable cues for the next 64 samples in traffic, demand, load,
-    and environmental monitoring series.
-    """
     if n <= 0:
         return np.empty((0, L), dtype=np.float64)
-    # Cycle periodicity matched to the pool's seasonal_period histogram, which
-    # is stable across all 8 snapshots on disk. The previous weights put their
-    # LARGEST share (0.18) on period 168 and 0.42 combined on 168/240/336/672 --
-    # periods occurring zero or near-zero times in every pool -- while period 24
-    # (23.4% of pool) got 0.08 and period 7 (11.2%) was never generated at all.
-    # This is the same coverage defect that, fixed in _ENV_PERIODS on the r17
-    # lineage, beat its base 5-of-5 pools on LCB. Repeated-cycle is the strongest
-    # correction found on this warm start (+1.44% / LCB +0.79% vs UID81), so
-    # pointing it at periods the pool actually contains is the highest-value
-    # instance of the fix rather than a new mechanism.
+
     out = np.empty((n, L), dtype=np.float64)
     t = np.arange(L, dtype=np.int64)
 
@@ -7770,8 +7531,7 @@ def _cycle_profile(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         knots = int(rng.integers(8, 17))
         knot_x = np.linspace(0.0, float(period), knots + 1)
         knot_y = rng.normal(0.0, 1.0, size=knots)
-        # Circular smoothing retains asymmetric peaks and shoulders without
-        # introducing a discontinuity where one cycle joins the next.
+
         for _ in range(2):
             knot_y = (
                 np.roll(knot_y, 1) + 2.0 * knot_y + np.roll(knot_y, -1)
@@ -7796,13 +7556,7 @@ def _cycle_profile(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         level_state[0] = float(rng.normal(0.0, 0.25))
         amp_sd = float(rng.uniform(0.025, 0.10))
         level_sd = float(rng.uniform(0.015, 0.10))
-        # The recursion is sequential and has to stay a Python loop, but its two
-        # scalar draws per cycle do not: normal(0, s) is built as s * a standard
-        # normal, and one (n_cycles-1, 2) block consumes the same ziggurat
-        # sequence as the alternating scalar calls, so the stream is unchanged.
-        # np.clip on a scalar costs more in dispatch than the arithmetic around
-        # it, and min/max is exact here because both states are bounded every
-        # step and the noise is finite, so no NaN can reach the comparison.
+
         if n_cycles > 1:
             _noise = rng.normal(0.0, 1.0, size=(n_cycles - 1, 2))
             _amp = float(amp_state[0])
@@ -7823,8 +7577,6 @@ def _cycle_profile(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
                 amp_state[c] = _amp
                 level_state[c] = _level
 
-        # Interpolate between cycle states. The state remains persistent but
-        # does not create artificial jumps exactly at the cycle boundary.
         amp = (1.0 - fraction) * amp_state[cycle] + fraction * amp_state[cycle + 1]
         level = ((1.0 - fraction) * level_state[cycle]
                  + fraction * level_state[cycle + 1])
@@ -7842,7 +7594,6 @@ def _cycle_profile(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
 
     return out
 
-
 def _ar1_batch(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
     if innov.shape[0] == 0:
         return np.empty_like(innov, dtype=np.float64)
@@ -7850,7 +7601,6 @@ def _ar1_batch(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
         np.ascontiguousarray(innov, dtype=np.float64),
         np.ascontiguousarray(np.reshape(phi, -1), dtype=np.float64),
     )
-
 
 @njit(cache=False, fastmath=False)
 def _ar2_kernel(innov: np.ndarray, a1: np.ndarray, a2: np.ndarray) -> np.ndarray:
