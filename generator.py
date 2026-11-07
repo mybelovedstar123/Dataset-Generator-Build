@@ -23150,3 +23150,303 @@ def _yf_station(r, n):
         x[j:] += 1.0 if x[0] <= 0.0 or (x[0] < cap and u[22] < 0.5) else -1.0
         frz = []
     return x, frz
+
+def _yf_stair(r, n):
+    u = r.random(16)
+    dec = 1 + min(int(np.searchsorted((0.2, 0.6), u[0], side="right")), 2)
+    lvl = np.floor(_yf_lu(u[1], 30.0, 5000.0))
+    if u[2] < _YF_C_P_SLOT:
+        P = int(_YF_C_PER[min(int(3.0 * u[3]), 2)])
+        nd = n // P + 2
+        day = np.flatnonzero(r.random(nd) < 0.2 + 0.7 * u[4])
+        tm = day * P + int(u[5] * P) - int(u[6] * P)
+    else:
+        med = _yf_lu(u[3], 5.0, 120.0)
+        sg = 0.8 + 0.7 * u[4]
+        mean = med * float(np.exp(0.5 * sg * sg))
+        burn = int(8.0 * mean)
+        iv = np.ceil(med * np.exp(sg * r.standard_normal(min(8000, 16 + int(3.0 * (n + burn) / med)))))
+        iv = np.minimum(iv, _YF_C_GAP_MAX)
+        tm = np.cumsum(iv).astype(np.int64) - burn
+
+    tm = np.unique(np.concatenate((1 + (r.random(_YF_C_OPEN) * 60.0).astype(np.int64), tm[(tm >= 1) & (tm < n)])))
+    v = r.random((2, tm.size))
+    base = min(max(1.0, lvl * _yf_lu(u[8], 0.002, 0.04)), max(1.0, 0.3 * lvl / np.sqrt(tm.size)))
+    k = np.maximum(1.0, np.round(base * np.exp(0.5 * r.standard_normal(tm.size))))
+    step = np.where(v[0] < 0.5, k, -k)
+    x = lvl + np.cumsum(np.bincount(tm, weights=step, minlength=n)[:n])
+    lo = float(x.min())
+    if lo < 1.0:
+        x = x + (1.0 - lo)
+    x = x / 10.0 ** dec
+    e = np.concatenate(([0], tm, [n]))
+    return x, [(int(a), int(b - a)) for a, b in zip(e[:-1], e[1:])]
+
+_YF_BUILD = (_yf_stale, _yf_station, _yf_stair)
+
+def _yf_draw(r, L):
+    L = int(L)
+    u = r.random(3)
+    kind = min(int(np.searchsorted(_YF_KIND_CUM, u[0], side="right")), len(_YF_BUILD) - 1)
+    n = L if u[1] < _YF_P_FULL else min(L, int(_YF_N_SHORT[0] + (_YF_N_SHORT[1] - _YF_N_SHORT[0]) * u[2]))
+    x, frz = _YF_BUILD[kind](r, n)
+    return np.asarray(x, dtype=np.float64), kind, frz
+
+def _yf_freeze(r, L):
+    L = int(L)
+    if L < 1024:
+        return None
+    x, _, _ = _yf_draw(r, L)
+    n = x.size
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+_YE2_KIND_CUM = np.cumsum([0.44, 0.32, 0.24])
+_YE2_TWO_PI = 2.0 * np.pi
+_YE2_LAM_LO = 0.02
+_YE2_LAM_HI = 5.0e4
+_YE2_LEN = ((5.92, 1.2), (6.68, 2.1), (7.0, 1.4))
+_YE2_CYC = (0.5, 0.8, 0.7)
+_YE2_HEAD = (1.3, 1.0, 0.5)
+_YE2_RISE = 0.3
+_YE2_S1 = (1.05, 1.0, 1.1)
+_YE2_S2 = (1.45, 1.0, 1.0)
+_YE2_OFF = (0.0, -0.15, 0.0)
+_YE2_S3_TAU = (80.0, 300.0)
+
+def _ye2_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _ye2_hump(m, pk, w_lo, w_hi):
+    d = float(np.log(m / pk))
+    return float(np.exp(-0.5 * (d / (w_lo if d < 0.0 else w_hi)) ** 2))
+
+def _ye2_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _ye2_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _ye2_ar1(e, phi)
+
+def _ye2_len(zl, L, kind):
+    mu, sd = _YE2_LEN[kind]
+    return int(min(L, round(320.0 + float(np.exp(mu + sd * min(max(zl, -6.0), 6.0))))))
+
+def _ye2_rises(u):
+
+    return (u * 1073741824.0) % 1.0 < 0.5
+
+def _ye2_head(n, size, c, span, rises):
+
+    t = np.arange(n, dtype=np.float64)
+    w = np.maximum(1.0 - np.log1p(t / c) / np.log1p(span / c), 0.0)
+    if not rises:
+        return size * w
+    mirror = np.log(2.0 - np.exp(size * (w - 1.0))) - float(np.log(2.0 - np.exp(-size)))
+    return -_YE2_RISE * size * w + (1.0 - _YE2_RISE) * mirror
+
+def _ye2_cycle(r, n, per, amp):
+    r.random()
+    ph_end = r.random()
+    ph = (np.arange(n, dtype=np.float64) - (n - 1)) / per + ph_end
+    h2 = r.uniform(0.0, 0.3)
+    return amp * (np.cos(_YE2_TWO_PI * ph) + h2 * np.cos(2.0 * _YE2_TWO_PI * ph + r.uniform(0.0, _YE2_TWO_PI)))
+
+def _ye2_episodes(r, n, rate, dur_lo, dur_hi, amp_lo, amp_hi, plateau):
+    out = np.zeros(n, dtype=np.float64)
+    k = int(min(r.poisson(rate * n), 40))
+    if k <= 0:
+        return out
+    t = np.arange(n, dtype=np.float64)
+    for _ in range(k):
+        i = int(r.integers(0, n))
+        d = _ye2_lu(r, dur_lo, dur_hi)
+        a = r.uniform(amp_lo, amp_hi)
+        if r.random() < plateau:
+            j = int(min(n, i + int(d) + 1))
+            out[i:j] += a
+        else:
+            j = int(min(n, i + int(6.0 * d) + 2))
+            out[i:j] += a * np.exp(-(t[i:j] - i) / d)
+    return out
+
+def _ye2_ztp(r, lam):
+    lam = np.minimum(np.maximum(lam, _YE2_LAM_LO), _YE2_LAM_HI)
+    p1 = -np.expm1(-lam)
+    t1 = -np.log1p(-r.random(lam.size) * p1) / lam
+    return 1.0 + r.poisson(lam * np.maximum(1.0 - t1, 0.0)).astype(np.float64)
+
+def _ye2_rate(m):
+    lam = m
+    for _ in range(12):
+        lam = m * (1.0 - float(np.exp(-lam)))
+    return max(lam, 0.05)
+
+def _ye2_trade(r, n, kind, fresh, m):
+
+    q = min(max((m - 2.0) / 5.0, 0.0), 1.0)
+    if kind == 0:
+        v = 0.30 + 1.15 * _ye2_hump(m, 8.5, 0.95, 0.18)
+        day = 1440.0
+        fw = 0.68 - 0.36 * q + 0.25 * min(max((m - 12.0) / 12.0, 0.0), 1.0)
+        f1, f2, f3 = 0.14 + 0.24 * q, 0.07 + 0.02 * q, 0.05 + 0.01 * q
+    else:
+
+        v = 0.30 + 0.95 * _ye2_hump(m, 6.5, 0.6, 0.5)
+        v *= 1.2 - 0.5 * min(max(float(np.log(n / 600.0)) / 1.92, 0.0), 1.0)
+        day = 8640.0
+        fw, f1, f2, f3 = 0.60 - 0.07 * q, 0.15 + 0.02 * q, 0.10 + 0.02 * q, 0.10 + 0.02 * q
+    h = np.zeros(n, dtype=np.float64)
+    if fresh:
+
+        if kind == 0:
+            pb = min(max((m - 4.0) / 3.0, 0.03), 0.92) * (0.45 if n > 2048 else 1.0)
+            c, span = _ye2_lu(r, 5.0, 60.0), _ye2_lu(r, 150.0, 1000.0)
+            a0 = 1.0 + 0.5 * min(max((m - 6.0) / 6.0, 0.0), 1.0)
+        else:
+            pb = min(max((m - 4.0) / 3.0, 0.04), 0.9) * (0.7 + 0.3 * min(max((n - 600.0) / 1200.0, 0.0), 1.0))
+            c, span = _ye2_lu(r, 1.5, 12.0), _ye2_lu(r, 60.0, 500.0)
+            a0 = 1.3
+        u = r.random()
+        rises = _ye2_rises(u)
+        if u < pb:
+
+            h = _ye2_head(n, _YE2_HEAD[kind] * min(max(r.normal(a0, 0.55), 0.15), 3.0), c, span, rises)
+            v = max(v - 0.5 * float(_v2_var(h)), 0.5 * v)
+            h -= 0.6 * float(np.log(_v2_mean(np.exp(h))))
+        else:
+            a_small = r.normal(-0.25, 0.35) if kind == 0 else r.normal(-0.15, 0.3)
+            h = _ye2_head(n, _YE2_HEAD[kind] * abs(a_small), _ye2_lu(r, 2.0, 12.0), _ye2_lu(r, 20.0, 250.0), rises)
+    v *= _ye2_lu(r, 0.85, 1.2)
+    sw = float(np.sqrt(v * fw * r.uniform(0.8, 1.2)))
+    s1 = _YE2_S1[kind] * float(np.sqrt(v * f1 * r.uniform(0.6, 1.4)))
+    s2 = _YE2_S2[kind] * float(np.sqrt(v * f2 * r.uniform(0.6, 1.4)))
+    s3 = float(np.sqrt(v * f3 * r.uniform(0.4, 1.6)))
+    x = h + (np.log(_ye2_rate(m)) - 0.5 * (sw * sw + s1 * s1 + s2 * s2 + s3 * s3))
+    x += _ye2_ou(r, n, _ye2_lu(r, 0.6, 4.0), s1)
+    x += _ye2_ou(r, n, _ye2_lu(r, 6.0, 50.0), s2)
+    x += _YE2_OFF[kind]
+    x += _ye2_ou(r, n, _ye2_lu(r, _YE2_S3_TAU[0], _YE2_S3_TAU[1]), s3)
+
+    if kind == 0:
+        x += _YE2_CYC[0] * _ye2_cycle(r, n, day, r.uniform(0.12, 0.50))
+    else:
+        x += _YE2_CYC[1] * _ye2_cycle(r, n, day, r.uniform(0.15, 0.55))
+
+    x += _ye2_episodes(r, n, _ye2_lu(r, 0.001, 0.008), 2.0, 40.0, 0.4, 1.4, 0.2)
+
+    e = sw * r.standard_normal(n)
+    e += (r.random(n) < _ye2_lu(r, 0.003, 0.03)) * r.exponential(r.uniform(0.3, 0.7), n)
+    return _ye2_ztp(r, np.exp(np.minimum(x + e, 11.0)))
+
+def _ye2_edits(r, n, fresh, m):
+    big = m > 40.0
+    lm = 0.0 if big else min(max(float(np.log2(m / 3.0)) / 2.5, 0.0), 1.0)
+    if big:
+        sw = r.uniform(0.55, 0.80)
+        s1, s2, s3 = (_ye2_lu(r, 0.3, 0.6) * r.uniform(lo, hi) for lo, hi in ((0.15, 0.4), (0.4, 0.8), (0.1, 0.3)))
+        cyc = r.uniform(0.10, 0.40)
+    else:
+
+        v = (0.50 + 2.00 * lm * lm) * _ye2_lu(r, 0.7, 1.4)
+        sw = float(np.sqrt(v * (0.62 - 0.52 * lm) * r.uniform(0.8, 1.2)))
+        s1 = _YE2_S1[2] * float(np.sqrt(v * (0.25 - 0.17 * lm) * r.uniform(0.6, 1.4)))
+        s2 = float(np.sqrt(v * (0.08 + 0.22 * lm) * r.uniform(0.6, 1.4)))
+        s3 = float(np.sqrt(v * (0.02 + 0.10 * lm) * r.uniform(0.6, 1.4)))
+        cyc = r.uniform(0.10, 0.40) + lm * r.uniform(0.35, 0.85)
+    x = _ye2_ou(r, n, _ye2_lu(r, 1.5, 6.0), s1)
+    x += _ye2_ou(r, n, _ye2_lu(r, 10.0, 60.0), s2)
+    x += _ye2_ou(r, n, _ye2_lu(r, 100.0, 400.0), s3)
+
+    per = 1440.0 * (1.0 if m > 7.0 else r.uniform(0.72, 1.0))
+    x += _YE2_CYC[2] * _ye2_cycle(r, n, per, cyc)
+    if fresh:
+        u = r.random()
+        amp = -r.exponential(0.8 if 3.0 < m <= 40.0 else 0.3) if u < 0.75 else r.normal(0.1, 0.25)
+        x += _ye2_head(n, _YE2_HEAD[2] * abs(max(amp, -2.0)), _ye2_lu(r, 3.0, 20.0), _ye2_lu(r, 100.0, 600.0),
+                       _ye2_rises(u))
+
+    x += _ye2_episodes(r, n, _ye2_lu(r, 0.0002, 0.002) * (0.3 if big else 1.0 - 0.6 * lm), 4.0, 300.0, 0.3, 1.2, 0.7)
+    x += sw * r.standard_normal(n)
+
+    k = 1.6 if big else 3.0 - 1.2 * lm
+    if k < 2.4:
+        x = np.where(x > 0.0, k * np.log1p(np.maximum(x, 0.0) / k), x)
+    if not big:
+        x += (r.random(n) < _ye2_lu(r, 0.004, 0.04) * (1.0 - 0.95 * lm)) * r.exponential(r.uniform(0.3, 0.65), n)
+    x = np.minimum(x, 9.0)
+    lam = np.exp(np.minimum(np.log(_ye2_rate(m)) + x - float(np.log(_v2_mean(np.exp(x)))), 11.0))
+    if big:
+
+        d = r.uniform(0.03, 0.30)
+        flip = np.cumsum(r.random(n) < r.uniform(0.0, 0.05))
+        lam = lam * np.exp(d * np.where((np.arange(n) + flip) % 2 == 0, 1.0, -1.0))
+        lam = lam * np.where(r.random(n) < r.uniform(0.0, 0.12), r.uniform(0.01, 0.4, n), 1.0)
+    y = _ye2_ztp(r, lam)
+    if big and r.random() < 0.6:
+        y = np.minimum(y, float((250, 500, 500, 1000)[int(r.integers(0, 4))]))
+    return y
+
+def _ye2_series(r, L, kind):
+
+    z = float(r.standard_normal())
+    if kind == 0:
+        m = min(max(9.0 * float(np.exp((0.35 if z > 0.0 else 0.80) * z)), 1.3), 40.0)
+    elif kind == 1:
+        m = min(max(6.6 * float(np.exp(0.62 * z)), 1.25), 60.0)
+    elif z > 1.3:
+        m = _ye2_lu(r, 60.0, 300.0)
+    else:
+        m = max(4.1 * float(np.exp((1.25 if z > 0.0 else 0.70) * z)), 1.8 + 0.3 * r.random())
+    rho = (0.0, 0.3, 0.8)[kind]
+    n = _ye2_len(rho * z + float(np.sqrt(1.0 - rho * rho)) * float(r.standard_normal()), L, kind)
+    if n < 8:
+        return None
+    fresh = n < L
+    y = _ye2_trade(r, n, kind, fresh, m) if kind < 2 else _ye2_edits(r, n, fresh, m)
+    if fresh:
+        u = r.random()
+        short = kind == 0 and n < 512
+        if kind < 2 and u < (0.10 if short else 0.22 if kind == 0 else 0.16):
+            y[0] = float(np.floor(y[0] * _ye2_lu(r, 2.0, 8.0) + 0.5))
+        elif u < (0.90 if short else (0.85, 0.75, 0.50)[kind]):
+            y[0] = max(1.0, float(np.floor(y[0] * r.uniform(0.45 if short else 0.1 if kind < 2 else 0.0, 1.0) + 0.5)))
+
+    return y
+
+def _ye_counts2(r, L):
+    L = int(L)
+    if L < 64 or L > 65536:
+        return None
+    kind = min(int(np.searchsorted(_YE2_KIND_CUM, r.random() * _YE2_KIND_CUM[-1], side="right")), 2)
+    y = _ye2_series(r, L, kind)
+    if y is None or y.size < 8 or y.size > L:
+        return None
+    out = np.empty(L, dtype=np.float64)
+    n = y.size
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+_YG_P = 1440
+_YG_TWO_PI = 2.0 * np.pi
+_YG_MIX = (0.85, 0.15)
