@@ -17420,16 +17420,7 @@ class Generator(_W86BParent):
         finally:
             base.close()
 
-
-# ═══════════════ c159: c145's six shapes after king-147's s2 ═══════════════
-# This stage sits where it sits in c145, after the weakness channel and before k. A row that is still one channel draws c145's coin. On a hit,
-# and when the tail is not quiet and the row is not integer-valued, one hardcoded shape is stacked
-# under it as channel 1.
-# Channel 0 stays the parent row. The six shapes are the ones that stay worse than the warm start
-# on every official pool from 2026-09-25 through 2026-09-30 and are not the four c124 modules:
-# a smooth daily share, a jumpy daily panel, a weekday count ledger, a smooth climate level,
-# a weekly cash balance, and a held intraday series (price holds, dispatch counts, latency, sparse notes).
-_P25_Q = 0.90  # leftover eligible rows are scarce once c124 has taken its share; this hits most of them
+_P25_Q = 0.90
 _P25_COIN_TAG = 0xC125A001
 _P25_XOR = 0xC1255EED
 _P25_TAG = 0xC125BA4D
@@ -17444,10 +17435,8 @@ _P25_FAMILIES = (
 )
 _P25_CUM = np.cumsum([w for _, w in _P25_FAMILIES])
 
-
 def _p25_len(r, lo, hi):
     return int(r.integers(lo, hi + 1))
-
 
 def _p25_ar1(r, n, phi, sd):
     phi = float(np.clip(phi, -0.99, 0.99))
@@ -17458,9 +17447,8 @@ def _p25_ar1(r, n, phi, sd):
         out[t] = phi * out[t - 1] + e[t]
     return out
 
-
 def _p25_daily_share(r):
-    # smooth daily proportion: strong day-to-day and weekly persistence, small steps
+
     n = _p25_len(r, 400, 2500)
     level = r.uniform(0.04, 0.85) if r.random() < 0.75 else r.uniform(0.85, 8.0)
     span = level * r.uniform(0.08, 0.45)
@@ -17472,9 +17460,8 @@ def _p25_daily_share(r):
     dp = 4 if r.random() < 0.6 else 5
     return np.round(x, dp)
 
-
 def _p25_daily_quote(r):
-    # jumpy daily panel: mean-reverting, a single step is a large share of the range, about half the points on a tick
+
     n = _p25_len(r, 500, 1600)
     level = float(np.exp(r.uniform(np.log(40.0), np.log(20000.0))))
     phi = r.uniform(0.35, 0.72)
@@ -17490,13 +17477,12 @@ def _p25_daily_quote(r):
         x = np.round(x, int(r.integers(1, 4)))
     return x
 
-
 def _p25_weekday_counts(r):
-    # calendar-daily counts: weekend dip, overdispersed, weekly profile stronger than day-to-day memory
+
     n = _p25_len(r, 400, 4096)
     mu = float(np.exp(r.uniform(np.log(2.0), np.log(8000.0))))
     dow = np.array([1.05, 1.08, 1.0, 0.98, 0.95, r.uniform(0.15, 0.55), r.uniform(0.08, 0.4)], dtype=np.float64)
-    if r.random() < 0.25:  # seven-day activity, mild weekend change
+    if r.random() < 0.25:
         dow[5] = r.uniform(0.7, 1.15)
         dow[6] = r.uniform(0.55, 1.05)
     dow = dow / dow.mean()
@@ -17507,9 +17493,8 @@ def _p25_weekday_counts(r):
     lam = np.clip(rate * r.gamma(k, 1.0 / k, n), 0.0, 1e7)
     return r.poisson(lam).astype(np.float64)
 
-
 def _p25_smooth_climate(r):
-    # near-unit autocorrelation and tiny steps: a daily seasonal level, or a smoother sub-daily wave
+
     if r.random() < 0.65:
         n = _p25_len(r, 800, 4096)
         level = r.uniform(-1.5, 32.0)
@@ -17528,9 +17513,8 @@ def _p25_smooth_climate(r):
     x = level + amp * (0.65 * tide + 0.35 * slow) + amp * 0.04 * _p25_ar1(r, n, r.uniform(0.985, 0.998), 1.0)
     return np.clip(np.round(x, 2), 0.0, None)
 
-
 def _p25_weekly_cash(r):
-    # large integer balance: mostly flat inside the week, the moves land on a weekly grid
+
     n = _p25_len(r, 300, 2000)
     level = float(np.exp(r.uniform(np.log(2e4), np.log(5e7))))
     step = 5 if r.random() < 0.7 else 7
@@ -17542,11 +17526,10 @@ def _p25_weekly_cash(r):
         x[t] = v
     return np.round(x)
 
-
 def _p25_held_intraday(r):
     u = r.random()
     if u < 0.45:
-        # sub-daily price with repeated prints and a daily wave
+
         n = 4096 if r.random() < 0.6 else _p25_len(r, 1500, 4096)
         p = 48
         level = float(np.exp(r.uniform(np.log(5.0), np.log(400.0))))
@@ -17558,7 +17541,7 @@ def _p25_held_intraday(r):
         x = x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
         return np.round(x, 2)
     if u < 0.75:
-        # half-hour or hourly counts that keep empty and held bins
+
         p = 48 if r.random() < 0.6 else 24
         n = _p25_len(r, 800, 4096)
         mu = float(np.exp(r.uniform(np.log(1.0), np.log(80.0))))
@@ -17587,7 +17570,6 @@ def _p25_held_intraday(r):
         x = np.cumsum(inc) + float(np.exp(r.uniform(np.log(1e5), np.log(1e9))))
     return x
 
-
 _P25_BUILD = {
     "daily_share": _p25_daily_share,
     "daily_quote": _p25_daily_quote,
@@ -17597,11 +17579,9 @@ _P25_BUILD = {
     "held_intraday": _p25_held_intraday,
 }
 
-
 def _p25_one(r):
     name = _P25_FAMILIES[int(np.searchsorted(_P25_CUM, r.random() * 0.999999))][0]
     return _P25_BUILD[name](r)
-
 
 def _p25_row(r, L):
     x = None
@@ -17623,7 +17603,6 @@ def _p25_row(r, L):
     np.clip(out, -1e30, 1e30, out=out)
     return out
 
-
 class _P25Stream:
     def __init__(self, seed):
         self._seed = int(seed) & ((1 << 64) - 1)
@@ -17634,7 +17613,6 @@ class _P25Stream:
         self._k += 1
         with np.errstate(all="ignore"):
             return _p25_row(r, int(L))
-
 
 def _p25_add(stream, x):
     if not (isinstance(x, np.ndarray) and x.ndim == 1 and x.dtype == np.float64 and x.size >= 2):
@@ -17651,12 +17629,9 @@ def _p25_add(stream, x):
         return z
     return None
 
-
 _P25Parent = Generator
 
-
 class Generator(_P25Parent):
-    """king-147 records, plus c145's partner coin, slow_level, and the six-shape channel."""
 
     def __init__(self, config_dir: str, *, seed: int) -> None:
         super().__init__(config_dir, seed=seed)
@@ -17684,22 +17659,13 @@ class Generator(_P25Parent):
         finally:
             base.close()
 
-
-# ═══════════════ k: micro-priced crypto channels (price below the scaler eps floor + huge volume) ═══════════════
-# Parent class unchanged; a record that is STILL univariate draws an independent coin under this block's tag and, on
-# success (same quiet rule), gets two channels stacked under it: an hourly micro-price walk whose level (1e-8..1e-5) and
-# absolute moves sit far below the backbone's 1e-5 scale floor, and a heavy-tailed volume count of 1e8..1e11 — the
-# exchange micro-coin layout (price, volume) the eval pool carries for meme coins. Rows use their own rng per record.
 _K_Q = 0.7000
 _K_COIN_TAG = 0x5EC0C008
 _K_XOR = 0x5EC05E08
 _K_TAG = 0x5EC0BA08
 _FORK_DEDUP_TAG = 1110608
 
-
 def _k_micro_pair(r, L):
-    """(2, L) float64: micro price (level 10^U(-8,-5), t-distributed hourly log-returns, pumps/dumps, tick quantised)
-    and its exchange volume (log-normal, diurnal, coupled to |returns|), left-padded with the first value."""
     n = int(max(min(L, 4096), 64))
     lvl = 10.0 ** r.uniform(-8.0, -5.0)
     sig = r.uniform(0.004, 0.03)
@@ -17724,12 +17690,9 @@ def _k_micro_pair(r, L):
         z = np.hstack([pad, z])
     return z[:, -L:]
 
-
 _KParent = Generator
 
-
 class Generator(_KParent):
-    """Parent records unchanged; micro-price + volume channels stacked under a share of still-univariate records."""
 
     def __init__(self, config_dir: str, *, seed: int) -> None:
         super().__init__(config_dir, seed=seed)
@@ -17766,10 +17729,6 @@ class Generator(_KParent):
         finally:
             base.close()
 
-
-# ═══════════════ k2: micro-priced channels under two-channel records ═══════════════
-# Parent class unchanged; a record that is exactly two-channel draws an independent coin under this block's tag and, on
-# success (channel 0 not quiet), gets the micro-price + volume pair of the k block stacked under it as channels 3-4.
 _K2_Q = 0.8000
 _K2_COIN_TAG = 0x5EC2C004
 _K2_XOR = 0x5EC25E04
@@ -17778,9 +17737,7 @@ _FORK_DEDUP_TAG = 1110701
 
 _K2Parent = Generator
 
-
 class Generator(_K2Parent):
-    """Parent records unchanged; micro-price + volume channels stacked under a share of two-channel records."""
 
     def __init__(self, config_dir: str, *, seed: int) -> None:
         super().__init__(config_dir, seed=seed)
@@ -17818,37 +17775,25 @@ class Generator(_K2Parent):
         finally:
             base.close()
 
-
-# ═══════════════ s1: second added stream on records the champion leaves univariate ═══════════════
-# The champion above is the parent class and is not changed in any way: every record it yields is yielded here, in
-# order, as the very same object, unless it is STILL univariate. Such a record draws an independent coin under this
-# block's own tag; on success (same quiet rule, integer-valued records skipped as by the champion) one row of a separate stream is stacked under it as
-# channel 1 (left-padded, own rng per row, same keep test as the champion's weakness rows).
 _S1_Q = 0.8000
 _S1_COIN_TAG = 0x51C0C006
 _S1_XOR = 0x51C05E06
 _S1_TAG = 0x51C0BA06
 _FORK_DEDUP_TAG = 1110712
 
-
 def _s1_ed_one(r):
     return _t2ed_share(r, 1, 4096)[0]
-
 
 def _s1_web_one(r):
     return _t2_web_counter(r, 1, 4096)[0]
 
-
 def _s1_station_one(r):
     return _sticky_station(r, 1, 4096)[0]
-
 
 _S1_FAMILIES = (("s1_civic", _w86b_civic_one, 0.6000), ("s1_energy", _w86b_energy_one, 0.4000))
 _S1_CUM = np.cumsum([w for _, _, w in _S1_FAMILIES]) / sum(w for _, _, w in _S1_FAMILIES)
 
-
 class _S1Stream:
-    """Rows of the s1 stream, one per call, each from its own rng."""
 
     def __init__(self, seed):
         self._seed = int(seed) & ((1 << 64) - 1)
@@ -17863,12 +17808,9 @@ class _S1Stream:
         with np.errstate(all="ignore"):
             return _w86b_row(r, int(L), _S1_FAMILIES[f][1])
 
-
 _S1Parent = Generator
 
-
 class Generator(_S1Parent):
-    """The champion's records unchanged; one more stream added as channel 1 on records it leaves univariate."""
 
     def __init__(self, config_dir: str, *, seed: int) -> None:
         super().__init__(config_dir, seed=seed)
@@ -17896,19 +17838,11 @@ class Generator(_S1Parent):
         finally:
             base.close()
 
-
-# ═══════════════ s2: pool-shaped channels on records the parent leaves univariate ═══════════════
-# Parent class unchanged: every record it yields is yielded here in order, as the same object, unless it is STILL
-# univariate. Such a record draws an independent coin under this block's tag; on success (same quiet rule) it gets
-# channels from one s2 family stacked under it: short left-padded pool-shaped series (live counts that move every
-# step, decimal-grid prices/rates/sensors, ED-visit percentage waves, sub-hourly spiky prices, holds that resume) or
-# channels DERIVED from the record itself (dock = capacity - count for count rows; a coupled sensor partner otherwise).
 _S2_Q = 0.6000
 _S2_COIN_TAG = 0x52C0C01B
 _S2_XOR = 0x52C05E1B
 _S2_TAG = 0x52C0BA1B
 _FORK_DEDUP_TAG = 1110773
-
 
 def _s2_len(r):
     u = r.random()
@@ -17917,7 +17851,6 @@ def _s2_len(r):
     if u < 0.75:
         return int(r.integers(1000, 3000))
     return int(r.integers(3000, 4097))
-
 
 def _s2_count_live(r):
     n = _s2_len(r)
@@ -17930,7 +17863,6 @@ def _s2_count_live(r):
     trend = np.exp(np.cumsum(r.normal(0.0, r.uniform(0.0005, 0.01), n)))
     lam = np.maximum(base * np.maximum(cyc, 0.05) * trend, 0.05)
     return r.poisson(lam * np.exp(r.normal(0.0, r.uniform(0.0, 0.3), n))).astype(np.float64)
-
 
 def _s2_decgrid(r):
     kind = int(r.integers(0, 5))
@@ -17957,7 +17889,6 @@ def _s2_decgrid(r):
         dp = int(r.integers(2, 4))
     return np.round(y, dp)
 
-
 def _s2_cdcpct(r):
     n = int(r.integers(300, 900))
     t = np.arange(n, dtype=np.float64)
@@ -17966,7 +17897,6 @@ def _s2_cdcpct(r):
         y = y + r.uniform(0.5, 8.0) * np.exp(-0.5 * ((t - r.uniform(0.0, n)) / r.uniform(15.0, 60.0)) ** 2)
     y = y * np.exp(r.normal(0.0, r.uniform(0.02, 0.08), n)) * (1.0 + 0.05 * np.sin(2.0 * np.pi * t / 7.0 + r.uniform(0.0, 6.28)))
     return np.round(np.clip(y, 0.01, 60.0), 2)
-
 
 def _s2_spikyprice(r):
     n = _s2_len(r)
@@ -17981,7 +17911,6 @@ def _s2_spikyprice(r):
     y[ng] = -r.uniform(0.0, 50.0, int(ng.sum()))
     return np.round(y, 2)
 
-
 def _s2_holdresume(r):
     n = _s2_len(r)
     y = np.cumsum(r.normal(0.0, 1.0, n)) + r.uniform(10.0, 100.0)
@@ -17991,14 +17920,10 @@ def _s2_holdresume(r):
         y[a:b] = y[a]
     return np.round(y, int(r.integers(0, 3)))
 
-
 _S2_FAMILIES = (("s2_holdresume", _s2_holdresume, 0.5000), ("s2_spikyprice", _s2_spikyprice, 0.5000))
 _S2_CUM = np.cumsum([w for _, _, w in _S2_FAMILIES]) / sum(w for _, _, w in _S2_FAMILIES)
 
-
 def _s2_corr(r, x):
-    """Channels derived from the record itself: count rows -> dock = capacity - count (strong anti-correlation, the
-    station-status layout); other rows -> one coupled sensor partner (affine copy + its own noise and lag)."""
     x = np.asarray(x, dtype=np.float64)
     if x.size and np.mean(x[-512:] == np.round(x[-512:])) >= 0.98 and np.nanmin(x) >= 0.0:
         cap = float(np.nanmax(x)) + float(r.integers(0, 6))
@@ -18011,7 +17936,6 @@ def _s2_corr(r, x):
     y[:lag] = y[lag] if lag < y.size else y[:lag]
     return y[None, :]
 
-
 class _S2Stream:
     def __init__(self, seed):
         self._seed = int(seed) & ((1 << 64) - 1)
@@ -18022,12 +17946,9 @@ class _S2Stream:
         self._k += 1
         return r
 
-
 _S2Parent = Generator
 
-
 class Generator(_S2Parent):
-    """Parent records unchanged; pool-shaped s2 channels stacked under a share of records the parent leaves univariate."""
 
     def __init__(self, config_dir: str, *, seed: int) -> None:
         super().__init__(config_dir, seed=seed)
@@ -18067,20 +17988,7 @@ class Generator(_S2Parent):
         finally:
             base.close()
 
-
-# ═══════════════ c91-hold: over-persistent exact holds late in the stream (metric-aligned hold sharpening) ═══════════════
-# The generator above is the parent class and is not changed in any way: every record it yields is yielded here, in
-# order, unchanged, unless (1) the stream position is inside this layer's window (the last part of the stream's billed
-# points) and (2) the record is univariate. Such a record keeps its values, grid and length: each exact run of
-# >= _C91_MIN_RUN identical values that does not start at index 0 (not a padding prefix) is, with probability _C91_P,
-# lengthened by D ~ Geometric(1/_C91_MEAN_D) (<= _C91_MAX_D) bitwise-identical repeats of its own value, and the same
-# number of points is cropped from the record start, so the length (4096) and the billed points are unchanged.
-# Why: the round metric (per-window geomean of WQL and sample-median MASE) pays for sharp forecasts on windows whose
-# history ends in an exact hold, and every lineage checkpoint is too spread there; holds that persist longer in the
-# last part of training teach the model to collapse its quantiles onto the held value. Statistics only, no pool data.
-# Record i's draws come only from SeedSequence([seed, _C91_TAG], spawn_key=(i,)), so the parent's RNGs advance exactly as
-# without this block. Position = billed points (live rule points+mv20) of the records already yielded by this layer.
-_C91_CHILD_BUDGET = 13_320_000_000  # live per-stream budget: [training] 39_960_000_000 billed points // gen_seed_mix 3
+_C91_CHILD_BUDGET = 13_320_000_000
 _C91_OPEN_NUM, _C91_OPEN_DEN = 3, 5
 _C91_P = 0.9
 _C91_MIN_RUN = 32
@@ -18090,14 +17998,12 @@ _C91_MAX_D = 512
 _C91_MAX_TOTAL = 2048
 _C91_TAG = 0xC96DB002
 
-
 def _c91_points(x):
     v = x['values'] if isinstance(x, dict) else x
     size = int(np.size(v))
     if np.ndim(v) == 2 and int(np.shape(v)[0]) > 1:
         return -(-size * 100 // 120)
     return size
-
 
 def _c91_extend(x, r):
     v = np.asarray(x)
@@ -18135,13 +18041,9 @@ def _c91_extend(x, r):
     w = np.concatenate(pieces)[ins:]
     return w if w.size == L else None
 
-
 _C91Parent = Generator
 
-
 class Generator(_C91Parent):
-    """Parent records unchanged, except that in the last part of each stream's billed points the exact holds of
-    univariate records are lengthened (same values, same length, same billing)."""
 
     @property
     def name(self) -> str:
@@ -18170,27 +18072,11 @@ class Generator(_C91Parent):
         finally:
             base.close()
 
-
-# ═══════════════ c124-b2: quiet-regime gate on the hold layer ═══════════════
-# Every class above is unchanged. This block re-binds the hold layer's per-record function (the c91 layer looks
-# `_c91_extend` and `_C91_TAG` up at call time) and gives the hold layer its own fresh per-record stream. Window, record
-# selection (univariate float, length >= 256), candidate runs (exact runs >= _C91_MIN_RUN that do not start at index 0),
-# the extension law (P, D = MIN_D + Geometric(1/MEAN_D) <= MAX_D, total <= MAX_TOTAL, same-length start crop) and the draw
-# order are the hold layer's own. One rule is added: a candidate run is lengthened only if the _C124B2_W steps before
-# it were a quiet regime, i.e. >= _C124B2_QMIN of those first differences are exact repeats (at least _C124B2_MIN_N
-# differences must exist). Why: in the public pools a run that has reached 32 steps lasts 64 more steps 29-47% of the
-# time after a quiet regime (>= 0.95 repeats in the 256 steps before it) but only 9-19% after an active one, while the
-# ungated hold layer makes 90% of all such runs last >= 64 more; on active small counts (bike docks, civic counts) and
-# drifting sensors that over-holds through the moves the next window brings and suppresses their +-1 move rate. Runs
-# after quiet regimes (exact-hold history, which only a coarse lattice produces) keep the full hold teaching.
-# The gate is decided after the run's draws are taken, so the stream position, record count, record lengths and every
-# record outside the window are untouched; a record whose candidate runs all fail is yielded unchanged.
 _C124B2_W = 256
 _C124B2_QMIN = 0.95
 _C124B2_MIN_N = 16
 _C124B2_TAG = 0xC124B002
 _C91_TAG = _C124B2_TAG
-
 
 def _c124b2_extend(x, r):
     v = np.asarray(x)
@@ -18203,7 +18089,7 @@ def _c124b2_extend(x, r):
     cand = [(s, e) for s, e in zip(starts, ends) if s > 0 and e - s >= _C91_MIN_RUN]
     if not cand:
         return None
-    ceq = np.concatenate(([0], np.cumsum(v[1:] == v[:-1])))   # ceq[k] = exact repeats among the first k differences
+    ceq = np.concatenate(([0], np.cumsum(v[1:] == v[:-1])))
     chosen = {}
     ins = 0
     for j in r.permutation(len(cand)).tolist():
@@ -18234,82 +18120,18 @@ def _c124b2_extend(x, r):
     w = np.concatenate(pieces)[ins:]
     return w if w.size == L else None
 
-
 _c91_extend = _c124b2_extend
 _C124B2Parent = Generator
 
-
 class Generator(_C124B2Parent):
-    """The hold layer below, lengthening only exact runs that follow a quiet regime (same window, law and lengths)."""
 
     @property
     def name(self) -> str:
         return 'c124-b2: quiet-regime (lattice-evidence) gate on the hold layer'
 
-
-# ═══════════════ c128-wsT: weakness-family series ADDED as channel 2 under two-channel records (whole stream) ═══════════════
-# Every record of the parent (king171 + the c91/c96 hold layer + the c124-b2 quiet gate) is yielded unchanged, in order,
-# except: anywhere in the stream (_C128_OPEN_NUM = 0: the window is the whole stream), an exactly TWO-channel float64
-# record (length >= 256, all finite) whose channel 0 passes the king's own c159 eligibility (not constant, not
-# _k87_quiet, not _w86b_intlike) and whose own coin falls under _C128_Q becomes a THREE-channel record (the record
-# passes unchanged if the builder's output is not exactly L finite, non-constant values; none was dropped in
-# generate(2000) at seed 4242). Channels 0 and 1 are the record itself (byte-identical); channel 2 is one series of the
-# same length from one of the 4 families with the largest weakness contribution x confidence (tidal, hydro, infra,
-# mobility; all rated medium), picked by the _C128_FAMS weights (their recommended weights). Univariate records are
-# never touched.
-# Host choice (explicit, after the 2026-10-09 review): the eligibility IS the king's. c159 (like w86b and s1) stacks its
-# shapes as channel 1 under univariate rows that pass `not _k87_quiet(x) and not _w86b_intlike(x)`; this layer runs
-# those same two king helpers, unchanged, on channel 0 of its host. It cannot run them on univariate rows: the parent
-# leaves none that pass (0 of 1581 univariate records at seed 1 and 0 of 1581 at seed 2, generate(3000)), because band,
-# w86b, c159, k, s1 and s2 have already stacked channels under every one of them. What the parent leaves univariate is
-# _k87_quiet (held, sticky or slow-tailed) or integer-like, and the c91 hold layer's teaching lives on those rows (it
-# lengthens exact holds in univariate rows only). So the host follows the lineage's own k2 precedent (k2 stacks its
-# micro-price pair under exactly two-channel records whose channel 0 is not _k87_quiet), and the added series goes in as
-# channel 2. Every univariate record stays byte-identical to the parent's, including each quiet / held row that the hold
-# layer lengthens, so no univariate record leaves the C = 1 batch bucket. The one indirect effect is on the stream's
-# length (last paragraph).
-# Why: on 5 king legs (the 2 REAL published era legs + 3 legs of the same code) x 3 recent public pools, the trained
-# king is WORSE than its own warm-start init on a consistent set of sources (training makes it forget them); they cost
-# ~1.1% of the log-score. Log-mass lost per family over the top-90 sources (1.066% in all; positive = king worse than
-# init): tidal 0.162, hydro 0.142, infra 0.129, mobility 0.115, crypto 0.114, health 0.108, energy 0.107, rates 0.103;
-# this layer uses the 4 chosen families (0.548 of the 1.066%). The king won with the same method: its c159 layer adds
-# shapes that stay worse than the warm start as an extra channel beside a moving, real-valued channel 0 (not _k87_quiet,
-# not _w86b_intlike), and this layer adds its series beside exactly such a channel 0.
-# Dose: about 5.2% of records are hosts (generate(3000) at seeds 1, 2, 3, 11, 777 and 4242: 4.7-5.7%). Most other
-# two-channel records have a _k87_quiet channel 0 (14-15% of records) or an integer-like one (2-3%). That is close to
-# the ~6% of all records this layer aims for, so _C128_Q = 1.0 and every host gains its channel. Batches are bucketed by
-# channel count and the loss averages a batch's channels, so the added series carries 1/3 of its record's weight. That
-# gives ~1.7% of the record slots, a little more than the ~1.4% that the first c128 build's 2.8% univariate hosts
-# carried at 1/2 each.
-# Statistics only: each builder draws its parameters from ranges that summarise pool statistics (cadences, grids,
-# levels, volatilities, event and hold rates, mixture weights); no real values, sequences or lookup tables are embedded.
-# Record i's draws come only from SeedSequence([seed, _C128_TAG], spawn_key=(i,)), so every parent RNG advances exactly
-# as without this block. A three-channel record is billed at points+mv20 (3 x L x 100/120 instead of 2 x L x 100/120).
-# That is ~2.5% more billed points (generate(2000), seed 4242), so the trainer reaches its budget ~2.4% of the parent
-# stream earlier. That cut falls inside the hold layer's late window, which gets ~6% shorter.
-
-# c128 family 'tidal': tide-gauge sea level + coastal/ocean met observations (statistics-only builder).
-#
-# Entry point: _c128_tidal(r, L) -> float64 array of exactly length L (r: a numpy Generator).
-# Short records are generated with n < L points and LEFT-PADDED with their first value (the scorer pads short histories the same way).
-#
-# Sub-families (weights from the pool's share of lost log-mass):
-#   gauge    0.64  IOC tide-gauge water level: real constituent periods (M2 S2 N2 K2 / K1 O1 P1 Q1 / MK3 M4 MS4 M6)
-#                  sampled mostly at 1-min cadence (M2 = 745 samples, K1/O1 = 1436/1549 samples -- periods the king's
-#                  three tide builders never emit, they stop at 5-min), plus 2..15-min feeds; smooth surge, harbour
-#                  seiche (8-90 min), sensor noise, mm/cm grid, datum offsets (incl. negative datums), rare spikes.
-#   aux      0.06  gauge-station auxiliary sensors (battery / housing pressure): near-constant level on a 1e-3 / 1e-2
-#                  grid, 50-95 % repeated values, a weak daily cycle and single-quantum blips.
-#   press    0.16  barometric pressure with the atmospheric tide (S2 = 12 h dominant, S1 = 24 h): 1-min ocean drones
-#                  and hourly buoys, smooth synoptic swings, occasional cyclone dip, 0.01 / 0.1 hPa grid.
-#   buoy     0.14  buoy observations: significant wave height (log-OU + storms), wave period (sticky), humidity
-#                  (diurnal, capped), air/water temperature (diurnal + synoptic, holds), wind speed (15-min / hourly).
-# All parameters are drawn from ranges that summarise pool statistics; no pool values are embedded.
-
-# physical tidal constituent periods in hours (constants of astronomy, not fitted values)
-_C128_TIDAL_SEMI_H = np.array([12.4206012, 12.0, 12.6583475, 11.9672361])      # M2 S2 N2 K2
-_C128_TIDAL_DIUR_H = np.array([23.9344697, 25.8193417, 24.0658877, 26.8683567])  # K1 O1 P1 Q1
-_C128_TIDAL_OVER_H = np.array([8.1771399, 6.2103006, 6.1033393, 4.1402004])      # MK3 M4 MS4 M6
+_C128_TIDAL_SEMI_H = np.array([12.4206012, 12.0, 12.6583475, 11.9672361])
+_C128_TIDAL_DIUR_H = np.array([23.9344697, 25.8193417, 24.0658877, 26.8683567])
+_C128_TIDAL_OVER_H = np.array([8.1771399, 6.2103006, 6.1033393, 4.1402004])
 _C128_TIDAL_SEMI_REL = np.array([1.0, 0.46, 0.19, 0.127])
 _C128_TIDAL_DIUR_REL = np.array([1.0, 0.71, 0.33, 0.14])
 _C128_TIDAL_CAD_MIN = np.array([1.0, 2.0, 3.0, 5.0, 6.0, 10.0, 15.0])
@@ -18317,16 +18139,10 @@ _C128_TIDAL_CAD_CUM = np.cumsum([0.70, 0.09, 0.06, 0.05, 0.03, 0.04, 0.03])
 _C128_TIDAL_SUB_CUM = np.cumsum([0.64, 0.06, 0.16, 0.14])
 _C128_TIDAL_TWO_PI = 2.0 * np.pi
 
-
 def _c128_tidal_lu(r, lo, hi):
-    """log-uniform scalar"""
     return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
 
-
 def _c128_tidal_fnoise(r, n, f_corner, order=2.0, peak=None):
-    """Unit-std Gaussian noise of length n with a shaped spectrum (FFT filter, no loops).
-    f_corner: low-pass corner in cycles/sample (amplitude ~ (1+(f/fc)^2)^(-order/2));
-    peak=(f0, bw): narrow band around f0 instead (harbour seiche)."""
     m = 1 << int(np.ceil(np.log2(max(2 * n, 64))))
     f = np.fft.rfftfreq(m)
     if peak is None:
@@ -18340,18 +18156,13 @@ def _c128_tidal_fnoise(r, n, f_corner, order=2.0, peak=None):
     s = float(x.std())
     return x / s if s > 0 else x
 
-
 def _c128_tidal_rough(r, n, d_sd, lo=2.0, hi=15.0):
-    """smooth short-scale noise (power ~ f^-4 above a corner of lo..hi samples) whose per-step increments have
-    standard deviation d_sd and are positively correlated (sensor / turbulence wander, not white noise)"""
     z = _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(lo, hi)), order=2.0)
     dz = float(np.std(np.diff(z))) if n > 2 else 1.0
     return z * (d_sd / max(dz, 1e-12))
 
-
 def _c128_tidal_quant(x, q):
     return np.round(x / q) * q
-
 
 def _c128_tidal_len(r, L, p_full, lo, hi):
     if r.random() < p_full:
@@ -18359,7 +18170,6 @@ def _c128_tidal_len(r, L, p_full, lo, hi):
     hi = max(min(hi, L), 8)
     lo = max(min(lo, hi), 8)
     return int(min(L, max(8, round(_c128_tidal_lu(r, lo, hi + 1e-9)))))
-
 
 def _c128_tidal_pad(x, L):
     out = np.empty(L, dtype=np.float64)
@@ -18371,12 +18181,9 @@ def _c128_tidal_pad(x, L):
         out[L - n:] = x
     return out
 
-
 def _c128_tidal_harm(th, periods_h, amps, phases):
-    """sum_j amps_j * cos(2 pi th / P_j + ph_j) over hours th"""
     arg = np.outer(_C128_TIDAL_TWO_PI / periods_h, th) + phases[:, None]
     return (amps[:, None] * np.cos(arg)).sum(axis=0)
-
 
 def _c128_tidal_gauge(r, L):
     cad = float(_C128_TIDAL_CAD_MIN[int(np.searchsorted(_C128_TIDAL_CAD_CUM, r.random() * _C128_TIDAL_CAD_CUM[-1]))])
@@ -18385,7 +18192,7 @@ def _c128_tidal_gauge(r, L):
     else:
         n = _c128_tidal_len(r, L, 0.30, 300, 1700)
     th = (np.arange(n, dtype=np.float64) + r.uniform(0.0, 1e5)) * (cad / 60.0)
-    # --- astronomy: semidiurnal amplitude log-uniform, diurnal via form factor F = (K1+O1)/(M2+S2)
+
     a2 = _c128_tidal_lu(r, 0.02, 1.4)
     semi = a2 * _C128_TIDAL_SEMI_REL * np.exp(r.normal(0.0, 0.25, 4))
     semi[0] = a2
@@ -18395,7 +18202,7 @@ def _c128_tidal_gauge(r, L):
     diur = np.array([k1, a1 - k1, 0.0, 0.0])
     diur[2] = diur[0] * _C128_TIDAL_DIUR_REL[2] * np.exp(r.normal(0.0, 0.2))
     diur[3] = diur[1] * 0.19 * np.exp(r.normal(0.0, 0.25))
-    if r.random() < 0.14:      # shallow-water / estuary gauge: strong overtides, asymmetric rise and fall
+    if r.random() < 0.14:
         r4 = r.uniform(0.07, 0.3)
         r6 = r.uniform(0.03, 0.1)
     else:
@@ -18407,22 +18214,22 @@ def _c128_tidal_gauge(r, L):
     phases = r.uniform(0.0, _C128_TIDAL_TWO_PI, periods.size)
     x = _c128_tidal_harm(th, periods, amps, phases)
     a_tot = float(semi[0] + semi[1] + diur[0] + diur[1])
-    # --- surge / non-tidal residual: smooth (power ~ f^-4 above a corner of 6..72 h)
+
     s_surge = float(np.clip(a_tot * np.exp(r.normal(np.log(0.1), 0.6)), 0.006, 0.35)) + _c128_tidal_lu(r, 0.003, 0.025)
-    t_corner = r.uniform(2.0, 24.0) * 60.0 / cad        # samples
+    t_corner = r.uniform(2.0, 24.0) * 60.0 / cad
     x = x + s_surge * _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * t_corner), order=2.0)
-    # --- harbour seiche: narrow band at 8..90 min, intermittent envelope
+
     if r.random() < 0.6:
-        p_s = _c128_tidal_lu(r, 8.0, 90.0) / cad           # samples
+        p_s = _c128_tidal_lu(r, 8.0, 90.0) / cad
         if p_s >= 2.5:
             q = r.uniform(4.0, 25.0)
             amp_s = _c128_tidal_lu(r, 0.0015, 0.035)
-            if a_tot < 0.08 and r.random() < 0.5:        # micro-tidal basin: seiche rivals the tide
+            if a_tot < 0.08 and r.random() < 0.5:
                 amp_s = amp_s * r.uniform(1.5, 4.0)
             env = np.exp(0.45 * _c128_tidal_fnoise(r, n, cad / (60.0 * 18.0), order=2.0))
             x = x + amp_s * env / max(float(np.sqrt(np.mean(env * env))), 1e-9) * \
                 _c128_tidal_fnoise(r, n, 0.0, peak=(1.0 / p_s, 1.0 / (p_s * q)))
-    # --- sensor noise: mostly quiet (sub-mm..mm), sometimes a noisy pressure/radar sensor (cm)
+
     if r.random() < 0.8:
         s_w = _c128_tidal_lu(r, 0.0005, 0.01)
     else:
@@ -18433,7 +18240,7 @@ def _c128_tidal_gauge(r, L):
     else:
         e = r.standard_normal(n)
     x = x + s_w * e
-    # --- rare sensor events: single-point spikes, a datum step, dropouts to zero
+
     if r.random() < 0.12:
         k = int(r.poisson(max(n * r.uniform(0.0002, 0.001), 0.5))) + 1
         idx = r.integers(0, n, k)
@@ -18441,7 +18248,7 @@ def _c128_tidal_gauge(r, L):
     if r.random() < 0.04:
         j = int(r.integers(n // 8, max(n // 8 + 1, n - n // 8)))
         x[j:] += r.choice(np.array([-1.0, 1.0])) * r.uniform(0.02, 0.3)
-    # --- datum: chart datum below the tide (positive), negative datum feeds, large offsets
+
     half_range = 1.1 * float(np.max(np.abs(x))) if n else 1.0
     u = r.random()
     if u < 0.6:
@@ -18450,7 +18257,7 @@ def _c128_tidal_gauge(r, L):
         datum = r.uniform(2.5, 7.0)
     elif u < 0.92:
         datum = -r.uniform(1.2, 8.5)
-    else:                     # datum inside the tidal range: the record crosses zero
+    else:
         datum = half_range * r.uniform(-0.8, 0.8)
     x = x + datum
     if r.random() < 0.03:
@@ -18461,7 +18268,6 @@ def _c128_tidal_gauge(r, L):
     x = _c128_tidal_quant(x, qd)
     return _c128_tidal_pad(x, L)
 
-
 def _c128_tidal_aux(r, L):
     cad = float(r.choice(np.array([1.0, 2.0, 3.0, 5.0, 6.0])))
     n = _c128_tidal_len(r, L, 0.35, 800, L)
@@ -18470,26 +18276,25 @@ def _c128_tidal_aux(r, L):
     t = np.arange(n, dtype=np.float64)
     day = 1440.0 / cad
     if r.random() < 0.7:
-        # flicker: a value parked near a rounding boundary, slow wander of ~1 quantum, long runs
+
         x = level + q * r.uniform(0.3, 1.5) * _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(0.1, 1.0) * day), 2.0)
         x = x + q * r.uniform(0.3, 0.8) * _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(1.5, 12.0)), 2.0)
         x = x + q * r.uniform(0.0, 1.0) * np.cos(_C128_TIDAL_TWO_PI * (t / day + r.random()))
     else:
-        # daily charge cycle of several quanta with sensor wander
+
         shape = np.cos(_C128_TIDAL_TWO_PI * (t / day + r.random()))
         if r.random() < 0.5:
             shape = np.maximum(shape, r.uniform(-0.2, 0.4))
         x = level + q * r.uniform(3.0, 15.0) * shape
         x = x + q * r.uniform(0.5, 3.0) * _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(0.05, 0.5) * day), 2.0)
         x = x + q * r.uniform(0.2, 0.7) * r.standard_normal(n)
-    if r.random() < 0.4:   # rare multi-quantum blips
+    if r.random() < 0.4:
         b = (r.random(n) < r.uniform(0.001, 0.006)).astype(np.float64) * r.choice(np.array([-4.0, -2.0, 2.0, 4.0]), n)
         x = x + q * b
-    if r.random() < 0.1:   # discharge / recharge step
+    if r.random() < 0.1:
         j = int(r.integers(n // 4, max(n // 4 + 1, n - n // 4)))
         x[j:] += q * r.uniform(2.0, 10.0) * r.choice(np.array([-1.0, 1.0]))
     return _c128_tidal_pad(_c128_tidal_quant(x, q), L)
-
 
 def _c128_tidal_press(r, L):
     u = r.random()
@@ -18515,16 +18320,16 @@ def _c128_tidal_press(r, L):
         s_syn = _c128_tidal_lu(r, 1.5, 6.5)
         t_c = r.uniform(12.0, 72.0) * 60.0 / cad
         x = x + s_syn * _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * t_c), order=2.0)
-    if r.random() < 0.12:   # passing cyclone / deep low
+    if r.random() < 0.12:
         c0 = r.uniform(0.15, 1.1) * n
         w = r.uniform(4.0, 30.0) * 60.0 / cad
         x = x - r.uniform(3.0, 25.0) * np.exp(-0.5 * ((np.arange(n) - c0) / w) ** 2)
-    if cad <= 1.0:   # per-minute wander of 0.01..0.04 hPa, positively correlated
+    if cad <= 1.0:
         d_sd = _c128_tidal_lu(r, 0.008, 0.035)
         x = x + _c128_tidal_rough(r, n, d_sd, 1.5, 10.0)
         e = r.standard_t(float(r.uniform(2.2, 4.0)), n)
         x = x + d_sd * r.uniform(0.2, 0.6) * e / max(float(e.std()), 1e-9)
-    else:            # hourly mesoscale wiggles of 0.25..0.7 hPa per step
+    else:
         x = x + _c128_tidal_rough(r, n, r.uniform(0.2, 0.6), 1.2, 5.0)
         e = r.standard_t(float(r.uniform(2.2, 4.0)), n)
         x = x + r.uniform(0.05, 0.25) * e / max(float(e.std()), 1e-9)
@@ -18535,12 +18340,11 @@ def _c128_tidal_press(r, L):
     else:
         q = 0.001 if v < 0.5 else (0.01 if v < 0.8 else 0.1)
     x = _c128_tidal_quant(x, q)
-    if r.random() < 0.25:   # slow-reporting logger: values held between updates
+    if r.random() < 0.25:
         h = r.random(n) < r.uniform(0.1, 0.45)
         h[0] = False
         x = x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
     return _c128_tidal_pad(x, L)
-
 
 def _c128_tidal_buoy(r, L):
     kind = float(r.random())
@@ -18551,11 +18355,11 @@ def _c128_tidal_buoy(r, L):
     day = 1440.0 / cad
     diel = np.cos(_C128_TIDAL_TWO_PI * (t / day + r.random()))
     syn = _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(0.8, 6.0) * day), 1.7)
-    syn = syn + r.uniform(0.0, 1.2) * r.choice(np.array([-1.0, 1.0])) * (t / max(n, 1) - 0.5)   # seasonal drift
+    syn = syn + r.uniform(0.0, 1.2) * r.choice(np.array([-1.0, 1.0])) * (t / max(n, 1) - 0.5)
     syn = syn / max(float(syn.std()), 1e-9)
     ht = r.standard_t(float(r.uniform(2.2, 5.0)), n)
     ht = ht / max(float(ht.std()), 1e-9)
-    if kind < 0.3:          # significant wave height: lognormal, storms rise fast, decay slowly
+    if kind < 0.3:
         lg = np.log(r.uniform(0.3, 1.5)) + r.uniform(0.35, 0.7) * syn
         k = int(r.poisson(max(n / (day * r.uniform(4.0, 12.0)), 0.3)))
         for _ in range(k):
@@ -18567,42 +18371,41 @@ def _c128_tidal_buoy(r, L):
         lg = lg + r.uniform(0.02, 0.08) * r.standard_normal(n)
         x = np.exp(lg)
         x = _c128_tidal_quant(x, 0.0001 if r.random() < 0.5 else 0.01)
-    elif kind < 0.42:       # dominant wave period (s): jumpy between spectral bins, sticky
+    elif kind < 0.42:
         lg = np.log(r.uniform(4.0, 9.0)) + r.uniform(0.15, 0.35) * syn + r.uniform(0.08, 0.25) * r.standard_normal(n)
         x = np.clip(np.exp(lg), 1.5, 22.0)
         x = _c128_tidal_quant(x, 0.01 if r.random() < 0.5 else 0.001)
         h = r.random(n) < r.uniform(0.1, 0.35)
         h[0] = False
         x = x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
-    elif kind < 0.55:       # relative humidity (%): diurnal, synoptic, capped at 100
+    elif kind < 0.55:
         x = r.uniform(65.0, 90.0) + r.uniform(0.5, 4.0) * diel + r.uniform(3.0, 9.0) * syn + _c128_tidal_rough(r, n, r.uniform(0.6, 2.5), 1.5, 6.0) + r.uniform(0.0, 0.5) * ht
         x = np.minimum(x, 100.0)
         x = _c128_tidal_quant(x, 0.01 if r.random() < 0.6 else 0.1)
-    elif kind < 0.76:       # air / water temperature (deg C)
-        if r.random() < 0.5:   # water: small diurnal, slow
+    elif kind < 0.76:
+        if r.random() < 0.5:
             x = r.uniform(8.0, 31.0) + r.uniform(0.02, 0.4) * diel + r.uniform(0.1, 1.6) * syn
         else:
             x = r.uniform(5.0, 30.0) + r.uniform(0.3, 2.0) * diel + r.uniform(0.8, 3.0) * syn
         x = x + _c128_tidal_rough(r, n, r.uniform(0.04, 0.45), 1.5, 6.0) + r.uniform(0.0, 0.06) * ht
         x = _c128_tidal_quant(x, 0.01 if r.random() < 0.8 else 0.1)
-    elif kind < 0.82:       # direction (deg): circular walk wrapped to [0, 360)
+    elif kind < 0.82:
         w = np.cumsum(r.uniform(2.0, 25.0) * ht) + r.uniform(0.0, 360.0) + 60.0 * syn
         x = _c128_tidal_quant(np.mod(w, 360.0), 0.01 if r.random() < 0.7 else 1.0)
-    elif kind < 0.92:       # small positive rough channel (drone wave / precip proxies, 0.01 grid)
+    elif kind < 0.92:
         x = r.uniform(0.015, 0.07) * np.exp(r.uniform(0.25, 0.6) * r.standard_normal(n) + 0.3 * syn)
         x = np.maximum(_c128_tidal_quant(x, 0.01), 0.01)
-    else:                   # wind speed (m/s): Rayleigh-like magnitude of a smooth vector, weak diurnal
+    else:
         s2 = _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(0.2, 1.5) * day), 2.0)
         m0 = r.uniform(2.0, 8.0)
         x = np.hypot(m0 + r.uniform(1.0, 4.0) * syn, r.uniform(1.0, 4.0) * s2) * (1.0 + 0.1 * diel)
         x = x * np.exp(r.uniform(0.03, 0.15) * ht)
         x = _c128_tidal_quant(x, 0.01 if r.random() < 0.6 else 0.001)
-    if kind >= 0.42 and r.random() < 0.3:   # held reports
+    if kind >= 0.42 and r.random() < 0.3:
         h = r.random(n) < r.uniform(0.2, 0.5)
         h[0] = False
         x = x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
     return _c128_tidal_pad(x, L)
-
 
 def _c128_tidal(r, L):
     L = int(L)
@@ -18624,66 +18427,48 @@ def _c128_tidal(r, L):
         return None
     return x
 
-# ─────────────── c128 hydro: river gauges, groundwater, met stations, geomagnetic minute data ───────────────
-# Statistics-only shapes for the USGS NWIS (00010 water temperature, 00060 discharge, 00065 gage height,
-# conductance / turbidity / oxygen), EA flood-monitoring (stage, flow, 15-min rain, water temperature,
-# hourly groundwater), INTERMAGNET minute, Toulouse met-station and SNOTEL SWE feeds. Every parameter is
-# drawn from a range that summarises pool statistics (cadence, grid, hold rate, daily range, skew of the
-# daily wave, event rates, recession constants, sentinel runs); no real value or sequence is embedded.
-# What the warm start keeps and the king loses on these feeds: a daily cycle carried forward at full
-# amplitude (sharp fast-rise / slow-fall water-temperature peaks, a 1440-step geomagnetic day seen only
-# ~2.8 times in context), NO invented daily wiggle on stage and groundwater series that have none,
-# smooth recessions continued at long horizons, grid holds (0.001 m, 0.01 ft, 0.1 C, 3 significant
-# figures), and exact holds of a sentinel tail.
 _C128_HYDRO_KINDS = ("wtemp", "stage", "flow", "ground", "geomag", "meteo", "rain", "snow", "quality")
 _C128_HYDRO_W = np.array([0.18, 0.23, 0.17, 0.07, 0.08, 0.07, 0.06, 0.04, 0.10], dtype=np.float64)
 _C128_HYDRO_CUM = np.cumsum(_C128_HYDRO_W) / np.sum(_C128_HYDRO_W)
-_C128_HYDRO_SENT = -999999.0  # USGS NWIS missing-value code, held exactly
-_C128_HYDRO_SENT_Q = 0.07  # share of NWIS-styled rows that carry sentinel runs
-_C128_HYDRO_M2 = 49.6835  # 12.42 h lunar semidiurnal tide in 15-min steps
-_C128_HYDRO_S2 = 48.0  # 12 h solar semidiurnal tide in 15-min steps
-
+_C128_HYDRO_SENT = -999999.0
+_C128_HYDRO_SENT_Q = 0.07
+_C128_HYDRO_M2 = 49.6835
+_C128_HYDRO_S2 = 48.0
 
 def _c128_hydro_conv(a, k, n):
     m = 1 << int(np.ceil(np.log2(a.size + k.size)))
     return np.fft.irfft(np.fft.rfft(a, m) * np.fft.rfft(k, m), m)[:n]
 
-
 def _c128_hydro_ar1(r, n, phi, sd):
-    # stationary AR(1) by FFT filtering (burn-in = kernel length)
+
     phi = float(np.clip(phi, 0.0, 0.9995))
     K = 1 if phi <= 0.0 else int(min(max(np.ceil(np.log(1e-3) / np.log(phi)), 1.0), 16384.0))
     e = r.standard_normal(n + K)
     y = _c128_hydro_conv(e, phi ** np.arange(K, dtype=np.float64), n + K)[K:]
     return y * (sd * np.sqrt(1.0 - phi * phi))
 
-
 def _c128_hydro_leak(e, phi):
     K = int(min(max(np.ceil(np.log(1e-3) / np.log(phi)), 1.0), 16384.0))
     return _c128_hydro_conv(e, phi ** np.arange(K, dtype=np.float64), e.size)
 
-
 def _c128_hydro_slow(r, n, span, tau, sd):
-    # smooth wander: AR(1) nodes every `span` steps (correlation time tau steps), linearly interpolated
+
     span = max(float(span), 1.0)
     nd = int(n // span) + 3
     v = _c128_hydro_ar1(r, nd, np.exp(-span / max(tau, span)), sd)
     return np.interp(np.arange(n, dtype=np.float64), (np.arange(nd, dtype=np.float64) - 1.0) * span, v)
 
-
 def _c128_hydro_logu(r, lo, hi):
     return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
 
-
 def _c128_hydro_dayfac(r, n, P, sd):
-    # smooth day-to-day multiplicative factor (cloud cover, weather)
+
     nd = int(n // max(P, 1)) + 3
     c = (np.arange(nd, dtype=np.float64) - 1.0) * P + 0.5 * P
     return np.interp(np.arange(n, dtype=np.float64), c, np.exp(r.normal(0.0, sd, nd)))
 
-
 def _c128_hydro_wave(t, P, ph, s, nh=5):
-    # unit half-range periodic wave: s=0 sine, s->1 fast-rise / slow-fall sawtooth
+
     th = 2.0 * np.pi * (t / P + ph)
     w = np.zeros_like(th)
     for k in range(1, nh + 1):
@@ -18694,13 +18479,11 @@ def _c128_hydro_wave(t, P, ph, s, nh=5):
         wg += (s ** (k - 1)) / k * np.sin(k * g)
     return (w - 0.5 * (wg.max() + wg.min())) / max(0.5 * (wg.max() - wg.min()), 1e-12)
 
-
 def _c128_hydro_grid(x, g):
     if g >= 1.0:
         return np.round(x / g) * g
     d = int(round(-np.log10(g))) + 1
     return np.round(np.round(x / g) * g, d)
-
 
 def _c128_hydro_sig(x, sf=3):
     a = np.abs(x)
@@ -18708,9 +18491,8 @@ def _c128_hydro_sig(x, sf=3):
     q = np.round(x / 10.0 ** e)
     return np.where(a > 0, np.where(e < 0, q / 10.0 ** (-e), q * 10.0 ** e), 0.0)
 
-
 def _c128_hydro_events(r, n, rate, tr, t1, t2, w1, hsd):
-    # storm hydrograph train: smooth rise over tr steps, two-reservoir recession (t1 fast, t2 slow)
+
     K = int(min(max(6.0 * t2, 4.0 * tr + 16.0), 12000.0))
     pre = int(min(K, 3000))
     tot = n + pre
@@ -18724,29 +18506,27 @@ def _c128_hydro_events(r, n, rate, tr, t1, t2, w1, hsd):
     ker = (u * u * (3.0 - 2.0 * u)) * (w1 * np.exp(-dt / t1) + (1.0 - w1) * np.exp(-dt / t2))
     return _c128_hydro_conv(imp, ker, tot)[pre:]
 
-
 def _c128_hydro_wtemp(r, n):
     u = r.random()
     P = 96
-    if u < 0.58:  # NWIS stream temperature: 0.1 C grid, 1-8 C daily range, fast afternoon rise
+    if u < 0.58:
         lvl, dr, s, g = r.uniform(7.0, 24.0), _c128_hydro_logu(r, 0.8, 8.0), r.uniform(0.35, 0.85), 0.1
-    elif u < 0.84:  # EA river temperature: 0.01 C grid, small daily range
+    elif u < 0.84:
         lvl, dr, s = r.uniform(8.0, 20.0), _c128_hydro_logu(r, 0.05, 1.8), r.uniform(0.0, 0.6)
         g = 0.01 if r.random() < 0.85 else 0.001
-    else:  # station dry-bulb air temperature
+    else:
         lvl, dr, s, g = r.uniform(2.0, 24.0), r.uniform(3.0, 12.0), r.uniform(0.1, 0.5), 0.1
         if r.random() < 0.3:
             P = 24
     t = np.arange(n, dtype=np.float64)
     amp = 0.5 * dr * _c128_hydro_dayfac(r, n, P, r.uniform(0.06, 0.3))
     x = lvl + amp * _c128_hydro_wave(t, P, r.random(), s)
-    x += r.normal(-0.05, 0.08) * t / P  # seasonal drift per day
+    x += r.normal(-0.05, 0.08) * t / P
     x += _c128_hydro_slow(r, n, P / 2.0, P * r.uniform(1.5, 5.0), r.uniform(0.1, 0.5) * dr + r.uniform(0.05, 0.6))
     x += _c128_hydro_ar1(r, n, r.uniform(0.6, 0.95), g * r.uniform(0.02, 0.2) + 0.001 * dr) + r.normal(0.0, g * r.uniform(0.05, 0.35), n)
     if u < 0.84:
         x = np.maximum(x, 0.0)
     return _c128_hydro_grid(x, g), u < 0.58
-
 
 def _c128_hydro_stage(r, n):
     ea = r.random() < 0.6
@@ -18766,7 +18546,7 @@ def _c128_hydro_stage(r, n):
     x += _c128_hydro_slow(r, n, r.uniform(24.0, 96.0), r.uniform(300.0, 3000.0), A * r.uniform(0.03, 0.3))
     x += r.normal(0.0, 0.2) * A * t / 4096.0
     w = r.random()
-    if ea and w < 0.14:  # tidally influenced reach: M2 + S2 spring-neap, M4 asymmetry, drained low water
+    if ea and w < 0.14:
         At = max(ref * r.uniform(0.05, 0.6), 8.0 * g)
         ph = r.uniform(0.0, 2.0 * np.pi, 3)
         tide = (np.cos(2.0 * np.pi * t / _C128_HYDRO_M2 + ph[0]) + r.uniform(0.15, 0.45) * np.cos(2.0 * np.pi * t / _C128_HYDRO_S2 + ph[1])
@@ -18774,10 +18554,10 @@ def _c128_hydro_stage(r, n):
         x = x + At * tide
         if r.random() < 0.5:
             x = np.maximum(x, lvl + At * r.uniform(-0.8, 0.0))
-    elif w < 0.30:  # small daily cycle (evapotranspiration, snowmelt, hydropeaking)
+    elif w < 0.30:
         Ad = max(A * r.uniform(0.02, 0.2), 1.5 * g)
         x = x + Ad * _c128_hydro_wave(t, 96.0, r.random(), r.uniform(0.0, 0.7))
-    elif w < 0.42:  # regulated reach: held pool levels with abrupt operator steps, or periodic pumping dips
+    elif w < 0.42:
         if r.random() < 0.6:
             m = int(r.integers(2, 11))
             cp = np.sort(r.integers(0, n, m))
@@ -18790,11 +18570,10 @@ def _c128_hydro_stage(r, n):
     x = x + r.normal(0.0, g * r.uniform(0.05, 0.7), n)
     return _c128_hydro_grid(x, g), not ea
 
-
 def _c128_hydro_flow(r, n):
     usgs = r.random() < 0.55
     t = np.arange(n, dtype=np.float64)
-    if r.random() < 0.06:  # daily streamflow record: annual snowmelt cycle + storms
+    if r.random() < 0.06:
         base = _c128_hydro_logu(r, 5.0, 50000.0)
         yr = np.exp(r.uniform(0.3, 1.5) * _c128_hydro_wave(t, 365.25, r.random(), r.uniform(0.0, 0.6)))
         ev = _c128_hydro_events(r, n, r.uniform(10.0, 60.0), r.uniform(1.0, 3.0), r.uniform(3.0, 15.0), r.uniform(30.0, 120.0),
@@ -18810,13 +18589,12 @@ def _c128_hydro_flow(r, n):
     if r.random() < 0.2:
         q = q * (1.0 + r.uniform(0.02, 0.2) * _c128_hydro_wave(t, 96.0, r.random(), r.uniform(0.0, 0.6)))
     q = q * np.exp(_c128_hydro_ar1(r, n, r.uniform(0.3, 0.95), r.uniform(0.0001, 0.0015)) + r.normal(0.0, r.uniform(0.0, 0.004), n))
-    if r.random() < 0.08:  # intermittent channel: zero flow between events
+    if r.random() < 0.08:
         q = q - base * r.uniform(0.5, 1.2)
     q = np.maximum(q, 0.0)
     if usgs:
         return np.round(_c128_hydro_sig(q), 2), True
     return _c128_hydro_grid(q, 0.001), False
-
 
 def _c128_hydro_ground(r, n):
     lvl = r.uniform(20.0, 150.0)
@@ -18824,18 +18602,17 @@ def _c128_hydro_ground(r, n):
     tau = _c128_hydro_logu(r, 300.0, 20000.0)
     D = r.uniform(0.0008, 0.004) * n * (-1.0 if r.random() < 0.78 else 1.0)
     x = lvl + D * (1.0 - np.exp(-t / tau)) / (1.0 - np.exp(-n / tau))
-    if r.random() < 0.35:  # recharge pulses
+    if r.random() < 0.35:
         x += r.uniform(0.05, 1.0) * _c128_hydro_events(r, n, r.uniform(1.0, 6.0), _c128_hydro_logu(r, 3.0, 60.0),
                                                         _c128_hydro_logu(r, 30.0, 600.0), _c128_hydro_logu(r, 300.0, 3000.0), 0.6, 0.5)
-    if r.random() < 0.12:  # abrupt drawdown that then recovers / keeps receding
+    if r.random() < 0.12:
         c = int(r.integers(n // 5, max(n // 5 + 1, 4 * n // 5)))
         x[c:] -= r.uniform(0.2, 1.5) * (1.0 - r.uniform(0.0, 0.6) * (1.0 - np.exp(-(t[c:] - c) / r.uniform(20.0, 300.0))))
-    if r.random() < 0.6:  # earth-tide / barometric wiggle, millimetres
+    if r.random() < 0.6:
         x += r.uniform(0.0003, 0.0015) * np.cos(2.0 * np.pi * t / 12.42 + r.uniform(0, 6.3))
         x += r.uniform(0.0, 0.001) * np.cos(2.0 * np.pi * t / 24.0 + r.uniform(0, 6.3))
     x += r.normal(0.0, r.uniform(0.0002, 0.0015), n)
     return _c128_hydro_grid(x, 0.001 if r.random() < 0.85 else 0.01), False
-
 
 def _c128_hydro_geomag(r, n):
     v = r.random()
@@ -18854,7 +18631,7 @@ def _c128_hydro_geomag(r, n):
     x += r.uniform(-4.0, 4.0) * t / P
     x += _c128_hydro_slow(r, n, r.uniform(20.0, 60.0), r.uniform(100.0, 800.0), r.uniform(0.5, 4.0))
     fast = _c128_hydro_leak(_c128_hydro_ar1(r, n, r.uniform(0.2, 0.5), r.uniform(0.04, 0.6)), r.uniform(0.97, 0.995))
-    if r.random() < 0.2:  # storm: sudden commencement, main-phase depression, slow recovery, noisier field
+    if r.random() < 0.2:
         t0 = int(r.integers(0, n))
         tm = t[t0:] - t0
         ramp = np.clip(tm / r.uniform(120.0, 720.0), 0.0, 1.0)
@@ -18862,7 +18639,6 @@ def _c128_hydro_geomag(r, n):
         fast[t0:] *= 1.0 + r.uniform(1.0, 5.0) * np.exp(-tm / r.uniform(300.0, 2000.0))
     x += fast + r.normal(0.0, r.uniform(0.0, 0.08), n)
     return _c128_hydro_grid(x, 0.1 if r.random() < 0.55 else 0.01), False
-
 
 def _c128_hydro_rainlike(r, n):
     lam = _c128_hydro_logu(r, 0.003, 0.04) * _c128_hydro_dayfac(r, n, int(96 * r.uniform(1.0, 4.0)), 1.0)
@@ -18876,7 +18652,7 @@ def _c128_hydro_rainlike(r, n):
     inten = r.gamma(r.uniform(1.0, 3.0), _c128_hydro_logu(r, 0.01, 0.12), n) * np.exp(_c128_hydro_ar1(r, n, 0.9, 0.8))
     x = np.where(wet, inten, 0.0)
     u = r.random()
-    if u < 0.15:  # tipping bucket: whole tips, remainder carried forward
+    if u < 0.15:
         tip = 0.2 if r.random() < 0.7 else 0.5
         c = np.floor(np.cumsum(x) / tip)
         return np.diff(np.concatenate([[0.0], c])) * tip
