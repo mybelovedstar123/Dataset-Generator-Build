@@ -26260,3 +26260,287 @@ def _ys_wind(r, cal, offshore=False):
     if r.random() < 0.15:
         cf = np.minimum(cf, r.uniform(0.6, 0.9))
     return cf
+
+def _ys_temp(r, cal):
+    nd = cal["nd"]
+    d = cal["doy"]
+    ts = r.uniform(4.0, 26.0) + r.uniform(2.0, 12.0) * np.cos(_YS_TWO_PI * (d - 200.0) / 365.0)
+    ts = ts + _ys_ou(r, nd + 1, r.uniform(2.0, 7.0), r.uniform(1.5, 4.0))
+    return _ys_daily(ts, cal["day"], cal["frac"]) + r.uniform(2.0, 7.0) * np.cos(_YS_TWO_PI * (cal["hour"] - 15.0) / 24.0)
+
+def _ys_profiles(r, P):
+    h = (np.arange(P) + 0.5) * (24.0 / P)
+    up, dn = r.uniform(5.0, 8.0), r.uniform(20.0, 23.8)
+    wu, wd = r.uniform(0.8, 2.0), r.uniform(0.9, 2.4)
+    a_m, c_m, s_m = r.uniform(0.0, 0.45), r.uniform(8.0, 11.5), r.uniform(1.0, 2.5)
+    a_l, c_l = (r.uniform(0.0, 0.25) if r.random() < 0.4 else 0.0), r.uniform(12.0, 13.5)
+    a_e, c_e, s_e = r.uniform(0.05, 0.7), r.uniform(17.5, 20.8), r.uniform(1.0, 2.6)
+    out = np.empty((3, P))
+    for k, (shift, scale, km, kl) in enumerate(((0.0, 1.0, 1.0, 1.0), (r.uniform(0.3, 1.5), r.uniform(0.55, 0.95), 0.6, 0.3),
+                                                (r.uniform(0.6, 2.2), r.uniform(0.4, 0.88), 0.4, 0.0))):
+        pl = _ys_sig((h - up - shift) / wu) - _ys_sig((h - dn) / wd)
+        out[k] = scale * pl + km * a_m * _ys_bump(h, c_m + shift, s_m) - kl * a_l * _ys_bump(h, c_l, 0.8) + \
+            a_e * _ys_bump(h, c_e, s_e)
+    w = 0.5 - 0.5 * np.cos(_YS_TWO_PI * h / 24.0)
+    out[1:] = out[0] + w * (out[1:] - out[0])
+    pl0 = (_ys_sig((h - up) / wu) - _ys_sig((h - dn) / wd)) * w
+    m = out[0].mean()
+    pp = max(float(np.ptp(out[0])), 1e-9)
+    return (out - m) / pp, pl0
+
+def _ys_demand(r, cal, sun=None, cloud=None):
+    P, nd, day, frac = cal["P"], cal["nd"], cal["day"], cal["frac"]
+    prof, pl0 = _ys_profiles(r, P)
+    amp = r.uniform(0.2, 0.55)
+    ampd = amp * np.exp(_ys_ou(r, nd + 1, r.uniform(3.0, 30.0), r.uniform(0.02, 0.08)))
+    dtd = cal["dt"][day]
+    wk = np.array([0.0, -r.uniform(0.02, 0.10), -r.uniform(0.05, 0.18)]) * (0.4 if P == 24 else 1.0)
+    x = 1.0 + _ys_daily(ampd, day, frac) * prof[dtd, cal["slot"]] + wk[dtd] * pl0[cal["slot"]]
+    T = _ys_temp(r, cal)
+    th, tc = r.uniform(12.0, 18.0), r.uniform(19.0, 25.0)
+    ks = 1.0 if P == 24 else 0.5
+    x = x + ks * (r.uniform(0.0, 0.015) * np.maximum(th - T, 0.0) + r.uniform(0.0, 0.02) * np.maximum(T - tc, 0.0))
+    slow = r.uniform(0.06, 0.2) if P == 24 else r.uniform(0.003, 0.02)
+    x = x + _ys_daily(_ys_ou(r, nd + 1, r.uniform(15.0, 60.0), slow) +
+                      _ys_ou(r, nd + 1, r.uniform(0.5, 2.5), r.uniform(0.02, 0.07)), day, frac)
+    x = x + _ys_ou2(r, cal["n"], r.uniform(0.3, 2.0) * P / 24.0, r.uniform(0.5, 4.0) * P / 24.0, r.uniform(0.004, 0.025))
+    if P >= 96:
+        x = x + _ys_ou(r, cal["n"], r.uniform(0.3, 2.0), r.uniform(0.0, 0.006))
+    if sun is not None and r.random() < 0.35:
+        x = x - r.uniform(0.05, 0.3) * sun * (cloud if cloud is not None else 1.0)
+    return np.maximum(x, 0.05)
+
+def _ys_system(r, cal, wcap=0.45, wlo=0.0):
+    sun = _ys_sun(r, cal)
+    cloud = _ys_cloud(r, cal)
+    D = _ys_demand(r, cal, sun, cloud)
+    S = r.uniform(0.0, 0.45) * sun * cloud / max(float(sun.max()), 1e-6)
+    W = r.uniform(wlo, wcap) * _ys_wind(r, cal)
+    P, nd = cal["P"], cal["nd"]
+    M = _ys_daily(_ys_ou(r, nd + 1, r.uniform(1.0, 5.0), r.uniform(0.02, 0.08)), cal["day"], cal["frac"])
+    M = M + _ys_ou2(r, cal["n"], r.uniform(0.5, 3.0) * P / 24.0, r.uniform(2.0, 8.0) * P / 24.0, r.uniform(0.01, 0.05))
+    M = M - r.uniform(0.0, 0.5) * S
+    return {"sun": sun, "D": D, "S": S, "W": W, "M": M, "R": D - S - W - M}
+
+def _ys_onoff(r, n, P, on_h, off_h):
+    st = np.zeros(n, dtype=bool)
+    i, on = 0, r.random() < on_h / (on_h + off_h)
+    while i < n:
+        m = 1 + int(r.exponential((on_h if on else off_h) * P / 24.0))
+        st[i:i + m] = on
+        i += m
+        on = not on
+    return st
+
+def _ys_gen(r, cal, sub):
+    P, nd, day, n = cal["P"], cal["nd"], cal["day"], cal["n"]
+    if sub == "solar":
+        return r.uniform(0.3, 1.0) * _ys_sun(r, cal) * _ys_cloud(r, cal)
+    if sub == "wind":
+        return _ys_wind(r, cal, r.random() < 0.3)
+    if sub == "nuclear" or sub == "other":
+        x = np.ones(n)
+        k = int(r.poisson(nd / r.uniform(25.0, 120.0)))
+        for _ in range(min(k, 12)):
+            a = int(r.integers(0, n))
+            x[a:a + int(r.uniform(0.3, 25.0) * P)] -= r.uniform(0.1, 0.6) if sub == "nuclear" else r.uniform(0.1, 1.0)
+        x = np.maximum(x, 0.0)
+        if sub == "other":
+            x = x * np.exp(_ys_daily(_ys_ou(r, nd + 1, r.uniform(2.0, 20.0), r.uniform(0.02, 0.2)), day, cal["frac"]))
+        return x * (1.0 + _ys_ou2(r, n, r.uniform(0.5, 3.0) * P / 24.0, r.uniform(1.0, 12.0) * P / 24.0, r.uniform(0.003, 0.03)))
+    if sub == "ror":
+        z = _ys_daily(_ys_ou(r, nd + 1, r.uniform(4.0, 30.0), r.uniform(0.15, 0.5)), day, cal["frac"])
+        x = np.exp(z) * (1.0 + _ys_ou2(r, n, r.uniform(0.5, 3.0) * P / 24.0, r.uniform(1.0, 12.0) * P / 24.0, r.uniform(0.005, 0.05)))
+        if r.random() < 0.4:
+            x = x * (1.0 + r.uniform(0.05, 0.4) * np.cos(_YS_TWO_PI * (cal["hour"] - r.uniform(8.0, 20.0)) / 24.0))
+        return x
+    sy = _ys_system(r, cal, 0.6, 0.0) if P == 96 else _ys_system(r, cal, 1.2, 0.1)
+    R, D = sy["R"], sy["D"]
+    if sub == "total":
+        return np.maximum(D - sy["M"], 0.02)
+    if sub == "inter":
+        return np.tanh(-sy["M"] / r.uniform(0.04, 0.15) + r.uniform(-1.0, 1.0) + r.uniform(-0.6, 0.6) * (D - _v2_meanm(D)) / max(float(_v2_stdm(D)), 1e-6))
+    T = np.maximum(R - r.uniform(0.0, 0.35), 0.02)
+    if sub == "thermal":
+        lo = r.uniform(0.0, 0.3) * float(_v2_meanm(T))
+        g = np.maximum(T - r.uniform(0.0, 0.5) * float(_v2_meanm(T)), lo)
+        if r.random() < 0.3:
+            a = float(np.exp(-1.0 / (0.05 * P)))
+            g = _ys_ar1(g * (1.0 - a), a)
+        return g
+    if sub == "coal":
+        a = float(np.exp(-1.0 / (0.4 * P)))
+        b = _ys_ar1(T * (1.0 - a), a)
+        u = r.uniform(0.05, 0.25) * float(_v2_meanm(b))
+        return np.round(b * r.uniform(0.3, 0.8) / u) * u + _ys_ou2(r, n, 2.0, 0.1 * P, r.uniform(0.03, 0.15) * u)
+    if sub == "peak":
+        q = _ys_daymean(T, day, nd)
+        return np.maximum(T - q * r.uniform(0.95, 1.2), 0.0) + (r.uniform(0.0, 0.1) * float(_v2_meanm(T)) if r.random() < 0.5 else 0.0)
+    if sub == "pumped":
+        q = _ys_daymean(T, day, nd)
+        s = (T - q) / max(float(_v2_stdm(T)), 1e-6)
+        dz = r.uniform(0.2, 1.0)
+        x = np.where(s > dz, s - dz, np.where(s < -dz, s + dz, 0.0))
+        mode = r.random()
+        if mode < 0.35:
+            x = np.minimum(x, 0.0)
+        elif mode < 0.6:
+            x = np.maximum(x, 0.0)
+        return np.clip(x, -2.0, 2.0)
+
+    st = _ys_onoff(r, n, P, _ys_lu(r, 4.0, 200.0), _ys_lu(r, 2.0, 300.0)) if r.random() < 0.75 else np.ones(n, dtype=bool)
+    pmin = r.uniform(0.2, 0.7)
+    if r.random() < 0.5:
+        x = 1.0 + _ys_ou2(r, n, r.uniform(0.5, 3.0) * P / 24.0, r.uniform(1.0, 12.0) * P / 24.0, r.uniform(0.002, 0.03))
+    else:
+        x = pmin + (1.0 - pmin) * (T - T.min()) / max(float(np.ptp(T)), 1e-6)
+    return np.where(st, np.maximum(x, 0.0), 0.0)
+
+def _ys_price(r, cal, mins):
+    P, nd, day, n = cal["P"], cal["nd"], cal["day"], cal["n"]
+    R = _ys_system(r, cal, r.uniform(0.2, 0.8))["R"]
+    z = (R - _v2_meanm(R)) / max(float(_v2_stdm(R)), 1e-6)
+    tau, sd = {5: ((1.0, 6.0), (0.03, 0.15)), 15: ((0.5, 3.0), (0.15, 0.4)), 30: ((1.0, 8.0), (0.08, 0.3)),
+               60: ((20.0, 60.0), (0.08, 0.25))}[mins]
+    lv = _ys_ou(r, nd + 1, r.uniform(*tau), r.uniform(*sd))
+    lv[:nd] += np.where(cal["dt"] > 0, np.log(r.uniform(0.5, 0.9) if mins == 15 else r.uniform(0.9, 1.0) if mins in (5, 60) else r.uniform(0.8, 1.0)), 0.0)
+    lvl = np.exp(_ys_daily(lv, day, cal["frac"]))
+    slope = {5: (0.4, 0.9), 15: (0.3, 0.8), 30: (0.15, 0.5), 60: (0.2, 0.45)}[mins]
+    p = lvl * (1.0 + r.uniform(*slope) * z + r.uniform(0.0, 0.2) * np.maximum(z, 0.0) ** 2)
+    if r.random() < {5: 0.3, 15: 0.6, 30: 0.4, 60: 0.1}[mins]:
+        f = r.uniform(-0.1, 0.25)
+        p = np.where(p < f, f + (p - f) * r.uniform(0.05, 0.4), p)
+    else:
+        p = np.maximum(p, r.uniform(0.0, 0.3))
+    rt = mins == 5 or (mins == 30 and r.random() < 0.3)
+    if mins in (15, 30) and not rt and r.random() < (0.12 if mins == 15 else 0.05):
+        k = 60 // mins
+        b = (np.arange(n) + int(r.integers(0, k))) // k
+        p = (np.bincount(b, weights=p) / np.bincount(b))[b]
+    if mins != 5:
+        p = _ys_white(r, p, "price15" if mins == 15 else "price")
+    if rt:
+        p = p + _ys_ou(r, n, r.uniform(0.3, 1.5), r.uniform(0.1, 0.4))
+        m = int(r.poisson(n * _ys_lu(r, 0.001, 0.012)))
+        if m > 0:
+            at = r.integers(0, n, 4 * m)
+            at = at[r.random(at.size) < _ys_sig(2.0 * z[at] - 1.0)][:m]
+            imp = np.zeros(n)
+            np.add.at(imp, at, np.exp(r.normal(np.log(r.uniform(1.5, 8.0)), 1.3, at.size)) *
+                      np.where(r.random(at.size) < 0.85, 1.0, -0.3))
+            p = p + _ys_ar1(imp, r.uniform(0.5, 0.9))
+        if r.random() < 0.6:
+            keep = r.random(n) >= r.uniform(0.02, 0.12)
+            keep[0] = True
+            p = p[np.maximum.accumulate(np.where(keep, np.arange(n), 0))]
+    elif r.random() < (0.2 if mins == 60 else 0.5):
+        m = int(r.poisson(nd * r.uniform(0.05, 0.4)))
+        for _ in range(min(m, 40)):
+            a = int(r.integers(0, n))
+            p[a:a + int(r.uniform(0.5, 3.0) * P / 24.0) + 1] *= r.uniform(1.3, 3.0)
+    if mins == 30 and not rt and r.random() < 0.5:
+        p = p * r.uniform(0.6, 1.0) + r.uniform(0.2, 0.6) * _ys_sig((cal["hour"] - 16.0) * 4.0) * _ys_sig((19.0 - cal["hour"]) * 4.0)
+    if mins == 60 and r.random() < 0.7:
+        keep = r.random(n) < r.uniform(0.5, 0.85)
+        keep[0] = True
+        p = p[np.maximum.accumulate(np.where(keep, np.arange(n), 0))]
+    return p
+
+def _ys_flow(r, cal, mins):
+    P, nd, day, n = cal["P"], cal["nd"], cal["day"], cal["n"]
+    R = _ys_system(r, cal, 0.35)["R"]
+    beta = r.uniform(0.0, 0.35) if mins == 5 else r.uniform(0.2, 0.8)
+    u = r.uniform(-1.6, 1.6) + beta * (1.0 if r.random() < 0.5 else -1.0) * (R - _v2_meanm(R)) / max(float(_v2_stdm(R)), 1e-6)
+    u = u + _ys_daily(_ys_ou(r, nd + 1, r.uniform(1.0, 6.0), r.uniform(0.3, 0.8) if mins == 5 else r.uniform(0.05, 0.3)), day, cal["frac"])
+    u = u + _ys_ou2(r, n, r.uniform(0.3, 2.0) * P / 24.0, r.uniform(1.0, 8.0) * P / 24.0, r.uniform(0.08, 0.35))
+    u = u + _ys_ou2(r, n, r.uniform(0.5, 2.0), r.uniform(1.0, 4.0), r.uniform(0.02, 0.12))
+    if r.random() < (0.8 if mins == 5 else 0.4):
+        k = max(P // 24, 1)
+        hb = (np.arange(n) + int(r.integers(0, k))) // k
+        m = int(hb[-1]) + 1
+        tl = r.uniform(0.3, 1.0) if mins == 5 else 0.0
+        st = r.standard_normal(m) * np.exp(tl * r.standard_normal(m) - tl * tl) * r.uniform(0.03, 0.2 if mins == 5 else 0.08) * \
+            (r.random(m) < r.uniform(0.1, 0.6))
+        u = u + _ys_ar1(st, float(np.exp(-1.0 / r.uniform(3.0, 24.0))))[hb]
+    if r.random() < (0.35 if mins == 5 else 0.15):
+        return np.clip(u, -r.uniform(0.6, 1.6), r.uniform(0.6, 1.6))
+    return np.tanh(u)
+
+def _ys_co2(r, cal, mins):
+    sy = _ys_system(r, cal, 1.8, 0.6) if mins == 5 else _ys_system(r, cal, 1.0, 0.2)
+    R = sy["R"]
+    th = _ys_sig(r.uniform(-1.0, 1.0) + r.uniform(0.6, 1.6) * (R - _v2_meanm(R)) / max(float(_v2_stdm(R)), 1e-6))
+    coal = r.uniform(0.0, 0.5)
+    x = th * (r.uniform(0.35, 0.45) * (1.0 - coal) + r.uniform(0.8, 1.0) * coal) + r.uniform(0.0, 0.05)
+    if mins == 5:
+        x = x + _ys_ou2(r, cal["n"], r.uniform(0.5, 1.5), r.uniform(1.0, 3.0), float(np.diff(x).std()) * r.uniform(0.5, 1.5))
+    else:
+        x = _ys_white(r, x, "co2")
+    if r.random() < 0.5:
+        m = int(r.poisson(cal["nd"] * r.uniform(0.1, 0.6)))
+        for _ in range(min(m, 60)):
+            a = int(r.integers(0, cal["n"]))
+            x[a:a + int(r.integers(1, 4))] *= np.exp(r.normal(0.0, 0.4))
+    if mins == 5 and r.random() < 0.7:
+        k = cal["P"] // 24
+        pj = r.uniform(0.0, 0.2, k)
+        hold = r.random(cal["n"]) < pj[(np.arange(cal["n"])) % k]
+        hold[0] = False
+        x = x[np.maximum.accumulate(np.where(hold, 0, np.arange(cal["n"])))]
+    return x
+
+_YS_WHITE = {"demand": (0.0, 0.45), "demand15": (0.1, 0.7), "demand5": (0.3, 0.9), "gen": (0.05, 0.6), "gen15": (0.2, 0.9), "gen30": (0.2, 1.0), "flow": (0.1, 0.7), "flow5": (0.0, 0.3),
+             "price": (0.1, 0.9), "price15": (0.6, 1.6), "co2": (0.3, 1.2)}
+
+def _ys_white(r, x, kind):
+    d = np.diff(x)
+    nz = x != 0.0
+    sdd = float(d[nz[1:]].std()) if np.count_nonzero(nz[1:]) > 8 else 0.0
+    if sdd <= 0.0:
+        return x
+    t = r.uniform(0.0, 0.4) if kind.startswith("demand") else r.uniform(0.2, 0.9)
+    kind = kind if kind in _YS_WHITE else kind.rstrip("0123456789")
+    e = r.standard_normal(x.size) * np.exp(t * r.standard_normal(x.size) - t * t)
+    return np.where(nz, x + e * sdd * r.uniform(*_YS_WHITE[kind]), x)
+
+def _ys_observe(r, x, kind, mins, signed):
+    n = x.size
+    if kind == "demand":
+        sc = _ys_lu(r, 60.0, 60000.0)
+    elif kind == "price":
+        sc = _ys_lu(r, *_YS_PSCALE.get(mins, (20.0, 300.0)))
+    elif kind == "co2":
+        sc = _ys_lu(r, 250.0, 1000.0)
+    elif kind == "flow":
+        sc = _ys_lu(r, 0.4, 4.0) if (mins == 15 and r.random() < 0.8) else _ys_lu(r, 100.0, 3000.0)
+    else:
+        sc = _ys_lu(r, 30.0, 20000.0)
+    y = x * sc
+    if (signed and r.random() < 0.5) or (kind == "gen" and mins == 15 and not signed and r.random() < 0.55):
+        y = -y
+    pst = {5: 0.15, 10: 0.1, 15: 0.04, 30: 0.03, 60: 0.0}[mins] * (1.0 if kind == "gen" else 0.3)
+    if r.random() < pst:
+        k = int(r.integers(2, 13 if mins == 5 else 5))
+        ph = int(r.integers(0, k))
+        y = y[np.clip((np.arange(n) + ph) // k * k - ph, 0, n - 1)]
+    if r.random() < (0.15 if kind == "demand" else 0.3):
+        m = int(r.poisson(n * _ys_lu(r, 0.0005, 0.005)))
+        for _ in range(min(m, 40)):
+            a = int(r.integers(1, n))
+            y[a:a + int(r.integers(1, 7))] = y[a - 1]
+    u = r.random()
+    big = float(np.median(np.abs(y))) > 50.0
+    if kind == "price":
+        y = np.round(y, 2) if (u < 0.85 or mins != 60) else np.round(y)
+    elif kind == "flow":
+        y = np.round(y, 3) if sc < 10.0 else (np.round(y) if u < 0.2 else np.round(y, 2) if u < 0.7 else y)
+    elif u < (0.15 if mins == 15 and kind == "gen" else 0.8 if big else 0.4):
+        y = np.round(y)
+    elif u < 0.92:
+        y = np.round(y, 1)
+    else:
+        y = y.astype(np.float32).astype(np.float64)
+    return y
+
+def _ys_len(r, mins, L):
+    return int(min(max(np.interp(r.random(), _YS_NQ, _YS_NKNOT[mins]), 256.0), L))
