@@ -30099,3 +30099,87 @@ class Generator(_K0Parent):
 # C-contiguous, finite, |v| <= float32 max; labels uint8 (32,), canonical, one contiguous block per packed record whose
 # width equals that record's channel count. Anything else raises (never yields a bad record).
 _K32G_C = 32
+_K32G_PARENT = Generator
+
+
+def _k32g_labels_ok(labels, widths):
+    if not (isinstance(labels, np.ndarray) and labels.dtype == np.uint8 and labels.shape == (_K32G_C,)):
+        return False
+    seen = set()
+    for v in labels.tolist():
+        if v not in seen:
+            if v != len(seen):
+                return False
+            seen.add(v)
+    if len(seen) != len(widths):
+        return False
+    return np.array_equal(np.bincount(labels, minlength=len(widths)), np.asarray(widths)) and bool(
+        (np.diff(labels.astype(np.int64)) >= 0).all())
+
+
+class Generator(_K32G_PARENT):
+
+    def generate(self, n_series: int) -> Iterator[dict]:
+        global _C91_CHILD_BUDGET, _C215LP_STREAM_POINTS
+        n = int(n_series)
+        if n <= 0:
+            return
+        _C91_CHILD_BUDGET = _k0_v1_child_budget(n)
+        _C215LP_STREAM_POINTS = _k0_v1_child_budget(n)
+        self._k0_dropped_records = 0
+        self._k0_dropped_groups = 0
+        base = _K0Parent.generate(self, n)
+        carry = []
+        emitted = 0
+        live = True
+        try:
+            while live and emitted < n:
+                group, filled, rest = [], 0, []
+                for a in carry:
+                    if filled + a.shape[0] <= _K32G_C:
+                        group.append(a)
+                        filled += a.shape[0]
+                    else:
+                        rest.append(a)
+                carry = rest
+                while filled < _K32G_C and len(carry) < _K0_LOOKAHEAD:
+                    try:
+                        x = next(base)
+                    except StopIteration:
+                        live = False
+                        break
+                    a = _k0_record(x)
+                    if a is None:
+                        self._k0_dropped_records += 1
+                    elif filled + a.shape[0] <= _K32G_C:
+                        group.append(a)
+                        filled += a.shape[0]
+                    else:
+                        carry.append(a)
+                if filled < _K32G_C:
+                    if live:
+                        self._k0_dropped_groups += 1
+                    continue
+                widths = [int(r.shape[0]) for r in group]
+                values = np.ascontiguousarray(np.concatenate(group, axis=0), dtype=np.float64)
+                labels = np.repeat(np.arange(len(group)), widths).astype(np.uint8)
+                if not (values.dtype == np.float64 and values.shape == (_K32G_C, _K0_L) and values.flags.c_contiguous
+                        and bool(np.isfinite(values).all()) and float(np.abs(values).max()) <= _K0_F32_MAX):
+                    raise RuntimeError(f"K0-32G assert-before-yield failed (values): {values.dtype} {values.shape}")
+                if not _k32g_labels_ok(labels, widths):
+                    raise RuntimeError(f"K0-32G assert-before-yield failed (groups): {labels.tolist()} {widths}")
+                yield {"values": values, "groups": labels}
+                emitted += 1
+        finally:
+            base.close()
+
+
+# ═══════════════ v2-MAGGUARD, dict-safe (append-only, last layer) ═════════════════════════════════════════════════════
+# Same rule as magguard_layer.py: channel rows whose peak |x| exceeds 1e4 are divided by 10**ceil(log10(peak / 1e4)) so the
+# peak lands in (1e3, 1e4]. The v2 model standardises every input and the duel's metrics are scale-free, but the trainer's
+# energy score squares (x - loc) / scale in float32: v1-scale rows (peaks up to 1.3e14 after a flat stretch, scale floored at
+# 1e-5) overflowed it and the loss went inf at update 328, which v2 counts as a miner fault (docs/INTERFACE.md:240-241).
+# Capped rows keep that ratio below ~6e9, far from the float32 limit. DICT-SAFE: a record yield {"values": ..., "groups": ...}
+# comes back as a record with only "values" rescaled (groups and any other field untouched, same object); a bare array comes
+# back as an array (identical to magguard_layer.py). The inner generator is closed in finally.
+_MG2_PEAK = 1.0e4
