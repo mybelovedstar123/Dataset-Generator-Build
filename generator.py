@@ -27676,3 +27676,301 @@ def _ybq_round(c, r):
     return y if float(y.max()) > float(y.min()) else c
 
 _YBQParent = Generator
+
+class Generator(_YBQParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_ybq_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _ybq_json.load(fh).get("y_quant", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        try:
+            q = float(cfg.get("q", 0.0))
+        except (TypeError, ValueError):
+            q = 0.0
+        self._ybq_q = q if np.isfinite(q) and 0.0 <= q <= 1.0 else 0.0
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        q = self._ybq_q
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                q = self._ybq_q
+                if q > 0.0 and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.ndim in (1, 2):
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _YBQ_TAG], spawn_key=(i,)))
+                    if r.random() < q:
+                        try:
+                            h = x.reshape(1, -1) if x.ndim == 1 else x
+                            z = np.stack([_ybq_round(c, r) for c in h])
+                            if bool(np.all(np.isfinite(z))):
+                                x = z[0] if x.ndim == 1 else z
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
+
+import json as _ycs_json
+import os as _ycs_os
+
+_YCS_TAG = 0x59E0_0003
+
+_YCS_KNOTS = ((200, 0.0), (316, 0.03), (501, 0.115), (1000, 0.375), (1995, 0.52), (3981, 0.69))
+
+def _ycs_draw(r):
+    u = r.random()
+    if u >= _YCS_KNOTS[-1][1]:
+        return None
+    for (a, fa), (b, fb) in zip(_YCS_KNOTS, _YCS_KNOTS[1:]):
+        if u < fb:
+            t = (u - fa) / max(fb - fa, 1e-9)
+            return int(np.exp(np.log(a) + t * (np.log(b) - np.log(a))))
+    return None
+
+_YCSParent = Generator
+
+class Generator(_YCSParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_ycs_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _ycs_json.load(fh).get("y_short", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        try:
+            q = float(cfg.get("q", 0.0))
+        except (TypeError, ValueError):
+            q = 0.0
+        self._ycs_q = q if np.isfinite(q) and 0.0 <= q <= 1.0 else 0.0
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        q = self._ycs_q
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                q = self._ycs_q
+                if q > 0.0 and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.ndim in (1, 2) and x.shape[-1] >= 512:
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _YCS_TAG], spawn_key=(i,)))
+                    if r.random() < q:
+                        m = _ycs_draw(r)
+                        if m is not None:
+                            h = x.reshape(1, -1) if x.ndim == 1 else x
+                            L = h.shape[1]
+                            c0 = h[0]
+                            moved = np.flatnonzero(c0 != c0[0])
+                            real = L - (int(moved[0]) - 1 if moved.size else L)
+                            if 64 <= m < real:
+                                z = np.empty_like(h)
+                                z[:, : L - m] = h[:, L - m: L - m + 1]
+                                z[:, L - m:] = h[:, L - m:]
+                                if bool(np.all(np.isfinite(z))) and float(z[0].max()) > float(z[0].min()):
+                                    x = z[0].copy() if x.ndim == 1 else z
+                yield x
+        finally:
+            base.close()
+
+import json as _ydh_json
+import os as _ydh_os
+
+_YDH_TAG = 0x59E0_0004
+
+def _ydh_apply(c, r, lo, hi, alpha):
+    L = c.shape[0]
+    mv0 = np.flatnonzero(c != c[0])
+    if not mv0.size:
+        return None
+    r0 = max(0, int(mv0[0]) - 1)
+    hi = min(hi, L - r0 - 256)
+    if hi <= lo:
+        return None
+    for _ in range(6):
+        E = int(np.exp(r.uniform(np.log(lo), np.log(hi))))
+        s = L - E
+        past = c[r0:s]
+        if past.size < 256 or float(_v2_mean(np.diff(past) != 0.0)) < 0.3:
+            continue
+        sd = float(_v2_std(past))
+        if not np.isfinite(sd) or sd <= 0.0:
+            continue
+        z = abs(float(c[s]) - float(_v2_mean(past))) / sd
+        if not 0.3 <= z <= 2.5:
+            continue
+        D = int(10.0 * (1.0 - r.random()) ** (-1.0 / alpha))
+        y = c.copy()
+        if D >= E:
+            y[s:] = c[s]
+        else:
+            e = s + D
+            y[s:e] = c[s]
+            y[e:] = c[s] + (c[e:] - c[e])
+        return y
+    return None
+
+_YDHParent = Generator
+
+class Generator(_YDHParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_ydh_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _ydh_json.load(fh).get("y_hold", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        def num(k, d):
+            try:
+                v = float(cfg.get(k, d))
+                return v if np.isfinite(v) else d
+            except (TypeError, ValueError):
+                return d
+        q = num("q", 0.0)
+        self._ydh_q = q if 0.0 <= q <= 1.0 else 0.0
+        self._ydh_lo, self._ydh_hi = max(16, int(num("min", 100))), int(num("max", 3000))
+        self._ydh_alpha = min(max(num("alpha", 0.45), 0.2), 3.0)
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                q = self._ydh_q
+                if q > 0.0 and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.ndim in (1, 2) and x.shape[-1] >= 512:
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _YDH_TAG], spawn_key=(i,)))
+                    if r.random() < q:
+                        try:
+                            c0 = x if x.ndim == 1 else x[0]
+                            if bool(np.all(np.isfinite(c0))):
+                                y = _ydh_apply(c0, r, self._ydh_lo, self._ydh_hi, self._ydh_alpha)
+                                if y is not None and float(y.max()) > float(y.min()):
+                                    if x.ndim == 1:
+                                        x = y
+                                    else:
+                                        x = x.copy(); x[0] = y
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
+
+import json as _yu_json
+import os as _yu_os
+
+_YU_TAG = 0x59D0_0001
+_YU_MIN_KEEP = 256
+
+def _yu_num(v, default: float) -> float:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if np.isfinite(v) and v >= 0.0 else default
+
+_YUParent = Generator
+
+class Generator(_YUParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        cfg: dict = {}
+        try:
+            with open(_yu_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yu_json.load(fh).get("y_unfreeze", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        self._yu_q = min(_yu_num(cfg.get("q", 0.0), 0.0), 1.0)
+        self._yu_min = max(int(_yu_num(cfg.get("min_hold", 100), 100)), 16)
+        self._yu_med = max(_yu_num(cfg.get("med", 10.0), 10.0), 1.0)
+        self._yu_max = max(int(_yu_num(cfg.get("max", 100), 100)), 1)
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        q = self._yu_q
+        seed = int(self._seed) & ((1 << 64) - 1)
+        p_geo = 1.0 - 0.5 ** (1.0 / self._yu_med)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                q = self._yu_q
+                if q > 0.0 and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.ndim in (1, 2) and x.shape[-1] >= 2 * _YU_MIN_KEEP:
+                    try:
+                        c0 = x if x.ndim == 1 else x[0]
+                        L = int(c0.shape[0])
+                        ch = np.flatnonzero(c0 != c0[-1])
+                        if ch.size and L - 1 - int(ch[-1]) >= self._yu_min:
+                            r = np.random.default_rng(np.random.SeedSequence([seed, _YU_TAG], spawn_key=(i,)))
+                            if r.random() < q:
+                                k = min(int(r.geometric(p_geo)), self._yu_max)
+                                t = int(ch[-1]) + 1 + k
+                                if _YU_MIN_KEEP <= t < L:
+                                    h = x.reshape(1, L) if x.ndim == 1 else x
+                                    z = np.empty_like(h)
+                                    z[:, : L - t] = h[:, :1]
+                                    z[:, L - t:] = h[:, :t]
+                                    if bool(np.all(np.isfinite(z))):
+                                        x = z[0].copy() if x.ndim == 1 else z
+                    except Exception:
+                        pass
+                yield x
+        finally:
+            base.close()
+
+import json as _yss_json
+import os as _yss_os
+
+_YSS_GLOBALS = ("_K_Q", "_K2_Q", "_S1_Q", "_S2_Q", "_W86B_Q", "_P25_Q", "_C128_Q", "_BAND_Q", "_ACUH_Q", "_C91_P",
+                "_C91_OPEN_NUM", "_C124B2_QMIN")
+_YSS_ATTRS = {"y_short": "_ycs_q", "y_quant": "_ybq_q", "y_couple": "_yac_q", "y_unfreeze": "_yu_q", "y_hold": "_ydh_q"}
+
+def _yss_fams(block, table, cap):
+    try:
+        mult = min(max(float(block.get("rate", 1.0)), 0.0), 20.0)
+    except (TypeError, ValueError):
+        mult = 1.0
+    out = []
+    for k, (key, fn) in enumerate(table):
+        try:
+            q = min(max(float(block.get(key, 0.0)), 0.0) * mult, cap)
+        except (TypeError, ValueError):
+            q = 0.0
+        f = globals().get(fn)
+        if q > 0.0 and callable(f):
+            out.append((k, q, f))
+    return tuple(out)
+
+_YSSParent = Generator
