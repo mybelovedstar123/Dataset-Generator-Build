@@ -26544,3 +26544,289 @@ def _ys_observe(r, x, kind, mins, signed):
 
 def _ys_len(r, mins, L):
     return int(min(max(np.interp(r.random(), _YS_NQ, _YS_NKNOT[mins]), 256.0), L))
+
+def _ys_series(r, kind, mins, n):
+    cal = _ys_cal(r, n, 1440 // mins)
+    signed = False
+    if kind == "demand":
+        x = _ys_demand(r, cal, _ys_sun(r, cal), None) if r.random() < 0.4 else _ys_demand(r, cal)
+    elif kind == "gen":
+        sub = _YS_GEN[_ys_pick(r, _YS_GEN_W[mins])]
+        x = _ys_gen(r, cal, sub)
+        signed = sub in ("pumped", "inter")
+    elif kind == "flow":
+        x = _ys_flow(r, cal, mins)
+        signed = True
+    elif kind == "price":
+        x = _ys_price(r, cal, mins)
+    else:
+        x = _ys_co2(r, cal, mins)
+    if kind == "demand" and mins == 5:
+        d = np.diff(x)
+        x = x + _ys_ou2(r, n, r.uniform(0.5, 1.5), r.uniform(1.0, 3.0), float(_v2_stdm(d)) * r.uniform(0.6, 2.0))
+    elif kind == "demand" and mins == 15:
+        x = _ys_white(r, np.asarray(x, dtype=np.float64), "demand15")
+    elif kind in ("demand", "gen", "flow"):
+        x = _ys_white(r, np.asarray(x, dtype=np.float64), kind + ("30" if mins >= 30 and kind == "gen" else "15" if mins == 15 and kind == "gen" else "5" if mins == 5 and kind == "flow" else ""))
+    return _ys_observe(r, np.asarray(x, dtype=np.float64), kind, mins, signed)
+
+def _ys_energy(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    kind, mins, _ = _YS_CELLS[min(int(np.searchsorted(_YS_CELL_CUM, r.random() * _YS_CELL_CUM[-1], side="right")),
+                                  len(_YS_CELLS) - 1)]
+    n = _ys_len(r, mins, L)
+    y = _ys_series(r, kind, mins, n)
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if not bool(np.all(np.isfinite(out))):
+        out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    if float(np.ptp(out)) == 0.0:
+        out[L - 1] += 1.0
+    return out
+
+_YS_MC_CAD = ((5, 0.2), (15, 0.15), (30, 0.5), (60, 0.15))
+
+def _ys_mc_area(r, cal, C):
+    P, nd, day, n = cal["P"], cal["nd"], cal["day"], cal["n"]
+    sun, cloud = _ys_sun(r, cal), _ys_cloud(r, cal)
+    D = _ys_demand(r, cal, sun, cloud)
+    S = r.uniform(0.0, 0.5) * sun * cloud / max(float(sun.max()), 1e-6)
+    W = r.uniform(0.0, 0.5) * _ys_wind(r, cal)
+    N = r.uniform(0.0, 0.3) * _ys_gen(r, cal, "nuclear")
+    Hy = r.uniform(0.02, 0.15) * _ys_gen(r, cal, "ror")
+    M = _ys_daily(_ys_ou(r, nd + 1, r.uniform(1.0, 5.0), r.uniform(0.02, 0.06)), day, cal["frac"]) - r.uniform(0.0, 0.3) * S
+    R = D - S - W - N - Hy - M
+    q = _ys_daymean(R, day, nd)
+    ps = r.uniform(0.0, 0.12) * np.clip((R - q) / max(float(_v2_stdm(R)), 1e-6), -1.5, 1.5)
+    ps = np.where(np.abs(ps) < r.uniform(0.0, 0.03), 0.0, ps)
+    T = np.maximum(R - ps, r.uniform(0.02, 0.15))
+    pool = [T, S, W, N, Hy, ps, -M]
+    order = [0] + list(1 + r.permutation(len(pool) - 1))
+    return [D] + [pool[k] for k in order[:C - 1]], [False] + [order[k] in (5, 6) for k in range(min(C - 1, len(order)))]
+
+def _ys_mc_zones(r, cal, C):
+    P, n = cal["P"], cal["n"]
+    D0 = _ys_demand(r, cal)
+    out = []
+    for _ in range(C):
+        k = int(r.integers(-P // 24, P // 24 + 1)) if r.random() < 0.5 else 0
+        z = np.roll(D0, k) if k else D0.copy()
+        if k > 0:
+            z[:k] = D0[0]
+        elif k < 0:
+            z[k:] = D0[-1]
+        out.append(z ** r.uniform(0.6, 1.6) * (1.0 + _ys_ou2(r, n, r.uniform(0.5, 3.0), r.uniform(0.1, 1.0) * P / 24.0, r.uniform(0.01, 0.05))))
+    return out, [False] * C
+
+def _ys_mc_pair(r, cal, C):
+    P, nd, day, n = cal["P"], cal["nd"], cal["day"], cal["n"]
+    sun = _ys_sun(r, cal)
+    D = _ys_demand(r, cal, sun, None)
+    a = float(np.exp(-1.0 / max(0.02 * P, 1.0)))
+    out = [D]
+    for j in range(C - 1):
+        v = r.random()
+        if v < 0.4:
+            f = _ys_ar1(D * (1.0 - a), a)
+            out.append(f * (1.0 + _ys_ou(r, n, r.uniform(0.1, 1.0) * P, r.uniform(0.005, 0.03))))
+        elif v < 0.75:
+            out.append(np.maximum(D - r.uniform(0.05, 0.35) * sun * _ys_cloud(r, cal) - r.uniform(0.0, 0.2) * _ys_wind(r, cal), 0.02))
+        else:
+            cap = 1.25 + _ys_daily(_ys_ou(r, nd + 1, r.uniform(2.0, 10.0), 0.05), day, cal["frac"])
+            out.append(np.maximum(cap + 0.1 * (D - _v2_meanm(D)) + np.round(_ys_ou(r, n, P, 0.05) / 0.02) * 0.02, D * 1.02))
+    return out, [False] * C
+
+def _ys_energy_mc(r, L, C):
+    L, C = int(L), int(C)
+    if L < 256 or C < 1:
+        return None
+    if C == 1:
+        y = _ys_energy(r, L)
+        return None if y is None else y[None, :]
+    mins = _YS_MC_CAD[_ys_pick(r, [w for _, w in _YS_MC_CAD])][0]
+    n = _ys_len(r, mins, L)
+    cal = _ys_cal(r, n, 1440 // mins)
+    v = r.random()
+    xs, sg = _ys_mc_area(r, cal, C) if v < 0.6 else (_ys_mc_zones(r, cal, C) if v < 0.8 else _ys_mc_pair(r, cal, C))
+    while len(xs) < C:
+        xs.append(xs[len(xs) % max(len(xs), 1)] * r.uniform(0.3, 0.9) * (1.0 + _ys_ou(r, n, cal["P"] / 12.0, 0.02)))
+        sg.append(False)
+    sc = _ys_lu(r, 300.0, 60000.0)
+    unit = r.random()
+    out = np.empty((C, L), dtype=np.float64)
+    for c in range(C):
+        y = _ys_white(r, np.asarray(xs[c], dtype=np.float64), "demand" if c == 0 else "gen") * sc
+        if sg[c] and r.random() < 0.5:
+            y = -y
+        y = np.round(y) if unit < 0.8 else np.round(y, 1)
+        if not bool(np.all(np.isfinite(y))):
+            y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+        out[c, :L - n] = y[0]
+        out[c, L - n:] = y
+        if float(np.ptp(out[c])) == 0.0:
+            out[c, L - 1] += 1.0
+    return out
+
+_YT_TWO_PI = 2.0 * np.pi
+_YT_KIND_CUM = np.cumsum([0.22, 0.17, 0.18, 0.20, 0.20, 0.03])
+_YT_MIN_N = 320
+_YT_SIG_CUM = np.cumsum([0.35, 0.45, 0.20])
+_YT_SIG_CUM_H = np.cumsum([0.60, 0.30, 0.10])
+_YT_SIG_CUM_I = np.cumsum([0.60, 0.30, 0.10])
+_YT_STEP_Q = np.array([0.25, 0.5, 0.1, 0.125, 0.05, 0.15])
+_YT_STEP_CUM = np.cumsum([0.90, 0.05, 0.02, 0.01, 0.01, 0.01])
+_YT_ICAD = ((1440, 0.71), (288, 0.07), (96, 0.20), (48, 0.02))
+_YT_ICUM = np.cumsum([w for _, w in _YT_ICAD])
+_YT_IVOL = {1440: (0.0003, 0.0009), 288: (0.0008, 0.0016), 96: (0.002, 0.0065), 48: (0.0022, 0.0075)}
+
+def _yt_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(max(hi, lo)))))
+
+def _yt_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yt_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yt_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yt_ar1(e, phi)
+
+def _yt_sv(r, n, ts, ss, tf, sf):
+    lv = _yt_ou(r, n, ts, ss) + (_yt_ou(r, n, tf, sf) if sf > 0.0 else 0.0)
+    v = np.exp(lv - lv.max())
+    return v / np.sqrt(max(float(_v2_mean(v * v)), 1e-300))
+
+def _yt_t(r, n, nu):
+    return r.standard_t(nu, n) * np.sqrt((nu - 2.0) / nu)
+
+def _yt_jumps(r, n, p, size):
+    j = r.random(n) < p
+    return np.where(j, size * r.uniform(1.0, 2.5, n) * np.where(r.random(n) < 0.5, -1.0, 1.0), 0.0)
+
+def _yt_ma1(e, th):
+    out = np.array(e, dtype=np.float64)
+    out[1:] += th * e[:-1]
+    return out
+
+def _yt_stale(r, x, p):
+    h = r.random(x.size) < p
+    h[0] = False
+    return x[np.maximum.accumulate(np.where(h, 0, np.arange(x.size)))]
+
+def _yt_tick(x, lvl, sig):
+    t = 10.0 ** (np.floor(np.log10(max(lvl, 1e-12))) - (sig - 1))
+    return np.round(x / t) * t, t
+
+def _yt_daycycle(r, n, P, amp):
+    ph = (np.arange(n) + int(r.integers(0, P))) * (_YT_TWO_PI / P)
+    return amp * np.cos(ph - r.uniform(0.0, _YT_TWO_PI)) + 0.4 * amp * r.random() * np.cos(2.0 * ph - r.uniform(0.0, _YT_TWO_PI))
+
+def _yt_weekend(r, n, P):
+    day = (np.arange(n) + int(r.integers(0, P))) // P
+    return ((day + int(r.integers(0, 7))) % 7) >= 5
+
+def _yt_stairs(r, n, cal):
+    q = float(_YT_STEP_Q[_yt_pick(r, _YT_STEP_CUM)])
+    u = r.random()
+    lvl = r.uniform(0.1, 4.0) if u < 0.78 else r.uniform(4.0, 11.0) if u < 0.91 else r.uniform(-0.75, 0.1)
+    lvl = float(np.round(lvl / q) * q)
+    floor = 0.0 if (lvl >= 0.0 and r.random() < 0.8) else -0.75
+    gap = (7.0 * float(r.integers(6, 9))) if cal else r.uniform(32.0, 45.0)
+    p_start, p_end, p_move = r.uniform(0.05, 0.3), r.uniform(0.05, 0.25), r.uniform(0.7, 0.97)
+    big = r.uniform(0.0, 0.4)
+    state = 0 if r.random() < 0.5 else (1 if r.random() < 0.5 else -1)
+    t = -r.uniform(0.0, gap)
+    meets, vals = [], []
+    while t < n:
+        t += gap * (r.uniform(0.95, 1.05) if not cal else 1.0) * (2.0 if r.random() < 0.06 else 1.0)
+        if state == 0:
+            if r.random() < p_start:
+                state = 1 if r.random() < 0.5 else -1
+        elif r.random() < p_end:
+            state = 0
+        if state != 0 and r.random() < p_move:
+            k = 1 + (int(r.integers(1, 3)) if r.random() < big else 0)
+            lvl = max(lvl + state * k * q, floor)
+        elif state == 0 and r.random() < 0.02:
+            lvl = max(lvl + (q if r.random() < 0.5 else -q), floor)
+        meets.append(t)
+        vals.append(lvl)
+    m = np.array(meets)
+    v = np.array(vals)
+    i = np.searchsorted(m, np.arange(n, dtype=np.float64), side="right") - 1
+    start = v[0] - (v[1] - v[0] if v.size > 1 else 0.0)
+    path = np.where(i >= 0, v[np.maximum(i, 0)], start)
+    return np.round(path, 4), q
+
+def _yt_admin(r, n):
+    cal = r.random() < 0.35
+    x, q = _yt_stairs(r, n, cal)
+    u = r.random()
+    if u < 0.3:
+        x = x + float(r.choice([-0.75, -0.5, -0.25, -0.1, 0.1, 0.25, 0.5, 0.75]))
+    if not np.any(x != x[0]):
+        k = int(r.integers(n // 8, max(n // 8 + 1, n - 8)))
+        x[k:] = x[k:] + (q if r.random() < 0.5 else -q)
+    return np.round(x, 3 if r.random() < 0.2 else 2)
+
+def _yt_rate(r, n):
+    u = r.random()
+    sub = 0 if u < 0.65 else 1 if u < 0.80 else 2
+    base = _yt_lu(r, 0.024, 0.07)
+    nu = r.uniform(5.0, 12.0)
+    v = _yt_sv(r, n, _yt_lu(r, 30.0, 400.0), r.uniform(0.3, 0.65), _yt_lu(r, 3.0, 25.0), r.uniform(0.35, 0.75))
+    e = base * v * _yt_t(r, n, nu) + base * _yt_jumps(r, n, _yt_lu(r, 2e-4, 2e-3), r.uniform(3.0, 6.0))
+    if sub == 1:
+        st, _ = _yt_stairs(r, n, r.random() < 0.3)
+        w = r.uniform(0.05, 0.4)
+        sp = _yt_ou(r, n, _yt_lu(r, 5.0, 60.0), base * r.uniform(0.5, 2.5))
+        x = st + r.normal(0.0, 0.15) + sp + w * np.cumsum(e) * r.uniform(0.2, 0.6)
+        if r.random() < 0.5:
+            mlen = r.uniform(20.5, 22.5)
+            pos = (np.arange(n) + r.uniform(0.0, mlen)) / mlen
+            me = np.floor(pos[1:]) > np.floor(pos[:-1])
+            me = np.concatenate(([False], me))
+            qe = me & ((np.floor(pos) % 3) == 0)
+            s = (1.0 if r.random() < 0.5 else -1.0) * _yt_lu(r, 0.01, 0.12)
+            x = x + s * (me * (r.random(n) < 0.7) + 1.5 * qe)
+    else:
+        u = r.random()
+        lv = r.uniform(0.1, 3.0) if u < 0.62 else r.uniform(3.0, 6.0) if u < 0.80 else r.uniform(6.0, 12.0) if u < 0.85 else r.uniform(-0.8, 0.3)
+        x = lv + np.cumsum(_yt_ma1(e, r.normal(-0.02, 0.06)))
+        if sub == 2:
+            x = x + r.uniform(0.5, 4.0) * base * r.standard_normal(n)
+    if r.random() < 0.05:
+        x = x * _yt_lu(r, 10.0, 300.0)
+    dec = 2 if r.random() < 0.5 else 3 if r.random() < 0.6 else 4
+    x = np.round(x, dec)
+    return _yt_stale(r, x, r.uniform(0.0, 0.012) if r.random() < 0.88 else r.uniform(0.02, 0.1))
+
+def _yt_fx(r, n):
+    base = _yt_lu(r, 0.0030, 0.0072)
+    nu = r.uniform(6.0, 20.0)
+    v = _yt_sv(r, n, _yt_lu(r, 20.0, 300.0), r.uniform(0.2, 0.45), _yt_lu(r, 3.0, 15.0), r.uniform(0.05, 0.4))
+    e = base * v * _yt_t(r, n, nu)
+    if r.random() < 0.35:
+        e = e + base * _yt_jumps(r, n, _yt_lu(r, 2e-4, 2e-3), r.uniform(3.0, 5.0))
+    y = np.cumsum(_yt_ma1(e, r.normal(-0.02, 0.07)))
+    lvl = 10.0 ** float(np.clip(r.normal(0.0, 1.0), -2.8, 2.6))
+    x = lvl * np.exp(y - y[0])
+    x, _ = _yt_tick(x, lvl, 4 + _yt_pick(r, _YT_SIG_CUM))
+    return _yt_stale(r, x, r.uniform(0.0, 0.015) if r.random() < 0.85 else r.uniform(0.02, 0.07))
