@@ -29575,3 +29575,89 @@ def _c251_k87_lin(s, q):
     if g >= 0.5:
         return b - diff * (1 - g)
     return a + diff * g
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_k87_eval_nb(recent):
+    n = recent.shape[0]
+    for t in range(n):
+        if not np.isfinite(recent[t]):
+            return -1
+    s = np.sort(recent)
+    lo = s[0]
+    hi = s[n - 1]
+    d = np.empty(n - 1, dtype=np.float64)
+    for t in range(n - 1):
+        d[t] = abs(recent[t + 1] - recent[t])
+    q10 = _c251_k87_lin(s, 0.10)
+    q90 = _c251_k87_lin(s, 0.90)
+    alo = abs(lo)
+    ahi = abs(hi)
+    peak = ahi if ahi > alo else alo
+    span = q90 - q10
+    c = peak * 1e-12
+    if c > span:
+        span = c
+    if 1e-12 > span:
+        span = 1e-12
+    tol = peak * 1e-12
+    if 1e-12 > tol:
+        tol = 1e-12
+    cnt = 0
+    for t in range(n - 1):
+        if d[t] <= tol:
+            cnt += 1
+    if cnt / (n - 1) >= 0.35:
+        return 1
+    sd = np.sort(d)
+    if not np.isfinite(sd[n - 2]):
+        return -1
+    m1 = np.sort(recent[n - 32:])
+    m0 = np.sort(recent[:32])
+    drift = abs((m1[15] + m1[16]) / 2 - (m0[15] + m0[16]) / 2) / span
+    if _c251_k87_lin(sd, 0.90) / span <= 0.03 and drift <= 0.12:
+        return 1
+    return 0
+
+
+_c251_k87_eval_parent = _k87_quiet_eval
+
+
+def _c251_k87_quiet_eval(recent):
+    if (type(recent) is np.ndarray and recent.dtype == np.float64 and recent.ndim == 1 and recent.size >= 64):
+        v = int(_c251_k87_eval_nb(recent))
+        if v >= 0:
+            return v == 1
+    return _c251_k87_eval_parent(recent)
+
+
+_k87_quiet_eval = _c251_k87_quiet_eval
+
+
+# ── c251-P9b: _c91_points without the numpy-dispatch wrappers (np.size / np.ndim / np.shape) for ndarray and dict
+# records: the same integer (size, or ceil(100 * size / 120) for a 2-D record with more than one channel).
+_c251_c91_points_parent = _c91_points
+
+
+def _c251_c91_points(x):
+    v = x['values'] if isinstance(x, dict) else x
+    if type(v) is np.ndarray:
+        size = int(v.size)
+        if v.ndim == 2 and int(v.shape[0]) > 1:
+            return -(-size * 100 // 120)
+        return size
+    return _c251_c91_points_parent(x)
+
+
+_c91_points = _c251_c91_points
+
+
+# ═══════════════ c251-P11: exact row std in _apply_nonneg_integer_prior (chunk post-processing). ═══════════════
+# rows.std(axis=1, keepdims=True) of a C-contiguous float64 block = per row sqrt((0.0 + pairwise((x - m) * (x - m)))
+# / L) with m = (0.0 + pairwise(x)) / L, i.e. uid76's own _v2_var_nb + a correctly rounded sqrt (bit-equal to numpy's
+# two-pass std along a contiguous row; verified). Everything else (the RNG calls rng.random(n), rng.uniform(..),
+# rng.random(..) [, rng.random(..)], _spread_flat_levels, the rint / scaling / write-back) is uid76's code verbatim.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_row_std(rows, out):
+    for r in range(rows.shape[0]):
+        out[r, 0] = np.sqrt(_v2_var_nb(rows[r]))
