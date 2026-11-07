@@ -31184,3 +31184,255 @@ class Generator(_C215LPParent):
 # 50% native share; quiet / degenerate / other -> untouched. NEVER writes a hold: the flat lever of RZPPUL is untouched.
 # Own SeedSequence([seed, TAG], spawn_key=(i,)) per record; parent stream untouched. ═══════════════
 _C233MLPC_TAG = 0xC233A1D
+_C233MLPC_EXT = 2048  # 0 = no periodic tail extension; else periodic tails may start up to this many steps before the end
+_C233MLPC_LIN_P = 0.5
+_C233MLPC_LAGS = np.arange(2, 513, dtype=np.int64)
+
+
+_C233MLPC_ACF_MIN = 0.5
+
+
+def _c233mlpc_acf_max(x, lo, hi):
+    """Cheap gate before the king's long-cycle validators (which dominate the layer's cost): the largest normalised
+    autocorrelation over lags [lo, hi). A cycle the validators accept (median-cycle error <= 0.12 of span) has a far
+    higher autocorrelation at its lag than this gate."""
+    y = x - float(np.mean(x))
+    d = float(np.dot(y, y))
+    if not d > 0.0:
+        return 0.0
+    n = y.shape[0]
+    f = np.fft.rfft(y, 2 * n)
+    acf = np.fft.irfft(f * np.conj(f), 2 * n)[:n] / d
+    return float(np.max(acf[lo:min(hi, n - 1)]))
+
+
+def _c233mlpc_lawlike(v):
+    """0 = no law tail; -1 = hold-like ending (exact hold over the last 256 or terminal exact run >= 16);
+    lag > 0 = the record ends in an exact repeat of its last 64 values at that lag (a law cycle tail)."""
+    L = int(v.shape[0])
+    t = v[-256:]
+    if bool(np.all(t == t[-1])):
+        return -1
+    r = 1
+    while r < 16 and v[L - 1 - r] == v[-1]:
+        r += 1
+    if r >= 16:
+        return -1
+    lags = _C233MLPC_LAGS[_C233MLPC_LAGS <= L - 65]
+    cand = lags[(v[L - 1 - lags] == v[L - 1]) & (v[L - 2 - lags] == v[L - 2])
+                & (v[L - 33 - lags] == v[L - 33]) & (v[L - 64 - lags] == v[L - 64])]
+    for lag in cand:
+        lag = int(lag)
+        if np.array_equal(v[L - 64:], v[L - 64 - lag:L - lag]):
+            return lag
+    return 0
+
+
+def _c233mlpc_hist_len(lag):
+    return 512 if lag <= 96 else (1024 if lag <= 256 else 2048)
+
+
+def _c233mlpc_extend(v, b, lag, u):
+    """Earlier start b2 < b for a periodic tail (back2 ~ U[L-b, EXT]), accepted only if the same lag re-validates on the
+    96 points before b2 with the king's criteria and its template is non-constant; returns (b2, history) or None."""
+    if _C233MLPC_EXT <= 0:
+        return None
+    L = int(v.shape[0])
+    hl = _c233mlpc_hist_len(lag)
+    hi = min(int(_C233MLPC_EXT), L - hl)
+    back = L - b
+    if hi <= back:
+        return None
+    back2 = min(hi, back + int(u * (hi - back + 1)))
+    b2 = L - back2
+    if b2 >= b or b2 - hl < 0:
+        return None
+    h2 = np.ascontiguousarray(v[b2 - hl:b2], dtype=np.float64)
+    if not bool(np.all(np.isfinite(h2))):
+        return None
+    fit = h2[:-96]
+    val = h2[-96:]
+    count = min(7, int(fit.shape[0]) // lag)
+    count -= int(count % 2 == 0)
+    if count < 1:
+        return None
+    pred = _empirical_cycle_tail(fit, lag, 96, None, "median")
+    if not bool(np.ptp(pred) > 0.0):
+        return None
+    recent = h2[-192:]
+    q10, q90 = np.quantile(recent, (0.10, 0.90))
+    peak = float(np.max(np.abs(recent)))
+    span = max(float(q90 - q10), peak * 1e-12, 1e-12)
+    err = float(np.mean(np.abs(val - pred))) / span
+    hold = float(np.mean(np.abs(val - float(np.median(fit[-16:]))))) / span
+    if err <= 0.12 and err <= 0.75 * hold:
+        return b2, h2
+    return None
+
+
+def _c233mlpc_tail(v, b, coin, u):
+    L = int(v.shape[0])
+    pre = np.asarray(v[b - 512:b], dtype=np.float64)
+    recent = pre[-192:]
+    if not bool(np.ptp(recent) > 0.0):
+        return None
+    peak = float(np.max(np.abs(recent)))
+    if float(np.mean(np.abs(np.diff(recent)) <= max(peak * 1e-12, 1e-12))) >= 0.35:
+        return None
+    q10, q90 = np.quantile(recent, (0.10, 0.90))
+    span = max(float(q90 - q10), peak * 1e-12, 1e-12)
+    fit = pre[:-96]
+    val = pre[-96:]
+    fa = float(np.median(fit[-16:]))
+    hold_error = float(np.mean(np.abs(val - fa))) / span
+    slope = (float(np.median(fit[-32:])) - float(np.median(fit[-64:-32]))) / 32.0
+    linear_error = float(np.mean(np.abs(val - (fa + slope * np.arange(1, 97, dtype=np.float64))))) / span
+    projected = abs(slope) * 96.0 / span
+    strict_linear = (linear_error <= 0.08) and (linear_error <= 0.30 * hold_error) and (0.20 <= projected <= 0.90)
+    away = float(np.mean(np.abs(fit - fa) > 0.05 * span))
+    perr = np.inf
+    lag_b = 7
+    for lag in (7, 12, 24, 48, 96):
+        pred = np.tile(fit[-lag:], (96 + lag - 1) // lag)[:96]
+        e = float(np.mean(np.abs(val - pred))) / span
+        if e < perr:
+            perr, lag_b = e, lag
+    recurring = (away >= 0.15) and (perr <= 0.12) and (perr <= 0.75 * hold_error)
+    hist = pre
+    if (not recurring) and (not strict_linear):
+        if b >= 1024:
+            ctx = np.ascontiguousarray(v[b - 1024:b], dtype=np.float64)
+            if _c233mlpc_acf_max(ctx, 97, 257) >= _C233MLPC_ACF_MIN:
+                ok, lg = _validated_long_cycle(ctx[None, :])
+                if bool(ok[0]):
+                    recurring, lag_b, hist = True, int(lg[0]), ctx
+        if (not recurring) and b >= 2048:
+            ctx = np.ascontiguousarray(v[b - 2048:b], dtype=np.float64)
+            if _c233mlpc_acf_max(ctx, 257, 513) >= _C233MLPC_ACF_MIN:
+                ok, lg = _validated_longer_cycle(ctx[None, :])
+                if bool(ok[0]):
+                    recurring, lag_b, hist = True, int(lg[0]), ctx
+    if recurring:
+        tm = _empirical_cycle_tail(hist, lag_b, L - b, None, "median")
+        if not bool(np.ptp(tm) > 0.0):
+            return None
+        ext = _c233mlpc_extend(v, b, lag_b, u)
+        if ext is not None:
+            b2, h2 = ext
+            tm2 = _empirical_cycle_tail(h2, lag_b, L - b2, None, "median")
+            if bool(np.ptp(tm2) > 0.0):
+                return b2, tm2
+        return b, tm
+    if strict_linear and coin < _C233MLPC_LIN_P:
+        anchor = float(np.median(recent[-16:]))
+        slope_now = (float(np.median(pre[-32:])) - float(np.median(pre[-64:-32]))) / 32.0
+        line = anchor + slope_now * np.arange(1, L - b + 1, dtype=np.float64)
+        return b, np.clip(line, anchor - span, anchor + span)
+    return None
+
+
+def _c233mlpc_apply(x, r):
+    a = np.asarray(x)
+    if a.ndim == 1:
+        arr = a[None, :]
+    elif a.ndim == 2:
+        arr = a
+    else:
+        return x
+    C, L = arr.shape
+    if L < 1232 or not bool(np.all(np.isfinite(arr))):
+        return x
+    backs = r.integers(256, min(721, L - 32), size=C)
+    coins = r.random(C)
+    us = r.random(C)
+    out = None
+    for c in range(C):
+        v = arr[c]
+        kind = _c233mlpc_lawlike(v)
+        if kind < 0:
+            continue
+        if kind > 0:
+            # existing exact cycle tail (engine law): optionally start it earlier (MLPX); MLPC leaves it alone
+            if _C233MLPC_EXT <= 0:
+                continue
+            eq = v[:-kind] == v[kind:]
+            nf = np.flatnonzero(~eq)
+            t0 = int(nf[-1]) + 1 if nf.size else 0
+            if L - t0 < 256:
+                continue
+            tm0 = v[t0:t0 + kind]
+            if not bool(np.ptp(tm0) > 0.0):
+                continue
+            ext = _c233mlpc_extend(v, t0, kind, float(us[c]))
+            if ext is None:
+                continue
+            b2, h2 = ext
+            tm2 = _empirical_cycle_tail(h2, kind, L - b2, None, "median")
+            if not bool(np.ptp(tm2) > 0.0):
+                continue
+            res = (b2, tm2)
+        else:
+            res = _c233mlpc_tail(v, L - int(backs[c]), float(coins[c]), float(us[c]))
+        if res is None:
+            continue
+        b, tail = res
+        if out is None:
+            out = np.array(arr, dtype=np.float64, copy=True)
+        out[c, b:] = tail
+    if out is None:
+        return x
+    return out[0] if a.ndim == 1 else out
+
+
+_C233MLPCParent = Generator
+
+
+class Generator(_C233MLPCParent):
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if isinstance(x, np.ndarray):
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _C233MLPC_TAG], spawn_key=(i,)))
+                    try:
+                        x = _c233mlpc_apply(x, r)
+                    except Exception:
+                        pass
+                yield x
+        finally:
+            base.close()
+
+
+
+_C259NameParent = Generator
+
+
+class Generator(_C259NameParent):
+    @property
+    def name(self) -> str:
+        return 'c268-k76-BIG1-P40U'
+
+
+# ═══════════════ c261 PAUT: autumn re-calibration of the king's own 15-min price kind (_yb_price, the ch_grid15 'price' channel) ═══════════════
+# Regime evidence (wfregime scan + verify-scan, 10-21): every uid76 king / challenger since the 10-15 pools forecasts European 15-min
+# day-ahead prices LOWER than its init (-0.066 sd) with DEEPER midday troughs (-0.17 sd on energy_charts price_*); the deficit is
+# -0.08..-0.19 % of round per leg (init 3d82fddc -0.143) and is projected to persist. Real energy_charts series (10-18 pool) by days
+# before the cut: trough/level 0.42-0.58 -> 0.28-0.33, peak/level 0.59 -> 0.39-0.41, day level +13-17 %, negative points 1-3 % -> 0.1-0.4 %
+# over the last ~5 weeks. The king's _yb_price (1.5 % of stream records carry it as their y_channel channel; 0.75 % of points) is a
+# stationary SEPTEMBER calibration: trough/level 0.44, peak/level 0.59, negatives 1.3 %, no within-row trend.
+# PAUT keeps every draw of the king's _yb_price (its values are computed first, unchanged) and then, in 90 % of rows, applies a
+# within-row AUTUMN TREND with 5 extra uniforms drawn AFTER the king's draws (price rows never use r again in _yb_draw: P_TAIL and
+# P_BLIP are 0 for 'price'): the daily shape (deviation from the calendar-day mean) is scaled by g(d) = g_end * exp(kap * (nd-1-d))
+# (capped at 1.25; g_end U(0.50, 0.75), kap U(0.010, 0.022) / day) and the day level gets a linear ramp that ENDS at the king's level
+# (past days lowered by delta * Lref * (nd-1-d) / 35; delta U(0.05, 0.35) in 80 % of the trended rows, else 0; Lref = median |day mean|). Result rounded to 2 decimals
+# like the king's. No new records, no billing change, every other record / channel of the stream byte-identical.
+# v2 (hygiene review 10-21 ~01:50 JST): negative outputs pass through a soft floor y -> -F * log1p(-y / F), F = 0.02 * Lref (the
+# shallow end of the king's own negative-price compression, lev * (0.02..0.12)). Without it the affine trend (g > 1 and a lowered
+# level on early days) pushed early-row troughs LINEARLY below zero: 42-44 % of trended rows had points < -0.2 * level on days
+# -44..-21 (king 6-10 %, real 10-18 energy_charts 0 %); with it: 0 %, row-min p10 -0.07 * level (real -0.02..-0.04). Same draws,
+# same trended rows, trough / peak / level profile of the last 14 days unchanged.
+_C261_YB_PRICE_KING = _yb_price
