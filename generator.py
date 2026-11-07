@@ -29467,3 +29467,530 @@ class Generator(_C234SParent):
 #      packing and counted in _k0_dropped_records (never observed on c268's stream).
 
 _PRODUCER_WORKERS = 1
+
+def _k0_serial_base_generate(self, n_series: int) -> Iterator[np.ndarray]:
+
+    if n_series <= 0:
+        return
+    rng = np.random.default_rng(self._seed)
+    max_len = self._max_len
+
+    target_points = max(1, max(n_series - 2, 1) * self._min_len)
+
+    produced = 0
+    emitted_points = 0
+    base_seed = self._seed
+
+    chunk_index = 0
+    while produced < n_series:
+
+        batch_size = chunk_batch_size(produced)
+        lengths = rng.integers(
+            self._min_len, max_len + 1, size=batch_size
+        )
+        take = min(batch_size, n_series - produced)
+        chunk_points = int(lengths[:take].sum())
+        midpoint_progress = self._progress_at(
+            emitted_points + 0.5 * chunk_points, target_points
+        )
+        family_weights = self._weights_at(midpoint_progress)
+        parameters = self._parameters_at(midpoint_progress)
+        builders = (
+            partial(
+                _trend_seasonal_ar,
+                hi_frac=self._tr_hi_frac,
+                exc_lo=parameters["tr_exc_lo"],
+                exc_hi=parameters["tr_exc_hi"],
+                clean_frac=parameters["sa_clean_frac"],
+                clean_lo=parameters["sa_clean_lo"],
+                clean_hi=parameters["sa_clean_hi"],
+            ),
+            _regime_shift,
+            partial(
+                _multiplicative,
+                hi_frac=self._tr_hi_frac,
+                exc_lo=parameters["gr_exc_lo"],
+                exc_hi=parameters["gr_exc_hi"],
+            ),
+            _ar2,
+            partial(
+                _integrated,
+                heavy_frac=parameters["integrated_heavy_frac"],
+                sv_frac=parameters["integrated_sv_frac"],
+            ),
+            _threshold_ar,
+            _chaotic,
+            _spectral_gp,
+            partial(
+                _long_memory,
+                beta_lo=parameters["lm_beta_lo"],
+                beta_hi_end=parameters["lm_beta_hi"],
+            ),
+            _ou_stochastic_vol,
+            _physical_sensors,
+            _seasonal_counts,
+            _intermittent,
+            _pulse_outlier,
+            partial(
+                _conditional_stability,
+                calm_noise=parameters["cs_calm_noise"],
+            ),
+            partial(
+                _step_level,
+                jumps_lo=parameters["step_level_jumps_lo"],
+                jumps_hi=parameters["step_level_jumps_hi"],
+                exact_frac=parameters["step_level_exact_frac"],
+                noise_lo=parameters["step_level_noise_lo"],
+                noise_hi=parameters["step_level_noise_hi"],
+            ),
+            _vol_regime_switch,
+            _weekly_demand,
+            _tidal_harmonic,
+            _flow_recession,
+            _bounded_counts,
+            _held_rate,
+            _spiky_price,
+            _epi_decay,
+            _sticky_station,
+            _grid_flow,
+            _price_shock,
+            _coastal_residual,
+            partial(_cs_flat, calm_noise=parameters["cs_calm_noise"]),
+            partial(_cs_drift, calm_noise=parameters["cs_calm_noise"]),
+            _cs_countwalk,
+            _cs_pulse,
+            _rk4_chaotic,
+            _tidal_constituents,
+            _envelope_mod,
+            _rate_counts,
+            _dispersion_counts,
+            _dispatch_blocks,
+
+            *self._cf_builders,
+
+            _cycle_profile,
+            _transport_flow_tail,
+            _capacity_counts,
+            _overdispersed_counts,
+            _reported_epi_counts,
+            _retail_promo_tail,
+            _heavy_traffic_counts,
+            _sparse_admin_counts,
+            _storm_outage_counts,
+            _gauge_rain,
+            _store_sales_panel,
+            _web_session_attr,
+            _broadband_path_attr,
+            _cluster_job_attr,
+            _sales_promo_stockout_panel,
+            _settle_hold,
+            _web_traffic_plateau,
+            _biz_day_counts,
+            _weekly_web_counts,
+            _dispatch_price,
+            _epi_season_decay,
+            _weekday_ledger_counts,
+            _surveillance_counts,
+            _pull_counter_ramp,
+            _weekly_cycle_downloads,
+            _hourly_social_counts,
+            _intraday_event_counts,
+            _intraday_spot_price,
+            _road_commute_counts,
+        )
+        current_observation = {
+            key.removeprefix("observation."): value
+            for key, value in parameters.items()
+            if key.startswith("observation.")
+        }
+        domain_weights = self._domain_weights_at(midpoint_progress)
+        if domain_weights is not None:
+            fam_ids = dispatch_domain_mix(
+                base_seed,
+                chunk_index,
+                batch_size,
+                domain_weights,
+                family_weights,
+                self._domain_pool_indices,
+            )
+        else:
+
+            dispatch_u = rng.random(batch_size)
+            fam_base = _DISPATCH_REF_CDF.searchsorted(
+                dispatch_u, side="right"
+            )
+            if np.array_equal(family_weights, _DISPATCH_REF):
+                fam_ids = fam_base
+            else:
+                excess = np.maximum(
+                    family_weights - _DISPATCH_REF, 0.0
+                )
+                excess_total = excess.sum()
+                if excess_total <= 0.0:
+                    fam_ids = fam_base
+                else:
+                    dispatch_rng = np.random.default_rng(
+                        np.random.SeedSequence(
+                            (base_seed, chunk_index,
+                             _DISPATCH_STREAM_FAM, 0, 0)
+                        )
+                    )
+                    keep_u = dispatch_rng.random(batch_size)
+                    move_u = dispatch_rng.random(batch_size)
+                    keep_prob = np.where(
+                        _DISPATCH_REF > 0.0,
+                        np.minimum(
+                            np.divide(
+                                family_weights,
+                                _DISPATCH_REF,
+                                out=np.ones_like(family_weights),
+                                where=_DISPATCH_REF > 0.0,
+                            ),
+                            1.0,
+                        ),
+                        1.0,
+                    )
+                    excess_cdf = np.cumsum(excess / excess_total)
+                    excess_cdf /= excess_cdf[-1]
+                    released = keep_u >= keep_prob[fam_base]
+                    fam_ids = fam_base.copy()
+                    fam_ids[released] = excess_cdf.searchsorted(
+                        move_u[released], side="right"
+                    )
+
+        slots = np.arange(batch_size, dtype=np.int64)
+
+        tags = (0, 1, 2, 3) if parameters["tail_rebase_rate"] > 0.0 \
+            else (0, 1, 2)
+        stream_words = []
+        for tag in tags:
+            cols = _ss_columns(
+                [base_seed, chunk_index, fam_ids, slots, tag],
+                batch_size,
+            )
+            stream_words.append(
+                None if cols is None else _pcg64_seed_words(cols)
+            )
+        n_tags = len(tags)
+
+        def _stream(tag: int, slot: int, fam: int):
+            words = stream_words[tag]
+            if words is None:
+                return np.random.default_rng(
+                    np.random.SeedSequence(
+                        (base_seed, chunk_index, fam, slot, tag)
+                    )
+                )
+            return _row_pool(n_tags).seeded(tag, *words[slot])
+
+        chunk: list[np.ndarray | None] = [None] * batch_size
+
+        support_protected = np.zeros(batch_size, dtype=bool)
+        native_no_pad = np.zeros(batch_size, dtype=bool)
+
+        def _build_family_group(fam: int, idx: np.ndarray) -> None:
+            family = _FAMILIES[fam]
+            preserve_nonnegative = family in {
+                "sticky_station",
+                "epi_decay",
+                "multiplicative",
+                "physical_sensors",
+                "seasonal_counts",
+                "intermittent",
+
+                "grid_flow",
+                "spiky_price",
+                "price_shock",
+
+                "tidal_constituents",
+
+                "flow_recession",
+
+                "rate_counts",
+
+                "dispersion_counts",
+
+                "dispatch_blocks",
+
+                "ops_diurnal_traffic",
+                "ops_saturating_feedback",
+                "ops_counter_reset",
+                "ops_latency_queue",
+                "ops_rate_plateau",
+                "epi_renewal",
+                "admin_reporting_counts",
+                "clinical_bounded_vitals",
+
+                "met_bounded_atom", "met_wind_speed",
+                "wet_dry_intermittent", "regime_dwell_zerosparse",
+                "hawkes_marked", "transport_flow",
+                "retail_promo_intermittent",
+
+                "energy_load_price_solar",
+
+                "heavy_traffic_counts",
+                "sparse_admin_counts",
+                "storm_outage_counts",
+                "gauge_rain",
+                "store_sales_panel",
+                "sales_promo_stockout_panel",
+                "web_session_attr",
+                "broadband_path_attr",
+                "cluster_job_attr",
+                "settle_hold",
+                "web_traffic_plateau",
+                "biz_day_counts",
+                "weekly_web_counts",
+                "weekly_demand",
+            }
+            clean = family in _CLEAN
+            preserve_integers = family in {
+                "sticky_station",
+                "epi_decay",
+                "seasonal_counts",
+                "intermittent",
+                "rate_counts",
+                "dispersion_counts",
+                "dispatch_blocks",
+
+                "epi_renewal",
+                "admin_reporting_counts",
+                "ops_counter_reset",
+                "ops_diurnal_traffic",
+                "retail_promo_intermittent",
+                "heavy_traffic_counts",
+                "sparse_admin_counts",
+                "storm_outage_counts",
+                "sales_promo_stockout_panel",
+                "web_session_attr",
+                "cluster_job_attr",
+                "web_traffic_plateau",
+                "biz_day_counts",
+                "weekly_web_counts",
+            }
+            allow_reverse = family in {
+                "trend_seasonal_ar",
+                "multiplicative",
+                "spectral_gp",
+                "long_memory",
+            }
+            allow_range_artifacts = family != "integrated"
+
+            anchor = int(idx[0])
+            policy = self._support_contract
+            builder = builders[fam]
+            metadata_builder = getattr(builder, "with_metadata", None)
+            flags = None
+            if metadata_builder is not None and (
+                policy["restore_bounded_native"] or policy["guard_mixing"]
+                or self._temporal_integrity["native_integer_flags"]
+            ):
+                block, flags = metadata_builder(
+                    _stream(0, anchor, fam), int(idx.size), max_len
+                )
+            else:
+                block = builder(_stream(0, anchor, fam), int(idx.size), max_len)
+            bounded_mask = _native_bounded_mask(flags, int(idx.size))
+            if (preserve_integers and flags is not None
+                    and self._temporal_integrity["native_integer_flags"]):
+                preserve_integers = np.asarray(flags["integer"], dtype=bool)
+                if preserve_integers.shape != (idx.size,):
+                    raise ValueError("native integer flags must have one value per row")
+            restore_mask = bounded_mask & policy["restore_bounded_native"]
+
+            native_rows = block[restore_mask].copy() if restore_mask.any() else None
+            signed_family = family in _NATIVE_SIGNED_FAMILIES
+            clip_nonnegative = preserve_nonnegative and not (
+                policy["restore_signed"] and signed_family
+            )
+            if policy["guard_mixing"]:
+                support_protected[idx] = bounded_mask | signed_family
+            native_no_pad[idx] = restore_mask
+            if clean:
+                block = _sanitize(block)
+            else:
+                block = _sanitize(
+                    _measurement_artifacts(
+                        _stream(1, anchor, fam),
+                        block,
+                        preserve_nonnegative=preserve_nonnegative,
+                        clip_nonnegative=clip_nonnegative,
+                        repair_degenerate_rollback=policy["repair_degenerate_rollback"],
+                        preserve_integers=preserve_integers,
+                        allow_reverse=allow_reverse,
+                        allow_range_artifacts=allow_range_artifacts,
+                        preserve_pre_gamma_shape=(
+                            (_HARRY_TIDAL_GAMMA_BYPASS
+                             and family == "tidal_constituents")
+                            or (_HARRY_I029_GRID_FLOW_GAMMA_BYPASS
+                                and family == "grid_flow")
+                        ),
+                        **(dict(current_observation, time_warp_rate=0.0,
+                                global_dilation_rate=0.0)
+                           if family in _V444_CLOCK_FAMILIES
+                           else current_observation),
+                    )
+                )
+            if not preserve_nonnegative:
+                post_rng = _stream(2, anchor, fam)
+                block = _apply_nonneg_integer_prior(
+                    post_rng, block,
+                    integer_min_std=parameters[
+                        "nonneg_integer_min_std"
+                    ],
+                    integer_min_std_frac=parameters[
+                        "nonneg_integer_min_std_frac"
+                    ],
+                    integer_frac=parameters[
+                        "nonneg_integer_frac"
+                    ],
+                    flat_level_spread=parameters[
+                        "flat_level_spread"
+                    ],
+                )
+                block = _apply_zero_inflation(post_rng, block)
+
+            if (parameters["tail_rebase_rate"] > 0.0
+                    and family not in ("ops_counter_reset", "pull_counter_ramp", "epi_season_decay", "surveillance_counts",
+                               "epi_renewal", "reported_epi_counts", "epi_decay")):
+                block = _apply_tail_rebase(
+                    _stream(3, anchor, fam), block,
+                    parameters["tail_rebase_rate"],
+                    periodic_continue=True,
+                    preserve_periodic_native=(
+                        _TIDAL_NATIVE_PERIODIC_ENABLED
+                        and family == "tidal_constituents"
+                    ),
+                )
+            block = _apply_unique_idea(
+                family, block, base_seed, chunk_index, fam
+            )
+            if clip_nonnegative:
+                np.maximum(block, 0.0, out=block)
+            if native_rows is not None:
+                block[restore_mask] = native_rows
+            block = _flow_reporting_memory(
+                block, family, base_seed, chunk_index, fam,
+                int(idx[0]), 8, 'rolling', 0.5)
+            for k in range(int(idx.size)):
+                slot = int(idx[k])
+                length = int(lengths[slot])
+                chunk[slot] = np.ascontiguousarray(
+                    block[k, :length], dtype=np.float64
+                )
+
+        groups = []
+        for fam in range(len(_FAMILIES)):
+            fam_idx = np.nonzero(fam_ids == fam)[0]
+            if fam_idx.size:
+                groups.append((fam, fam_idx))
+        if _PRODUCER_WORKERS > 1 and len(groups) > 1:
+            _run_family_groups(_build_family_group, groups)
+        else:
+            for fam, fam_idx in groups:
+                _build_family_group(fam, fam_idx)
+
+        if self._min_len == max_len:
+            mix_rate = parameters["augment.tsmixup"]
+            mixed = np.nonzero(rng.random(batch_size) < mix_rate)[0]
+            mix_alpha = parameters["tsmixup_source_alpha"]
+            mix_scaled = parameters["tsmixup_mean_scale"] >= 0.5
+            for series_i in mixed:
+                source = chunk[series_i]
+                if source is None:
+                    continue
+                n_other = int(rng.integers(1, 3))
+                others = rng.integers(0, batch_size, size=n_other)
+
+                alpha = np.ones(n_other + 1)
+                alpha[0] = mix_alpha
+                weights = rng.dirichlet(alpha)
+                if self._support_contract["guard_mixing"] and not _mixup_support_compatible(
+                    support_protected, int(series_i), others
+                ):
+                    continue
+                parts = [source]
+                valid = True
+                for other_i in others:
+                    other = chunk[int(other_i)]
+                    if other is None:
+                        valid = False
+                        break
+                    parts.append(other)
+                if not valid:
+                    continue
+                if mix_scaled:
+
+                    unit = []
+                    for part in parts:
+                        s = float(_v2_mean(np.abs(part)))
+                        unit.append(part / s if s > 1e-12 else part)
+                    source_scale = float(_v2_mean(np.abs(source)))
+                    combined = weights[0] * unit[0]
+                    for j, part in enumerate(unit[1:]):
+                        combined = combined + weights[j + 1] * part
+                    if source_scale > 1e-12:
+                        combined = combined * source_scale
+                else:
+                    combined = weights[0] * parts[0]
+                    for j, part in enumerate(parts[1:]):
+                        combined = combined + weights[j + 1] * part
+                chunk[series_i] = _sanitize(combined)
+
+        pad_rate = parameters["augment.pad_prefix"]
+        padded = np.nonzero(rng.random(batch_size) < pad_rate)[0]
+        for series_i in padded:
+            series = chunk[series_i]
+            if series is None or series.size < 8:
+                continue
+            cut = int(rng.integers(series.size // 8, 3 * series.size // 4))
+            if native_no_pad[series_i]:
+                continue
+            series[:cut] = series[cut]
+
+        if self._renewal_persistence["rate"] > 0.0:
+            _apply_renewal_persistence(
+                chunk, fam_ids, base_seed, chunk_index,
+                self._renewal_persistence,
+            )
+
+        if _CAS1_INTERIOR_REBASE_RATE > 0.0:
+            for fam, fam_idx in groups:
+                family = _FAMILIES[fam]
+                if family == "ops_counter_reset":
+                    continue
+                parent_rows = np.stack(
+                    [chunk[int(i)] for i in fam_idx]
+                )
+                rows = parent_rows.copy()
+                for episode_i, endpoint in enumerate(
+                        _CAS1_INTERIOR_REBASE_ENDPOINTS):
+                    episode_rng = np.random.default_rng(
+                        np.random.SeedSequence(
+                            (base_seed, chunk_index, fam,
+                             _CAS1_INTERIOR_REBASE_STAGE + episode_i)
+                        )
+                    )
+                    proposed = _apply_interior_rebase_episode(
+                        episode_rng, parent_rows.copy(),
+                        _CAS1_INTERIOR_REBASE_RATE,
+                        endpoint=endpoint,
+                        periodic_continue=True,
+                        preserve_periodic_native=(
+                            _TIDAL_NATIVE_PERIODIC_ENABLED
+                            and family == "tidal_constituents"
+                        ),
+                        route_mode=_CAS1_INTERIOR_REBASE_ROUTE,
+                    )
+                    changed = proposed != parent_rows
+                    rows[changed] = proposed[changed]
+                for k, slot in enumerate(fam_idx):
+                    chunk[int(slot)] = rows[k]
+        for arr in chunk[:take]:
+
+            if arr is None:
+                raise RuntimeError("internal: unfilled series slot")
+            yield arr
+        produced += take
+        emitted_points += chunk_points
+        chunk_index += 1
