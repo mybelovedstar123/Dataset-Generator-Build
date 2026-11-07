@@ -7604,21 +7604,7 @@ def _ar1_batch(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
 
 @njit(cache=False, fastmath=False)
 def _ar2_kernel(innov: np.ndarray, a1: np.ndarray, a2: np.ndarray) -> np.ndarray:
-    # scipy.signal.lfilter implements a *transposed* Direct Form II, not the
-    # textbook y[t] = x[t] + a1 y[t-1] + a2 y[t-2]. That textbook form is
-    # mathematically the same filter and was the first thing tried; against
-    # lfilter it drifted (and on poles near the unit circle the states
-    # diverged). The transposed update below is what scipy actually runs for
-    # b=[1], a=[1, -a1, -a2], zi=0:
-    #
-    #     y  = x + z1
-    #     z1 = a1 y + z2
-    #     z2 = a2 y
-    #
-    # Checked bit-identical to lfilter over 400 random rows, 5 edge-pole rows
-    # (including 1.8/-0.81), and 100 family-like draws. fastmath stays off so
-    # the compiler cannot reassociate the three assignments. The function
-    # draws nothing, so the RNG stream is untouched.
+
     n, L = innov.shape
     x = np.empty((n, L), dtype=np.float64)
     for i in range(n):
@@ -7633,7 +7619,6 @@ def _ar2_kernel(innov: np.ndarray, a1: np.ndarray, a2: np.ndarray) -> np.ndarray
             x[i, t] = y
     return x
 
-
 def _ar2_batch(innov: np.ndarray, a1: np.ndarray, a2: np.ndarray) -> np.ndarray:
     if innov.shape[0] == 0:
         return np.empty_like(innov, dtype=np.float64)
@@ -7642,7 +7627,6 @@ def _ar2_batch(innov: np.ndarray, a1: np.ndarray, a2: np.ndarray) -> np.ndarray:
         np.ascontiguousarray(np.reshape(a1, -1), dtype=np.float64),
         np.ascontiguousarray(np.reshape(a2, -1), dtype=np.float64),
     )
-
 
 def _prefix_mean_std(
     x: np.ndarray, *, calibration_points: int = 512
@@ -7653,7 +7637,6 @@ def _prefix_mean_std(
     std = prefix.std(axis=1, keepdims=True)
     return mean, np.where(std < 1e-12, 1.0, std)
 
-
 def _prefix_standardize(
     x: np.ndarray, *, center: bool = True, calibration_points: int = 512
 ) -> np.ndarray:
@@ -7662,15 +7645,7 @@ def _prefix_standardize(
     )
     return (x - mean) / std if center else x / std
 
-
 def _median_1d(x: np.ndarray):
-    """``np.median(x)`` for a non-empty 1-D float array, without the wrapper.
-
-    np.median spends most of its time in python: it re-derives the kth list,
-    slices, routes through np.mean and then re-checks for NaN. Selecting the
-    same kth set and averaging the same two order statistics is the identical
-    computation for a third of the cost.
-    """
     n = x.size
     half = n // 2
     if n & 1:
@@ -7679,21 +7654,16 @@ def _median_1d(x: np.ndarray):
     else:
         part = np.partition(x, (half - 1, half, -1))
         result = (part[half - 1] + part[half]) / 2.0
-    # np.median reports NaN whenever one is present; after partitioning with
-    # kth=-1 a NaN always lands last.
+
     largest = part[-1]
     return largest if np.isnan(largest) else result
 
-
 def _lerp(a: np.ndarray, b: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """NumPy's numerically stable lerp; needed for bit-identical quantiles."""
     diff = b - a
     out = a + diff * t
     return np.where(t >= 0.5, b - diff * (1.0 - t), out)
 
-
 def _quantile_rows(a: np.ndarray, q: np.ndarray) -> np.ndarray:
-    """``np.quantile(row, qi)`` for each row (linear method, bit-identical)."""
     n = a.shape[1]
     if n <= 1:
         return a[:, 0].astype(np.float64, copy=True)
@@ -7707,20 +7677,14 @@ def _quantile_rows(a: np.ndarray, q: np.ndarray) -> np.ndarray:
     nan_row = np.isnan(a).any(axis=1)
     if nan_row.any():
         out = np.where(nan_row, np.nan, out)
-    # -0.0 and 0.0 compare equal but have different bits, and that is the only
-    # way two equal float64s can differ, so a tie between them is the one case
-    # where np.sort may select a different representation than the partition
-    # np.quantile uses. Rows holding a negative zero take the exact path;
-    # integer-rounded rows produce them via np.rint of small negatives.
+
     zero_tie = np.nonzero((np.signbit(a) & (a == 0.0)).any(axis=1))[0]
     for i in zero_tie:
         out[i] = np.quantile(a[i], q[i])
     return out
 
-
 @lru_cache(maxsize=16)
 def _linspace_segments(L: int, k: int) -> tuple:
-    """Slice bounds and time offsets per knot interval; fixed by (L, k) alone."""
     t = np.arange(L, dtype=np.float64)
     knot_t = np.linspace(0.0, float(L - 1), k)
     pos = t * (k - 1) / (L - 1)
@@ -7737,15 +7701,7 @@ def _linspace_segments(L: int, k: int) -> tuple:
         for j in range(k - 1)
     )
 
-
 def _interp_linspace_rows(knot_a: np.ndarray, L: int) -> np.ndarray:
-    """``np.interp(arange(L), linspace(0, L-1, k), knot_a[i])`` for every row.
-
-    On a uniform knot grid the result is linear over each of the k-1 intervals,
-    so every interval is one contiguous slice. Indexing the knots with a
-    length-L index vector instead would cost several (rows, L) gathers and is
-    slower than the per-row ``np.interp`` loop this replaces.
-    """
     out = np.empty((knot_a.shape[0], L), dtype=np.float64)
     for j, start, stop, toff, dt in _linspace_segments(L, knot_a.shape[1]):
         slope = ((knot_a[:, j + 1] - knot_a[:, j]) / dt)[:, None]
@@ -7753,9 +7709,7 @@ def _interp_linspace_rows(knot_a: np.ndarray, L: int) -> np.ndarray:
     out[:, -1] = knot_a[:, -1]
     return out
 
-
 def _median_rows(a: np.ndarray) -> np.ndarray:
-    """``np.median(a, axis=1, keepdims=True)`` for a 2-D float array."""
     n = a.shape[1]
     half = n // 2
     if n & 1:
@@ -7764,25 +7718,16 @@ def _median_rows(a: np.ndarray) -> np.ndarray:
     else:
         part = np.partition(a, (half - 1, half, n - 1), axis=1)
         result = (part[:, half - 1] + part[:, half]) / 2.0
-    # Match _median_1d/np.median: any NaN partitions to the last column and
-    # makes that row's result NaN.
+
     largest = part[:, -1]
     result = np.where(np.isnan(largest), largest, result)
     return result[:, None]
 
-
 @lru_cache(maxsize=4)
 def _time_index(L: int) -> np.ndarray:
-    """Shared read-only ``arange(L)`` row vector.
-
-    Nearly every builder opens by rebuilding this, and at n=1 the allocation is
-    a measurable share of the row. Read-only so an accidental in-place write
-    fails loudly instead of corrupting every later row.
-    """
     t = np.arange(L, dtype=np.float64)[None, :]
     t.flags.writeable = False
     return t
-
 
 @lru_cache(maxsize=4)
 def _seasonal_basis(L: int) -> tuple[np.ndarray, np.ndarray]:
@@ -7794,7 +7739,6 @@ def _seasonal_basis(L: int) -> tuple[np.ndarray, np.ndarray]:
         / _SEASONAL_PERIODS[:, None]
     )
     return np.sin(angle), np.cos(angle)
-
 
 def _seasonal(rng: np.random.Generator, n: int, L: int, k_max: int = 3) -> np.ndarray:
 
@@ -7817,13 +7761,11 @@ def _seasonal(rng: np.random.Generator, n: int, L: int, k_max: int = 3) -> np.nd
         amp = rng.uniform(0.2, 2.0, size=n)[:, None]
         phase = rng.uniform(0.0, 2.0 * np.pi, size=n)[:, None]
 
-
         basis_idx = np.searchsorted(_SEASONAL_PERIODS, per[active, 0])
         component = amp[active] * (
             sin_basis[basis_idx] * np.cos(phase[active])
             + cos_basis[basis_idx] * np.sin(phase[active])
         )
-
 
         modulated = np.nonzero((k > j) & (rng.random(n) < 0.35))[0]
         if modulated.size:
@@ -7857,9 +7799,7 @@ def _seasonal(rng: np.random.Generator, n: int, L: int, k_max: int = 3) -> np.nd
         out[active] += component
     return out
 
-
 def _sparse_jumps(rng: np.random.Generator, n: int, L: int, rate: float, scale) -> np.ndarray:
-
 
     mask = rng.random((n, L)) < rate
     mask[:, 0] = False
@@ -7868,48 +7808,15 @@ def _sparse_jumps(rng: np.random.Generator, n: int, L: int, rate: float, scale) 
     if rows.size == 0:
         return jumps
 
-
     s = np.asarray(scale, dtype=np.float64)
     event_scale = s if s.ndim == 0 else s.reshape(n)[rows]
     jumps[rows, cols] = rng.normal(0.0, 1.0, size=rows.size) * event_scale
     return jumps
 
-
 def _relax_high_plateaus(
     rng: np.random.Generator, out: np.ndarray, rate: float,
     calibration_len: int,
 ) -> None:
-    """Let a row's peaks decay instead of sitting flat at the maximum.
-
-    Every other lever in this round adds exact repeats, because that is what the
-    evidence supports. This one removes them, from the one place the pool says
-    they do not belong. Held samples in the pool cluster hard at the bottom of a
-    series' range and are entirely absent from the top of it: the top-decile lift
-    is 0.00 for web_cloudops, healthcare and energy alike, so those series never
-    repeat a value near their maximum. Our corpus repeats near its maximum as
-    readily as anywhere else, at a lift of 0.94, which trains the model to expect
-    a peak to hold when the real thing relaxes immediately. Peaks are where the
-    forecast error concentrates, so it is an expensive place to be wrong.
-
-    Rows are excluded when a large share of their samples already sit in the top
-    decile. That is capacity saturation -- a full dock, a link at line rate --
-    where the plateau is the physics and transport does show it, at a top-decile
-    lift of 0.96. What is left are the spiky rows, where a flat maximum is an
-    artefact of our own hold and quantize stages.
-
-    The relaxation is exponential from the first repeated sample, so the peak
-    keeps its onset and loses only the flat shoulder behind it.
-
-    DORMANT, and the measurement is the reason: 74% of rows pass the saturation
-    guard but the median one holds a single relaxable sample and the mean row only
-    1.4% of them, because top-decile repeats are rare in absolute terms however
-    unbalanced the lift looks. There is not enough mass here to move a score
-    against a 0.0027 seed-noise floor, so no arm of this round sets the rate. It
-    stays wired and verified as a no-op at 0.0 so the next round need not
-    rediscover this; biasing the censor's bound turned out to remove far more
-    ceiling plateau than this can, taking the corpus lift from 0.94 to 0.79 on its
-    own.
-    """
     n, L = out.shape
     if L < 3:
         return
@@ -7920,8 +7827,7 @@ def _relax_high_plateaus(
     lo = x[:, :calibration_len].min(axis=1, keepdims=True)
     span = x[:, :calibration_len].max(axis=1, keepdims=True) - lo
     high = x >= lo + 0.9 * span
-    # Saturated rows keep their plateaus; 0.15 is above nature's and transport's
-    # typical top-decile occupancy and below that of a clipped or docked series.
+
     live = (span[:, 0] > 1e-12) & (high.mean(axis=1) < 0.15)
     if not live.any():
         return
@@ -7929,9 +7835,7 @@ def _relax_high_plateaus(
     held[:, 1:] = np.diff(x, axis=1) == 0.0
     mark = held & high & live[:, None]
     idx = np.arange(L, dtype=np.int64)
-    # Distance back to the last sample that is not a high repeat, so k counts
-    # 1, 2, 3 ... along a plateau and is exactly 0 everywhere else. The decay
-    # term then vanishes off the plateaus without needing a mask.
+
     anchor = np.where(~mark, idx[None, :], 0)
     np.maximum.accumulate(anchor, axis=1, out=anchor)
     k = idx[None, :] - anchor
@@ -7939,10 +7843,8 @@ def _relax_high_plateaus(
     lam = rng.uniform(0.30, 1.20, size=(rows.size, 1))
     out[rows] = x - amplitude * (1.0 - np.exp(-lam * k))
 
-
 @njit(cache=False, fastmath=False)
 def _gamma_warp_apply(out: np.ndarray, rows: np.ndarray, gamma: np.ndarray) -> None:
-    """In-place per-row gamma warp; bit-identical to the vectorized NumPy form."""
     for r in range(rows.size):
         i = rows[r]
         g = gamma[r]
@@ -7974,18 +7876,15 @@ def _gamma_warp_apply(out: np.ndarray, rows: np.ndarray, gamma: np.ndarray) -> N
                     out[i, t] = hi
                 else:
                     value = lo + span * (1.0 - (1.0 - u) ** g)
-                    # Cancellation can overshoot hi by an ULP when the power
-                    # rounds to zero. Enforce the mathematical range exactly.
+
                     if value < lo:
                         value = lo
                     elif value > hi:
                         value = hi
                     out[i, t] = value
             else:
-                # Keep the complete original arithmetic for unmirrored and
-                # sub-floor-span rows, including exactly constant inputs.
-                out[i, t] = lo + span * (u ** g)
 
+                out[i, t] = lo + span * (u ** g)
 
 def _measurement_artifacts(
     rng: np.random.Generator,
@@ -8024,15 +7923,12 @@ def _measurement_artifacts(
     nonneg_skip_range_artifacts: float = 0.0,
 ) -> np.ndarray:
 
-
     if clip_nonnegative is None:
         clip_nonnegative = preserve_nonnegative
     original = np.asarray(block, dtype=np.float64)
-    # The legacy chain mutates its input. Keep a real rollback reference only
-    # when requested; the all-off control remains byte-identical to V144.
+
     working = original.copy() if repair_degenerate_rollback else original
-    # TiRex-2 stage-1 / time-discretisation portables run BEFORE the existing
-    # censor/quantize/hold chain so those still see the post-augment series.
+
     out = _tirex2_marginal_augments(
         rng,
         working,
@@ -8045,20 +7941,15 @@ def _measurement_artifacts(
     )
     n, L = out.shape
 
-    # 191 p46: per-row gamma power warp of the amplitude range, BEFORE
-    # censor/quantize/hold. Helps sales/energy shapes that are mostly
-    # monotone in level but need a heavier or lighter mid-range.
     if gamma_warp_rate > 0.0:
-        # The conditional selection quantile is uniform and independent of
-        # the existing exponent draw. Reuse it; do not shift downstream RNG.
+
         warp_u = rng.random(n)
         warp_rows = np.nonzero(warp_u < gamma_warp_rate)[0]
         if warp_rows.size:
             gamma = rng.uniform(1.5, 3.2, size=warp_rows.size)
             mirrored = warp_u[warp_rows] < gamma_warp_rate * 0.25
             gamma = np.where(mirrored, -gamma, gamma)
-            # Consume the original selection/exponent draws in both arms.
-            # Other observation maps and the caller RNG stream stay intact.
+
             if not preserve_pre_gamma_shape:
                 _gamma_warp_apply(
                     out,
@@ -8077,10 +7968,6 @@ def _measurement_artifacts(
         invert = rng.random(n) < 0.04
         out[invert] *= -1.0
 
-    # 191 p45: when the family owns nonnegative semantics, zero the rates of
-    # censor / quantize / hold / hold-blocks. Energy (grid_flow, spiky_price,
-    # price_shock), web ops counts, and sales intermittent all land here —
-    # the domains 191 wins vs king. Signed econ families keep the full chain.
     range_scale = (
         0.0
         if (nonneg_skip_range_artifacts > 0.5 and preserve_nonnegative)
@@ -8124,13 +8011,9 @@ def _measurement_artifacts(
         if clip_nonnegative:
             np.maximum(out, 0.0, out=out)
 
-
     censor_rows = np.nonzero(rng.random(n) < censor_rate)[0]
     if censor_rows.size:
-        # Same interleaved draws as the old per-row loop:
-        # uniform(q) then random() for the bound, once per selected row.
-        # rng.uniform(lo, hi) is (hi-lo)*random()+lo, so 2*N sequential
-        # random() values reproduce that stream exactly.
+
         pair = rng.random(2 * censor_rows.size)
         qs = censor_q_lo + (censor_q_hi - censor_q_lo) * pair[0::2]
         uppers = pair[1::2] < censor_upper_frac
@@ -8145,9 +8028,7 @@ def _measurement_artifacts(
 
     quantized = np.nonzero(rng.random(n) < quantize_rate)[0]
     if quantized.size:
-        # TiRex-2 App.F: value discretisation in uniform / quantile / power-law
-        # regimes. Uniform (legacy) keeps the prior behaviour; the other two
-        # densify levels near typical values or in the heavy tail.
+
         if allow_range_artifacts:
             x = out[quantized]
             calibration = x[:, :calibration_len]
@@ -8158,8 +8039,7 @@ def _measurement_artifacts(
             levels = np.ones(quantized.size, dtype=np.int64)
             ps = np.empty(quantized.size, dtype=np.float64)
             for i in np.nonzero(live)[0]:
-                # Degenerate rows still consume no extra RNG, matching the
-                # original continue-before-draw.
+
                 if rng.random() < nonuniform_quantize_frac:
                     modes[i] = int(rng.integers(1, 3))
                 else:
@@ -8187,7 +8067,6 @@ def _measurement_artifacts(
                 x[i] = edges[idx]
             out[quantized] = x
 
-
     held = np.nonzero(rng.random(n) < regular_hold_rate)[0]
     if held.size:
         factors = _HOLD_FACTORS[
@@ -8199,7 +8078,6 @@ def _measurement_artifacts(
                 out[rows] = np.repeat(
                     out[rows, ::factor], factor, axis=1
                 )[:, :L]
-
 
     irregular = np.nonzero(rng.random(n) < irregular_hold_rate)[0]
     if irregular.size and L > 1:
@@ -8218,16 +8096,11 @@ def _measurement_artifacts(
             out[irregular], source_index, axis=1
         )
 
-    # Last of the value stages, so it sees the plateaus the holds and the
-    # quantizer just created rather than only the ones a family emitted.
     if peak_transient_rate > 0.0 and allow_range_artifacts:
         _relax_high_plateaus(
             rng, out, peak_transient_rate, calibration_len
         )
 
-    # 191 p44: random hold-blocks (copy a short prefix across a contiguous
-    # window). Gated by range_scale so nonnegative families that skip
-    # censor/quantize also skip these synthetic flats.
     if hold_block_rate > 0.0 and L > 32:
         for row in np.nonzero(rng.random(n) < hold_block_rate)[0]:
             for _ in range(int(rng.integers(1, 4))):
@@ -8235,9 +8108,6 @@ def _measurement_artifacts(
                 start = int(rng.integers(0, max(1, L - length)))
                 out[row, start:start + length] = out[row, start]
 
-    # 191 p43: slow multiplicative amplitude drift AFTER the artifact chain.
-    # Distinct from TiRex amp_trend (which runs first and recentres about the
-    # median): this is a pure level scale so nonnegative floors stay floors.
     if post_amp_drift_rate > 0.0 and L > 1:
         drift_rows = np.nonzero(rng.random(n) < post_amp_drift_rate)[0]
         if drift_rows.size:
@@ -8270,11 +8140,9 @@ def _measurement_artifacts(
         if clip_nonnegative:
             out = np.maximum(out, 0.0)
 
-
     degenerate = out[:, :calibration_len].std(axis=1) < 1e-9
     out[degenerate] = original[degenerate]
     return out
-
 
 @njit(cache=False, fastmath=False)
 def _rk4_flow_kernel_p(x0, sys_id, dt, L, burn, p0, p1, p2, w0, w1, w2):
@@ -8287,13 +8155,13 @@ def _rk4_flow_kernel_p(x0, sys_id, dt, L, burn, p0, p1, p2, w0, w1, w2):
             kx = np.empty(4); ky = np.empty(4); kz = np.empty(4)
             bx = a0; by = a1; bz = a2
             for k in range(4):
-                if sys_id == 0:      # Lorenz(sigma=p0, rho=p1, beta=p2)
+                if sys_id == 0:
                     dx = p0*(by-bx); dy = bx*(p1-bz)-by; dz = bx*by-p2*bz
-                elif sys_id == 1:    # Rossler(a=p0, b=p1, c=p2)
+                elif sys_id == 1:
                     dx = -by-bz; dy = bx+p0*by; dz = p1+bz*(bx-p2)
-                elif sys_id == 2:    # Thomas(b=p0)
+                elif sys_id == 2:
                     dx = np.sin(by)-p0*bx; dy = np.sin(bz)-p0*by; dz = np.sin(bx)-p0*bz
-                else:                # Halvorsen(a=p0)
+                else:
                     dx = -p0*bx-4*by-4*bz-by*by; dy = -p0*by-4*bz-4*bx-bz*bz; dz = -p0*bz-4*bx-4*by-bx*bx
                 kx[k] = dx; ky[k] = dy; kz[k] = dz
                 h = dt if k == 2 else dt*0.5
@@ -8313,10 +8181,7 @@ def _rk4_flow_kernel_p(x0, sys_id, dt, L, burn, p0, p1, p2, w0, w1, w2):
                 out[i, step-burn] = w0*a0 + w1*a1 + w2*a2
     return out
 
-
 def _rk4_chaotic(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """4-flow bank with per-batch parameter randomization (dysts-style regimes), dt
-    jitter, and OBS_MODE observation (x-coordinate or random unit direction)."""
     out = np.empty((n, L), dtype=np.float64)
     done = 0
     while done < n:
@@ -8352,14 +8217,12 @@ def _rk4_chaotic(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         done += m
     return out
 
-
 def _trend_seasonal_ar(rng: np.random.Generator, n: int, L: int, *,
                        hi_frac: float = 0.25, exc_lo: float = 0.4,
                        exc_hi: float = 3.0, clean_frac: float = 0.4,
                        clean_lo: float = 0.02, clean_hi: float = 0.12) -> np.ndarray:
     t = _time_index(L)
     level = rng.normal(0.0, 1.0, size=(n, 1))
-
 
     _hi = rng.random((n, 1)) < hi_frac
     exc = np.where(_hi, rng.normal(0.0, exc_hi, size=(n, 1)),
@@ -8376,9 +8239,7 @@ def _trend_seasonal_ar(rng: np.random.Generator, n: int, L: int, *,
     innov = rng.normal(0.0, 1.0, size=(n, L)) * sigma
     return series + _ar1_batch(innov, phi)
 
-
 def _regime_shift(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-
 
     level = np.cumsum(_sparse_jumps(rng, n, L, rate=3.0 / L, scale=2.0), axis=1)
     log_vol = np.cumsum(_sparse_jumps(rng, n, L, rate=3.0 / L, scale=0.5), axis=1)
@@ -8386,13 +8247,11 @@ def _regime_shift(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     noise = rng.normal(0.0, 1.0, size=(n, L)) * vol
     seas = _seasonal(rng, n, L, k_max=2) * rng.uniform(0.0, 1.0, size=(n, 1))
 
-
     slope = rng.normal(0.0, 1.0 / L, size=(n, 1)) + np.cumsum(
         _sparse_jumps(rng, n, L, rate=2.0 / L, scale=4.0 / L), axis=1
     )
     piecewise_trend = np.cumsum(slope, axis=1)
     return level + piecewise_trend + seas + noise
-
 
 def _multiplicative(rng: np.random.Generator, n: int, L: int, *,
                     hi_frac: float = 0.25, exc_lo: float = 0.3, exc_hi: float = 2.0) -> np.ndarray:
@@ -8411,9 +8270,7 @@ def _multiplicative(rng: np.random.Generator, n: int, L: int, *,
     scale = rng.uniform(1.0, 50.0, size=(n, 1))
     return scale * base_level * np.clip(seas, 0.05, None) * np.clip(noise, 0.05, None)
 
-
 def _ar2(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-
 
     p1 = rng.uniform(0.3, 0.98, size=n)
     p2 = rng.uniform(-0.6, 0.6, size=n)
@@ -8423,9 +8280,7 @@ def _ar2(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     burn = 512
     innov = rng.normal(0.0, 1.0, size=(n, L + burn)) * sigma
 
-
     return _ar2_batch(innov, a1, a2)[:, burn:]
-
 
 def _integrated(
     rng: np.random.Generator,
@@ -8435,7 +8290,6 @@ def _integrated(
     heavy_frac: float = 0.25,
     sv_frac: float = 0.30,
 ) -> np.ndarray:
-
 
     order2 = rng.random(n) < 0.35
     drift = rng.normal(0.0, 0.02, size=(n, 1))
@@ -8470,19 +8324,13 @@ def _integrated(
     walk2 = np.cumsum(walk, axis=1)
     o2 = order2[:, None]
 
-
     return np.where(o2, walk2 / max(L, 1), walk)
-
 
 @njit(cache=False, fastmath=False)
 def _threshold_ar_recurse(
     innov, phi_hi, phi_lo, const_hi, const_lo
 ):
-    # Bit-identical rewrite of the original per-timestep numpy loop
-    # (same operation order: (const + (phi * prev)) + innov, then clip),
-    # moved into numba because per-row isolated streams call this builder
-    # with n == 1 and the numpy loop's ~13 ms per-CALL cost is independent
-    # of n. fastmath=False keeps IEEE ordering, so no FMA contraction.
+
     n, total = innov.shape
     x = np.empty((n, total), dtype=np.float64)
     for i in range(n):
@@ -8502,9 +8350,7 @@ def _threshold_ar_recurse(
             prev = v
     return x
 
-
 def _threshold_ar(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-
 
     phi_hi = rng.uniform(0.3, 0.9, size=n)
     phi_lo = rng.uniform(-0.9, 0.3, size=n)
@@ -8517,9 +8363,7 @@ def _threshold_ar(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     x = _threshold_ar_recurse(innov, phi_hi, phi_lo, const_hi, const_lo)
     return x[:, burn:]
 
-
 def _chaotic(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-
 
     use_sine = rng.random(n) < 0.5
     r_log = rng.uniform(3.6, 4.0, size=n)
@@ -8540,9 +8384,7 @@ def _chaotic(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         x[:, t] = cur
     return _prefix_standardize(x)
 
-
 def _spectral_gp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-
 
     embed = 2 * L
     f = np.fft.rfftfreq(embed)[None, :]
@@ -8553,7 +8395,6 @@ def _spectral_gp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     x = np.fft.irfft(z * np.sqrt(envelope), n=embed, axis=1)[:, :L]
     return _prefix_standardize(x)
 
-
 def _long_memory(
     rng: np.random.Generator,
     n: int,
@@ -8562,27 +8403,11 @@ def _long_memory(
     beta_lo: float = -0.6,
     beta_hi_end: float = 2.4,
 ) -> np.ndarray:
-    """Gaussian noise shaped to a prescribed spectral slope, 1/f^beta.
-
-    The slope range is the knob. Measured on the pool, the corpus spans beta from
-    -0.17 to 3.13 at the 1st and 99th percentiles, but nature reaches 3.78 and
-    web_cloudops reaches -1.05, so 11% of nature series are steeper than anything
-    the corpus emits and 21% of web_cloudops series are flatter. Steep slopes are
-    strongly persistent smooth signals; negative slopes are blue noise, which is
-    anti-correlated and no AR family here produces. Widening this range is the
-    cheapest way to cover both, because the mechanism is already exact -- the
-    slope is imposed in the frequency domain rather than approximated by a
-    recurrence.
-
-    Draw counts do not depend on the bounds, so the stream is unchanged at any
-    setting and the defaults reproduce the previous hardcoded range.
-    """
     embed = 2 * L
     f = np.fft.rfftfreq(embed)
     safe_f = np.maximum(f, 1.0 / embed)[None, :]
     beta = rng.uniform(beta_lo, beta_hi_end, size=(n, 1))
     amp = safe_f ** (-0.5 * beta)
-
 
     multiscale = rng.random((n, 1)) < 0.4
     split_idx = rng.integers(8, max(9, f.size // 3), size=(n, 1))
@@ -8600,15 +8425,12 @@ def _long_memory(
         x[integrate] = np.cumsum(x[integrate], axis=1)
     return _prefix_standardize(x)
 
-
 def _ou_stochastic_vol(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-
 
     switch_rate = np.exp(rng.uniform(np.log(0.001), np.log(0.15), size=(n, 1)))
     switches = rng.random((n, L)) < switch_rate
     switches[:, 0] = rng.random(n) < 0.5
     regime = np.bitwise_and(np.cumsum(switches, axis=1), 1).astype(np.int8)
-
 
     slow = rng.random((n, 1)) < 0.5
     phi = np.where(
@@ -8649,7 +8471,6 @@ def _ou_stochastic_vol(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     heavy = np.nonzero(rng.random(n) < 0.35)[0]
     if heavy.size:
 
-
         eps[heavy] = (
             rng.standard_t(4.0, size=(heavy.size, L)) / np.sqrt(2.0)
         )
@@ -8674,9 +8495,7 @@ def _ou_stochastic_vol(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     shift = rng.uniform(-100.0, 100.0, size=(n, 1))
     return out * scale + shift
 
-
 def _physical_sensors(rng: np.random.Generator, n: int, L: int, *, native_metadata: bool = False):
-
 
     seasonal = _seasonal(rng, n, L, k_max=2)
     smooth = _spectral_gp(rng, n, L)
@@ -8701,7 +8520,6 @@ def _physical_sensors(rng: np.random.Generator, n: int, L: int, *, native_metada
     pressure = kind == 2
     if pressure.any():
         count = int(pressure.sum())
-
 
         diffusion = np.exp(
             rng.uniform(np.log(0.03), np.log(0.20), size=(count, 1))
@@ -8728,9 +8546,7 @@ def _physical_sensors(rng: np.random.Generator, n: int, L: int, *, native_metada
         return out, flags
     return out
 
-
 def _seasonal_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-
 
     t = _time_index(L)
     period = rng.choice(
@@ -8744,7 +8560,6 @@ def _seasonal_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         4.0 * np.pi * t / period + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
     )
 
-
     calendar = rng.random((n, 1)) < 0.35
     day_period = rng.choice([24, 48, 96, 144], size=(n, 1))
     day_idx = (np.floor_divide(np.arange(L)[None, :], day_period) % 7).astype(np.int64)
@@ -8755,7 +8570,6 @@ def _seasonal_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     excursion = rng.uniform(-0.5, 0.5, size=(n, 1))
     log_rate += excursion * t / max(L - 1, 1)
 
-
     impulses = (
         (rng.random((n, L)) < (2.0 / L))
         * rng.uniform(1.0, 10.0, size=(n, L))
@@ -8765,46 +8579,12 @@ def _seasonal_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     lam = base * np.exp(np.clip(log_rate, -5.0, 5.0)) * (1.0 + burst)
     np.clip(lam, 0.0, 1.0e7, out=lam)
 
-
     overdispersed = rng.random((n, 1)) < 0.5
     shape = rng.uniform(0.5, 4.0, size=(n, 1))
     mixed = lam * rng.gamma(shape, 1.0 / shape, size=(n, L))
     return rng.poisson(np.where(overdispersed, mixed, lam)).astype(np.float64)
 
-
 def _dispersion_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Integer counts whose dispersion is drawn, not inherited from the sampler.
-
-    Every existing count family fixes its dispersion by choosing a distribution:
-    ``_rate_counts`` and ``_seasonal_counts`` are Poisson or Poisson-Gamma, and a
-    Poisson process has variance equal to its mean by construction, so the Fano
-    factor var/mean can only land at or above 1. Their rates are also capped
-    (100 and 3000), which bounds how far the measured factor can travel.
-
-    Measured on the 2026-08-11 pool that is the largest coverage hole in the
-    corpus: 25% of nature's integer series sit *below* the corpus 1st percentile
-    of 0.039, because they are near-deterministic counters -- a level in the
-    thousands carrying a variance of a few -- while energy sits far above instead,
-    median 237 against the corpus median 1.8. Neither tail is reachable by any
-    family here, and no reweighting can create a statistic the mechanisms cannot
-    emit.
-
-    So dispersion becomes a first-class parameter. Draw a target Fano factor and
-    a level, then pick whichever distribution can realise the pair exactly:
-
-        phi < 1   Binomial(N, p),  p = 1 - phi,  N = mu / p
-                  mean = Np = mu,  var = Np(1-p) = mu*phi     underdispersed
-        phi = 1   Poisson(mu)                                 equidispersed
-        phi > 1   NegBinomial(r, q),  r = mu / (phi - 1),  q = r / (r + mu)
-                  mean = mu,  var = mu*(1 + mu/r) = mu*phi    overdispersed
-
-    A seasonal level of relative depth d contributes mu*d^2/2 to the *measured*
-    factor, which at mu=5e4 swamps any sampling phi, so depth and phi are drawn
-    jointly against the target rather than independently: the depth is capped so
-    the level term cannot exceed the target, and the count noise supplies the
-    remainder. Verified against the pool in scripts/proto_dispersion.py, where
-    this reaches 0.001 to 9.1e3 against nature's 0.001 to 2.2e4.
-    """
     t = _time_index(L)
     target = np.exp(rng.uniform(np.log(1.0e-3), np.log(1.0e4), size=(n, 1)))
     level = np.exp(rng.uniform(np.log(0.5), np.log(5.0e4), size=(n, 1)))
@@ -8818,8 +8598,7 @@ def _dispersion_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     phi = np.clip(target - level * depth * depth / 2.0, 1.0e-3, 1.0e4)
 
     season = 1.0 + depth * np.sin(2.0 * np.pi * t / period + phase)
-    # A second harmonic on some rows, so the level is not a pure sinusoid; it is
-    # scaled by the same depth and therefore respects the variance budget above.
+
     second = rng.random((n, 1)) < 0.45
     season += second * (0.35 * depth) * np.sin(
         4.0 * np.pi * t / period + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
@@ -8840,45 +8619,7 @@ def _dispersion_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             out[i] = rng.negative_binomial(r, r / (r + mu[i]))
     return out
 
-
 def _dispatch_blocks(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """An asset that is off at exactly zero, then holds a level when on.
-
-    Scale-free measurement of the pool found energy's real dispersion gap: 28.4% of
-    its integer series sit above our CV^2 ceiling, where CV^2 = var/mean^2 is the
-    dispersion a scale-normalising model can actually see. The raw Fano gap was
-    checked first and largely discarded -- web_cloudops reads 22.2% uncovered on
-    raw Fano but only 7.9% scale-free, so most of that hole was series magnitude,
-    which the metric penalises and the model ignores.
-
-    Splitting energy's integer rows at CV^2 = 3 separates two populations sharing
-    almost nothing. The high group, 28 of 88 rows, runs CV^2 17.9 with 46% exact
-    zeros, 82% held values, max/mean 45, a median at 2% of the mean, and 5% unique
-    values. A median that far below the mean with that few distinct values is not a
-    spiky series with noise on top; it is a *blocky* one: dispatchable generation,
-    curtailment, a plant cycling on and off, a battery charging.
-
-    ``_intermittent`` is the closest existing family and it is the wrong shape.
-    Independent Bernoulli occurrence with gamma magnitudes produces isolated
-    spikes, so it can raise the zero fraction but can never hold a level across a
-    sustained run. Nothing in the other 36 families does either.
-
-    Alternating off and on runs; a heavy-tailed level per on-run, which is what
-    carries CV^2 since a single repeated level would give a two-valued series with
-    CV^2 near 1; optional ramps at the block edges; and either coarse reporting
-    (quantised to a few levels) or mild within-block wander, since a series that is
-    piecewise constant to the sample lands at a third of the archetype's
-    unique-value fraction.
-
-    Built by run rather than by sample. Since the shortest run is 4 steps there can
-    never be more than L // 4 + 2 runs, so every draw a row needs is taken in one
-    vectorised call up front and the runs are expanded with ``repeat``. The obvious
-    formulation walks the row in a Python ``while`` loop, but a row whose off scale
-    sits at the low end of its log-uniform range holds a few hundred runs, each
-    paying scalar-Generator and small-array overhead; that costs roughly ten times
-    what the arithmetic does and it is paid inside the training process's producer
-    thread, where it holds the GIL against the training loop.
-    """
     out = np.zeros((n, L), dtype=np.float64)
     idx = np.arange(L)
     for row in range(n):
@@ -8892,7 +8633,7 @@ def _dispatch_blocks(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         first_on = rng.random() < on_frac
 
         cap = L // 4 + 2
-        # Run i is an on-run when its parity matches the row's opening state.
+
         on_run = (np.arange(cap) % 2 == 0) == bool(first_on)
         hi = np.where(on_run, max(5.0, on_hi), max(5.0, off_hi))
         spans = (4.0 + rng.random(cap) * (hi - 4.0)).astype(np.int64)
@@ -8902,7 +8643,7 @@ def _dispatch_blocks(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         nrun = min(nrun, cap)
         spans = spans[:nrun].copy()
         on_run = on_run[:nrun]
-        # Trim the final run so the runs tile exactly L samples.
+
         spans[nrun - 1] -= int(ends[nrun - 1] - L)
         if spans[nrun - 1] <= 0:
             spans[nrun - 1] = 1
@@ -8920,8 +8661,7 @@ def _dispatch_blocks(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             k = np.maximum((size_of * ramp).astype(np.int64), 1)
             den = np.maximum(k - 1, 1)
             wide = k > 1
-            # linspace(0.2, 1.0, k) at the run head, its mirror at the tail; a
-            # single-sample ramp degenerates to linspace's lone endpoint.
+
             up = np.where(wide, 0.2 + 0.8 * head / den, 0.2)
             down = np.where(wide, 1.0 - 0.8 * (k - 1 - tail) / den, 1.0)
             edge = size_of > 4
@@ -8940,9 +8680,7 @@ def _dispatch_blocks(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         out[row] = val
     return np.clip(np.rint(out), 0.0, None)
 
-
 def _intermittent(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-
 
     t = _time_index(L)
     base_p = rng.uniform(0.03, 0.35, size=(n, 1))
@@ -8963,9 +8701,7 @@ def _intermittent(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     )
     return occur * magnitude
 
-
 def _pulse_outlier(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-
 
     base = _spectral_gp(rng, n, L) * rng.uniform(0.5, 2.0, size=(n, 1))
     base += _seasonal(rng, n, L, k_max=1) * rng.uniform(0.0, 1.0, size=(n, 1))
@@ -8978,7 +8714,6 @@ def _pulse_outlier(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     recovery = _ar1_batch(impulses, rng.uniform(0.75, 0.995, size=n))
     series = base + sharp + recovery
 
-
     starts = rng.random((n, L)) < (2.0 / L)
     starts[:, 0] = False
     for row in range(n):
@@ -8988,12 +8723,10 @@ def _pulse_outlier(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             series[row, start:end] = series[row, start - 1]
     return series
 
-
 _CS_CALM_LO = 192
 _CS_CALM_HI = 1024
 _CS_DYNAMIC_LO = 96
 _CS_DYNAMIC_HI = 512
-
 
 def _conditional_stability(
     rng: np.random.Generator, n: int, L: int, *,
