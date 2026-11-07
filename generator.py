@@ -796,7 +796,6 @@ def profile_trapezoid(rng, n, L, ph):
     tilt = rng.uniform(-0.25, 0.25, size=(n, 1))
     return y * (1.0 + tilt * (f - 0.5))
 
-
 def profile_double_peak(rng, n, L, ph):
     m1 = rng.uniform(0.25, 0.40, size=(n, 1))
     m2 = rng.uniform(0.62, 0.80, size=(n, 1))
@@ -806,7 +805,6 @@ def profile_double_peak(rng, n, L, ph):
     c = np.cos(_cf_prims_TWO_PI * (ph - m1))
     d = np.cos(_cf_prims_TWO_PI * (ph - m2))
     return np.exp(k1 * (c - 1.0)) + h2 * np.exp(k2 * (d - 1.0))
-
 
 def profile_free_periodic(rng, n, L, ph, H=16):
     out = np.zeros((n, L))
@@ -819,19 +817,10 @@ def profile_free_periodic(rng, n, L, ph, H=16):
         out += np.where(h <= nh, 1.0, 0.0) * amp * np.cos(_cf_prims_TWO_PI * h * ph + psi)
     return out
 
-
-SHAPE_PROBS = (0.40, 0.30, 0.15, 0.10, 0.05)  # harmonic / trapezoid / double / warped / freeGP
-
+SHAPE_PROBS = (0.40, 0.30, 0.15, 0.10, 0.05)
 
 def seasonal_profile(rng: np.random.Generator, n: int, L: int, period: np.ndarray,
                      cfg: dict | None = None, allow_drift: bool = True) -> np.ndarray:
-    """Unit-std periodic profile at ``period`` samples, one row per series.
-
-    Shapes: harmonic series, business-hours trapezoid, double von-Mises peak,
-    circle-map-warped variant, free periodic GP.  Optional slow phase drift and
-    genuine period drift (a phase accumulator over a varying instantaneous
-    frequency), which no fixed-grid seasonal model can express.
-    """
     sea = (cfg or {}).get("seasonality", {})
     shape_probs = sea.get("shape_mix", SHAPE_PROBS)
     p_phase = float(sea.get("phase_drift_rate", 0.35))
@@ -865,17 +854,9 @@ def seasonal_profile(rng: np.random.Generator, n: int, L: int, period: np.ndarra
         out[m] = fn(rng, sub, L, (ph_w if use_warp else ph)[m])
     return unit_std(out)
 
-
-# ────────────────────────────── misc processes ─────────────────────────────
-
 def hawkes(rng: np.random.Generator, n: int, L: int, mu: np.ndarray,
            branching: np.ndarray, tau: np.ndarray,
            power_law: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Discrete-time self-exciting arrivals; returns (intensity, counts).
-
-    ``power_law`` rows use four exponential components geometrically spaced over
-    three decades, which approximates a genuine long-memory power-law kernel.
-    """
     K_COMP = 4
     tau = np.asarray(tau, dtype=np.float64).reshape(n, 1)
     br = np.clip(np.asarray(branching, dtype=np.float64).reshape(n, 1), 0.0, 0.95)
@@ -891,7 +872,7 @@ def hawkes(rng: np.random.Generator, n: int, L: int, mu: np.ndarray,
     wts = np.where(pl, w_pl, w_ex)
     taus = np.maximum(taus, 1.0)
     decays = np.exp(-1.0 / taus)
-    # branching ratio n = sum_k alpha_k * tau_k  -> normalise
+
     norm = np.sum(wts * taus, axis=1, keepdims=True)
     alpha = wts * br / np.maximum(norm, 1e-9)
     lam = np.zeros((n, L))
@@ -902,9 +883,7 @@ def hawkes(rng: np.random.Generator, n: int, L: int, mu: np.ndarray,
                np.ascontiguousarray(alpha), u, z, lam, cnt)
     return lam, cnt
 
-
 def decay_convolve(x: np.ndarray, tau: np.ndarray) -> np.ndarray:
-    """Causal exponential smoothing with per-row timescale (via k_arma)."""
     n, L = x.shape
     phi = np.exp(-1.0 / np.maximum(np.asarray(tau, dtype=np.float64).reshape(n, 1), 1e-3))
     out = np.zeros((n, L))
@@ -913,18 +892,10 @@ def decay_convolve(x: np.ndarray, tau: np.ndarray) -> np.ndarray:
              np.ascontiguousarray(x), out)
     return out
 
-
 GAMMA_NORMAL_SHAPE = 60.0
-
 
 def gamma_shape_mix(rng: np.random.Generator, n: int, L: int,
                     k: np.ndarray) -> np.ndarray:
-    """Gamma(k, 1/k) variates (unit mean) with a per-row shape.
-
-    Above ``GAMMA_NORMAL_SHAPE`` the Wilson-Hilferty cube-root transform of a
-    normal is accurate to better than 1e-3 in the body and far cheaper than a
-    rejection sampler; below it we draw exactly.
-    """
     k = np.maximum(np.asarray(k, dtype=np.float64).reshape(n, 1), 1e-3)
     big = k >= GAMMA_NORMAL_SHAPE
     if big.all():
@@ -940,17 +911,9 @@ def gamma_shape_mix(rng: np.random.Generator, n: int, L: int,
     out[idx] = np.maximum((1.0 - c + z * np.sqrt(c)) ** 3, 0.0)
     return out
 
-
 POISSON_NORMAL_LAMBDA = 200.0
 
-
 def nb_counts(rng: np.random.Generator, mean: np.ndarray, k: np.ndarray) -> np.ndarray:
-    """Negative-binomial counts via a Gamma-mixed Poisson (var = mu + mu^2/k).
-
-    Above ``POISSON_NORMAL_LAMBDA`` the Poisson layer is replaced by a
-    continuity-corrected normal (relative error < 1e-3 there, and the
-    over-dispersion that actually shapes the series comes from the Gamma mix).
-    """
     n, L = mean.shape
     lam = np.minimum(np.maximum(mean, 0.0) * gamma_shape_mix(rng, n, L, k), 1e8)
     big = lam > POISSON_NORMAL_LAMBDA
@@ -961,20 +924,12 @@ def nb_counts(rng: np.random.Generator, mean: np.ndarray, k: np.ndarray) -> np.n
     approx = np.maximum(np.floor(lam + np.sqrt(lam) * z + 0.5), 0.0)
     return np.where(big, approx, small)
 
-
 def round_tick(x: np.ndarray, tick: np.ndarray) -> np.ndarray:
     tick = np.maximum(np.asarray(tick, dtype=np.float64).reshape(-1, 1), 1e-300)
     return np.round(x / tick) * tick
 
-
 def human_tick(scale: np.ndarray, rng: np.random.Generator, n: int,
                rel_lo=1e-3, rel_hi=0.2) -> np.ndarray:
-    """A round human tick {1,2,5}x10^k sized relative to a series scale.
-
-    ``rel_lo`` / ``rel_hi`` may be scalars or (n, 1) columns.  Ticks are round
-    human values because that is what real reporting granularity looks like, and
-    a *recurring* tick is learnable in a way an arbitrary quantiser is not.
-    """
     lo = np.broadcast_to(np.asarray(rel_lo, dtype=np.float64).reshape(-1, 1), (n, 1))
     hi = np.maximum(np.broadcast_to(
         np.asarray(rel_hi, dtype=np.float64).reshape(-1, 1), (n, 1)), lo * 1.001)
@@ -985,10 +940,7 @@ def human_tick(scale: np.ndarray, rng: np.random.Generator, n: int,
     mant = np.where(mant < 1.5, 1.0, np.where(mant < 3.5, 2.0, 5.0))
     return mant * (10.0 ** ex)
 
-
 def rolling_agg(x: np.ndarray, k: int, mode: int) -> np.ndarray:
-    """Causal rolling aggregate over the last ``k`` samples (mode 0/1/2/3 =
-    mean/sum/max/min)."""
     n, L = x.shape
     if k <= 1:
         return x
@@ -1015,20 +967,17 @@ def rolling_agg(x: np.ndarray, k: int, mode: int) -> np.ndarray:
             np.minimum(acc, shifted, out=acc)
     return acc
 
-
-# ─────────────────────────── per-row capability flags ──────────────────────
-
 FLAG_DEFAULTS = {
-    "scale_mode": 0,      # 0 free (standardise + offset/scale) | 1 positive | 2 as-is
-    "offset_pref": 0,     # 0 mixture | 1 large offset | 2 zero anchor | 3 sign crossing
-    "integer": False,     # values already lie on a discrete lattice
-    "count": False,       # genuine integer counts (set by the batch builder)
-    "bounded": False,     # has hard bounds that artefacts must not break
-    "positive": False,    # non-negative by construction
-    "quant_boost": 1.0,   # multiplier on the quantisation stage probability
-    "quant_rel_hi": 0.2,  # upper bound on tick/std for the quantiser
-    "obs_boost": 1.0,     # multiplier on every observation-artefact rate
-    "allow_agg": True,    # may participate in structured hierarchical aggregation
+    "scale_mode": 0,
+    "offset_pref": 0,
+    "integer": False,
+    "count": False,
+    "bounded": False,
+    "positive": False,
+    "quant_boost": 1.0,
+    "quant_rel_hi": 0.2,
+    "obs_boost": 1.0,
+    "allow_agg": True,
 }
 
 _FLAG_DTYPE = {
@@ -1038,9 +987,7 @@ _FLAG_DTYPE = {
     "quant_rel_hi": np.float64, "obs_boost": np.float64, "allow_agg": bool,
 }
 
-
 def new_flags(n: int, **over) -> dict:
-    """Per-row capability flags with family overrides."""
     f = {}
     for k, v in FLAG_DEFAULTS.items():
         f[k] = np.full(n, over.get(k, v), dtype=_FLAG_DTYPE[k])
@@ -1049,18 +996,8 @@ def new_flags(n: int, **over) -> dict:
             raise KeyError(f"unknown row flag {k!r}")
     return f
 
-
 def complete_dwell_table(rng, dwell, L, median, sigma, minimum=1.0,
                          heavy=None, pareto_a=None):
-    """Extend only exhausted renewal tables; never tile or freeze the last slot.
-
-    Called after the legacy builder has drawn its carriers/noise, so extending
-    a table cannot move any of those draws. median/sigma have one column for
-    iid durations or two columns for an alternating process. The existing
-    floating dwell law and floor(cumsum) event locations are preserved.
-    Returns affected original row indices, their completed table, and the first
-    invalid legacy sample. Non-exhausted rows consume no extension randomness.
-    """
     end = np.floor(np.cumsum(np.maximum(dwell, 1.0), axis=1)[:, -1]).astype(np.int64)
     rows = np.flatnonzero(end < L)
     if rows.size == 0:
@@ -1071,8 +1008,7 @@ def complete_dwell_table(rng, dwell, L, median, sigma, minimum=1.0,
                           (dwell.shape[0], med.shape[1]))[rows]
     if med.shape[1] not in (1, 2) or np.any(med <= 0) or np.any(sig < 0):
         raise ValueError('invalid native renewal duration parameters')
-    # Every appended duration is >= minimum >= 1. Thus even the shortest
-    # possible draws terminate after at most L extra slots; no probabilistic cap.
+
     while np.any(np.floor(np.cumsum(table, axis=1)[:, -1]) < L):
         width = min(64, max(1, int(np.ceil(L / max(minimum, 1.0))) + 1 - table.shape[1]))
         columns = (table.shape[1] + np.arange(width)) % med.shape[1]
@@ -1089,37 +1025,11 @@ def complete_dwell_table(rng, dwell, L, median, sigma, minimum=1.0,
         table = np.concatenate((table, np.maximum(extra, minimum)), axis=1)
     return rows, table, end[rows]
 
-
-# ═══════════════ chronoforge: cf_cadence ═══════════════
-# Cadence, derived periods, and the length ladder.
-#
-# We do not carry a hard-coded list of integer seasonal periods.  We sample a
-# *cadence* (the wall-clock spacing between samples, matched to the pool's
-# frequency map) and then derive every period physically::
-#
-#     P_day   = 86400 / c            P_week  = 7   * P_day
-#     P_half  = P_day / 2            P_month = 30.436875 * P_day
-#     P_third = P_day / 3            P_year  = 365.2425  * P_day
-#
-# Periods are used as *floats*.  At a daily cadence ``P_month = 30.436875`` is
-# genuinely non-integer, which produces the slow phase drift an integer-30 model
-# cannot reproduce; at an hourly cadence ``P_year = 8765.8`` exceeds the window
-# and correctly enters as a slow trend rather than a cycle.
-#
-# Length is drawn conditional on the cadence class: short evaluation contexts in
-# the real pool come from *daily* feeds, so our short training series carry daily
-# structure rather than truncated hourly structure.  Every length is an exact
-# multiple of 32 (the trainer buckets by ``p = L // 32`` and discards the
-# remainder, so a non-multiple silently throws away token budget).
-
-
-# Cadences (seconds between samples) matched to the pool's FREQ_MAP.
 FINE_SECONDS = np.array([30, 60, 150, 300, 360, 600, 900, 1800, 3600], dtype=np.float64)
 COARSE_SECONDS = np.array([28800, 86400], dtype=np.float64)
 
 SECONDS_PER_DAY = 86400.0
 
-# Derived-period multipliers on P_day.
 MULT_HALF = 0.5
 MULT_THIRD = 1.0 / 3.0
 MULT_WEEK = 7.0
@@ -1128,9 +1038,7 @@ MULT_MONTH = 30.436875
 MULT_QUARTER = 91.310625
 MULT_YEAR = 365.2425
 
-
 class CadenceDraw:
-    """Per-row cadence for one batch (dense, batch-sized)."""
 
     __slots__ = ("seconds", "p_day", "is_coarse", "length", "n")
 
@@ -1144,11 +1052,9 @@ class CadenceDraw:
     def take(self, rows: np.ndarray) -> "CadenceDraw":
         return CadenceDraw(self.seconds[rows], self.is_coarse[rows], self.length[rows])
 
-    # ── derived periods, as (n, 1) float columns ──
     def period(self, name: str) -> np.ndarray:
         pd = self.p_day.reshape(-1, 1)
         return pd * _MULT[name]
-
 
 _MULT = {
     "day": 1.0,
@@ -1161,10 +1067,8 @@ _MULT = {
     "year": MULT_YEAR,
 }
 
-
 def draw_cadence(rng: np.random.Generator, n: int, p_coarse: np.ndarray,
                  cfg: dict) -> CadenceDraw:
-    """Draw a cadence and a length for every row of the batch."""
     fine_s = np.asarray(cfg["cadence"]["fine_seconds"], dtype=np.float64)
     coarse_s = np.asarray(cfg["cadence"]["coarse_seconds"], dtype=np.float64)
     fine_w = np.asarray(cfg["cadence"]["fine_weights"], dtype=np.float64)
@@ -1185,21 +1089,10 @@ def draw_cadence(rng: np.random.Generator, n: int, p_coarse: np.ndarray,
                       fl[categorical(rng, fw, n)])
     return CadenceDraw(seconds.astype(np.float64), is_coarse, length.astype(np.int64))
 
-
-# ─────────────────────── which periods are active ──────────────────────────
-
 ACTIVE_KEYS = ("day", "half", "third", "week", "bizweek", "month", "quarter", "free")
-
 
 def active_periods(rng: np.random.Generator, cad: CadenceDraw, cfg: dict,
                    L: int) -> dict[str, np.ndarray]:
-    """Cadence-conditional Bernoulli activation of each derived period.
-
-    Returns a dict ``key -> (n, 1) period length in samples`` where inactive
-    rows carry ``0.0``.  Also emits a ``free`` entry: a continuous period drawn
-    log-uniformly in ``[6, L/3]``, incommensurate with everything else.  That is
-    the escape hatch which stops the model over-fitting to a fixed grid.
-    """
     n = cad.n
     tbl_fine = cfg["seasonality"]["active_fine"]
     tbl_coarse = cfg["seasonality"]["active_coarse"]
@@ -1214,26 +1107,17 @@ def active_periods(rng: np.random.Generator, cad: CadenceDraw, cfg: dict,
             per = np.exp(rng.uniform(np.log(6.0), np.log(max(L / 3.0, 12.0)), size=(n, 1)))
         else:
             per = cad.period(key)
-        # a period must fit at least ~2.2 cycles in the window to be learnable
+
         on = on & (per >= 2.0) & (per <= L / 2.2)
         out[key] = np.where(on, per, 0.0)
     return out
 
-
 def diurnal_period(cad: CadenceDraw, min_samples: float = 3.0) -> np.ndarray:
-    """P_day where a diurnal cycle is resolvable, else 0."""
     pd = cad.p_day.reshape(-1, 1)
     return np.where(pd >= min_samples, pd, 0.0)
 
-
 def multi_seasonal(rng: np.random.Generator, n: int, L: int, cad: CadenceDraw,
                    cfg: dict) -> np.ndarray:
-    """Sum of shaped profiles over every period that is active for the row.
-
-    Amplitudes are log-normal, so one component usually dominates; 45% of rows
-    additionally get their seasonal amplitude modulated by a slow latent, which
-    is what makes seasonality non-stationary in real feeds.
-    """
     act = active_periods(rng, cad, cfg, L)
     out = np.zeros((n, L))
     any_on = np.zeros((n, 1), dtype=bool)
@@ -1258,29 +1142,10 @@ def multi_seasonal(rng: np.random.Generator, n: int, L: int, cad: CadenceDraw,
     fallback = unit_std(np.cumsum(rng.standard_normal((n, L)), axis=1))
     return np.where(any_on, unit_std(out), fallback)
 
-
-# ═══════════════ chronoforge: cf_calendars ═══════════════
-# Broadcast calendar arrays — no pandas, no Python loops.
-#
-# For every row we draw a starting day-of-week and day-of-year, then derive::
-#
-#     day_index[i, t] = floor(t / P_day[i])
-#     dow[i, t]       = (start_dow[i] + day_index) % 7
-#     doy[i, t]       = (start_doy[i] + day_index) % 365
-#
-# The calendar layer exists because the losing domains are administrative.  Real
-# public-health and hospital feeds do not carry a +-0.12 additive log day-of-week
-# offset: they carry a 2-5x *multiplicative* factor, a Monday catch-up spike,
-# holiday collapses with a compensating spike on the next working day, batched
-# multi-day releases, and revisions.  All of that lives here.
-
-
 DAYS_IN_YEAR = 365
 MAX_YEARS = 16
 
-
 class Calendar:
-    """Lazily materialised calendar arrays for one group of rows."""
 
     __slots__ = ("n", "L", "p_day", "start_dow", "start_doy", "_day_index",
                  "_dow", "_doy")
@@ -1323,24 +1188,13 @@ class Calendar:
         return Calendar(len(rows), self.L, self.p_day[rows, 0],
                         self.start_dow[rows, 0], self.start_doy[rows, 0])
 
-
 def draw_calendar(rng: np.random.Generator, n: int, L: int,
                   p_day: np.ndarray) -> Calendar:
     return Calendar(n, L, p_day,
                     rng.integers(0, 7, size=n),
                     rng.integers(0, DAYS_IN_YEAR, size=n))
 
-
-# ───────────────────────── multiplicative factors ──────────────────────────
-
 def dow_factors(rng: np.random.Generator, n: int, cfg: dict) -> np.ndarray:
-    """Seven multiplicative day-of-week factors, geometric mean normalised to 1.
-
-    Weekend ~ LogN(log 0.45, 0.35) -> a 0.2-0.9x weekend; Monday carries a
-    catch-up multiplier.  These are an order of magnitude stronger than the
-    additive log offsets the incumbent field uses, and they are what the data
-    actually shows.
-    """
     c = cfg["calendar"]
     f = np.empty((n, 7))
     f[:, 0] = np.exp(rng.normal(np.log(c["monday_factor"]), c["monday_sigma"], size=n))
@@ -1349,25 +1203,16 @@ def dow_factors(rng: np.random.Generator, n: int, cfg: dict) -> np.ndarray:
     for d in (5, 6):
         f[:, d] = np.exp(rng.normal(np.log(c["weekend_factor"]),
                                     c["weekend_sigma"], size=n))
-    # Sat != Sun
+
     f[:, 6] *= np.exp(rng.normal(0.0, 0.22, size=n))
     g = np.exp(np.mean(np.log(np.maximum(f, 1e-6)), axis=1, keepdims=True))
     return f / g
 
-
 def apply_dow(fac: np.ndarray, cal: Calendar) -> np.ndarray:
-    """Gather the 7 factors onto the (n, L) grid."""
     return np.take_along_axis(fac, cal.dow, axis=1)
-
 
 def holiday_factor(rng: np.random.Generator, cal: Calendar, cfg: dict
                    ) -> tuple[np.ndarray, np.ndarray]:
-    """Multiplicative holiday collapse plus a next-working-day compensation.
-
-    Returns ``(factor, comp)`` on the (n, L) grid.  Holidays are 8-13 fixed
-    day-of-year anchors plus 2-4 moving ones (an Easter-like offset from a drawn
-    anchor), each with a +-1 day shoulder.
-    """
     n, L = cal.n, cal.L
     c = cfg["calendar"]
     n_fixed = int(c["n_fixed_holidays"])
@@ -1381,14 +1226,11 @@ def holiday_factor(rng: np.random.Generator, cal: Calendar, cfg: dict
     depth = np.clip(depth, 0.02, 1.0)
 
     doy = cal.doy
-    # A daily-cadence window spans ~11 virtual years, so a *moving* feast really
-    # does land on a different day-of-year each year.  Fixed anchors do not.
+
     year = np.minimum(cal.day_index // DAYS_IN_YEAR, MAX_YEARS - 1)
     year_shift = rng.integers(-25, 26, size=(n, MAX_YEARS))
     shift = np.take_along_axis(year_shift, year, axis=1)
 
-    # Fixed anchors depend only on day-of-year, so they are resolved once on a
-    # (n, 365) table and gathered; only the moving feasts need the full grid.
     grid = np.arange(DAYS_IN_YEAR, dtype=np.int64)[None, :]
     tab = np.ones((n, DAYS_IN_YEAR))
     tab_hit = np.zeros((n, DAYS_IN_YEAR), dtype=bool)
@@ -1408,57 +1250,38 @@ def holiday_factor(rng: np.random.Generator, cal: Calendar, cfg: dict
             continue
         d = np.abs(((doy - (anchors[:, j:j + 1] + shift) + 182) % 365) - 182)
         on = (d <= 1) & live[:, j:j + 1]
-        # shoulder days are milder than the holiday itself
+
         f = np.where(d == 0, depth[:, j:j + 1], 0.5 * (1.0 + depth[:, j:j + 1]))
         fac = np.where(on, np.minimum(fac, f), fac)
         hit |= on
 
     comp = np.zeros((n, L))
     if L > 1:
-        # compensation lands on the first sample after the holiday block ends
+
         boundary = np.zeros((n, L), dtype=bool)
         boundary[:, 1:] = hit[:, :-1] & (~hit[:, 1:])
         amp = rng.uniform(c["holiday_comp_lo"], c["holiday_comp_hi"], size=(n, 1)) - 1.0
         span = np.maximum(cal.p_day, 1.0)
         comp = np.where(boundary, amp, 0.0)
-        # spread the catch-up over one "day" of samples
+
         if float(np.max(span)) > 1.5:
             comp = decay_convolve(comp, np.maximum(span[:, 0] * 0.4, 1.0))
     return fac, comp
 
-
 def month_boundary(cal: Calendar) -> np.ndarray:
-    """True on the first sample of each 30/31-day month block."""
     m = (cal.doy // 30)
     b = np.zeros_like(m, dtype=bool)
     b[:, 1:] = m[:, 1:] != m[:, :-1]
     return b
 
-
 def business_day_index(cal: Calendar) -> np.ndarray:
-    """Cumulative count of business days, i.e. the business-day observation grid.
-
-    Econ/fin daily feeds publish on business days only, so their effective weekly
-    period is 5 rather than 7 and their release calendar advances only on
-    weekdays.  Ubiquitous in the pool and modelled by nobody.
-    """
     di = cal.day_index
     new_day = np.zeros_like(di, dtype=bool)
     new_day[:, 0] = True
     new_day[:, 1:] = di[:, 1:] != di[:, :-1]
     return np.cumsum((new_day & (~cal.is_weekend)).astype(np.int64), axis=1)
 
-
 def dst_shift(rng: np.random.Generator, cal: Calendar, rate: float) -> np.ndarray:
-    """A one-hour daily-phase jump at two day-of-year anchors (civil-time feeds).
-
-    Returned in *cycles*: one hour of a 24-hour day is 1/24 of the daily phase,
-    whatever the sampling cadence.
-
-    Deliberately NOT applied to the meteorological families: that source requests
-    UTC, so an ERA5 series has no DST discontinuity and a spurious one would be a
-    mismatch rather than a prior.
-    """
     n, L = cal.n, cal.L
     on = rng.random((n, 1)) < rate
     a1 = rng.integers(60, 120, size=(n, 1))
@@ -1466,33 +1289,23 @@ def dst_shift(rng: np.random.Generator, cal: Calendar, rate: float) -> np.ndarra
     inside = (cal.doy >= a1) & (cal.doy < a2)
     return np.where(on & inside, 1.0 / 24.0, 0.0)
 
-
 def batch_release(rng: np.random.Generator, x: np.ndarray, cal: Calendar,
                   period_days: np.ndarray) -> np.ndarray:
-    """Accumulate over a k-day batch and release the whole sum on one sample.
-
-    Everything between releases is an exact zero.  This is how a large fraction
-    of public-health feeds actually report and it destroys naive persistence.
-    """
     n, L = x.shape
     blk = (cal.day_index // np.maximum(period_days.reshape(n, 1), 1))
     boundary = np.zeros((n, L), dtype=bool)
     boundary[:, 1:] = blk[:, 1:] != blk[:, :-1]
     boundary[:, 0] = True
     cum = np.cumsum(x, axis=1)
-    # A_t is the total accumulated strictly before t; S_t is A at the most recent
-    # boundary at or before t.  Shifting S by one sample gives A at the PREVIOUS
-    # boundary, so each release reports exactly the block that just closed.
+
     a = cum - x
     s = np.maximum.accumulate(np.where(boundary, a, 0.0), axis=1)
     prev = np.zeros_like(s)
     prev[:, 1:] = s[:, :-1]
     return np.where(boundary, a - prev, 0.0)
 
-
 def revision_ramp(rng: np.random.Generator, x: np.ndarray, n_last: np.ndarray,
                   depth: np.ndarray) -> np.ndarray:
-    """Systematically under-report the most recent k samples, ramping to truth."""
     n, L = x.shape
     k = np.maximum(np.asarray(n_last).reshape(n, 1), 1)
     age = (L - 1) - np.arange(L)[None, :]
@@ -1500,41 +1313,10 @@ def revision_ramp(rng: np.random.Generator, x: np.ndarray, n_last: np.ndarray,
     d = np.asarray(depth).reshape(n, 1)
     return x * (1.0 - w * d)
 
-
-# ═══════════════ chronoforge: cf_observe ═══════════════
-# Observation layer, scale/offset, structured aggregation, sanitiser.
-#
-# One shared, family-gated stage runs after every family has produced its rows.
-# The stages are applied in a fixed order and each one is gated by the per-row
-# capability flags the family returned, so a bounded process never gets an outlier
-# spike outside its bounds and an integer count is never rounded onto a
-# non-integer tick.  Every stage operates on the *selected rows only* — the gate
-# is an index set, not a mask over a full-batch computation.
-#
-# Two deliberate omissions relative to the competitive field:
-#
-# * **no global time reversal.**  It is applied there to symmetric families; the
-#   gain is marginal and it mis-teaches causality on anything with an asymmetric
-#   response, which is most of what we generate.
-# * **no tail-concentrated regime break.**  Injecting breaks into the last
-#   64-1024 samples of a fixed fraction of series teaches a positional artefact
-#   over patch index and inflates predictive width everywhere.  Our breaks carry a
-#   uniform hazard modulated by *observable* volatility precursors instead.
-#
-# The rounding stage is the third departure, and the most consequential: it fires
-# only when the series' standard deviation is at least ``round_min_ticks`` ticks.
-# Blind rounding of unit-scale continuous families is what collapses a nominal
-# AR(2)/GP/1-f corpus onto a three-to-five-level staircase.
-
-
 MAX_PEAK = 1.0e12
-
 
 def _rows(mask):
     return np.nonzero(mask)[0]
-
-
-# ═════════════════════════════ observation layer ═══════════════════════════
 
 def apply_observation(rng, y, flags, cfg):
     n, L = y.shape
@@ -1547,19 +1329,14 @@ def apply_observation(rng, y, flags, cfg):
     def gate(rate):
         return rng.random(n) < np.clip(rate * boost, 0.0, 1.0)
 
-    # ── 1. block aggregation ────────────────────────────────────────────────
-    # Real feeds are frequently a rolling-window statistic of a finer signal: a
-    # max-aggregate has an extreme-value marginal, a mean-aggregate a smoothed
-    # one, and neither looks like the underlying process.  We aggregate causally
-    # at constant length so the emitted series stays a multiple of 32 samples.
     lo_b = y.min(axis=1, keepdims=True)
     hi_b = y.max(axis=1, keepdims=True)
 
     sel = gate(o["block_aggregation_rate"])
     ks = rng.integers(2, 13, n)
     modes = rng.integers(0, 4, n)
-    modes = np.where(integer & (modes == 0), 1, modes)   # mean breaks a lattice
-    modes = np.where(bounded & (modes == 1), 2, modes)   # sum breaks a hard bound
+    modes = np.where(integer & (modes == 0), 1, modes)
+    modes = np.where(bounded & (modes == 1), 2, modes)
     if sel.any():
         for k in range(2, 13):
             for mode in range(4):
@@ -1567,7 +1344,6 @@ def apply_observation(rng, y, flags, cfg):
                 if idx.size:
                     y[idx] = rolling_agg(y[idx], k, mode)
 
-    # ── 2. quantisation to a round human tick ───────────────────────────────
     qb = flags["quant_boost"]
     idx = _rows((rng.random(n) < np.clip(o["quantise_rate"] * qb, 0.0, 1.0))
                 & (~integer))
@@ -1586,7 +1362,6 @@ def apply_observation(rng, y, flags, cfg):
         y[idx] = q
         flags["integer"][idx] = True
 
-    # ── 3. one-sided censoring at a round value ─────────────────────────────
     idx = _rows(gate(o["censor_rate"]))
     if idx.size:
         m = idx.size
@@ -1596,12 +1371,11 @@ def apply_observation(rng, y, flags, cfg):
         up = rng.random((m, 1)) < 0.5
         lvl = mean + np.where(up, 1.0, -1.0) * logu(rng, 0.8, 2.6, (m, 1)) * std
         tick = human_tick(std[:, 0], rng, m, 0.05, 0.5)
-        # an integer feed is clipped at an integer, not at an arbitrary tick
+
         tick = np.where(integer[idx].reshape(m, 1), np.maximum(np.round(tick), 1.0), tick)
         lvl = np.round(lvl / tick) * tick
         y[idx] = np.where(up, np.minimum(sub, lvl), np.maximum(sub, lvl))
 
-    # ── 4. staleness (bursty last-observation-carried-forward) ──────────────
     idx = _rows(gate(o["staleness_rate"]))
     if idx.size:
         m = idx.size
@@ -1609,7 +1383,6 @@ def apply_observation(rng, y, flags, cfg):
                           logu(rng, 2.0, 60.0, (m, 1)))
         y[idx] = locf(y[idx], gap)
 
-    # ── 5. missing-as-zero ──────────────────────────────────────────────────
     idx = _rows(gate(o["missing_zero_rate"]) & (~bounded))
     if idx.size:
         m = idx.size
@@ -1619,7 +1392,6 @@ def apply_observation(rng, y, flags, cfg):
         sub[gap] = 0.0
         y[idx] = sub
 
-    # ── 6. isolated outliers ────────────────────────────────────────────────
     idx = _rows(gate(o["outlier_rate"]) & (~bounded))
     if idx.size:
         m = idx.size
@@ -1637,7 +1409,6 @@ def apply_observation(rng, y, flags, cfg):
         np.add.at(sub, (rows[live], pos[live]), amp[live])
         y[idx] = sub
 
-    # ── 7. instrument drift with abrupt recalibration ───────────────────────
     idx = _rows(gate(o["drift_recal_rate"]) & (~bounded) & (~integer))
     if idx.size:
         m = idx.size
@@ -1656,15 +1427,13 @@ def apply_observation(rng, y, flags, cfg):
                           sub * (1.0 + np.clip(bias / std, -0.9, 3.0)),
                           sub + bias)
 
-    # ── 8. scale-guarded rounding ───────────────────────────────────────────
     idx = _rows(gate(o["round_rate"]) & (~integer) & (~bounded))
     if idx.size:
         m = idx.size
         sub = y[idx]
         std = safe_std(sub)
         tick = human_tick(std[:, 0], rng, m, 1e-4, 1.0 / o["round_min_ticks"])
-        # a share of these land on the literal integer lattice, which is what a
-        # natural-unit feed (people, packets, requests) actually looks like
+
         unit = (rng.random((m, 1)) < o["integer_tick_share"]) & \
             (std >= o["round_min_ticks"])
         tick = np.where(unit, 1.0, tick)
@@ -1675,28 +1444,13 @@ def apply_observation(rng, y, flags, cfg):
     idx = _rows(positive)
     if idx.size:
         np.maximum(y[idx], 0.0, out=y[idx])
-    # A family that declared hard bounds keeps them: the artefact stages must not
-    # move probability mass off a boundary we deliberately put there.
+
     idx = _rows(bounded)
     if idx.size:
         y[idx] = np.clip(y[idx], lo_b[idx], hi_b[idx])
     return y
 
-
-# ═══════════════════════════ scale and offset ══════════════════════════════
-
 def apply_scale(rng, y, flags, cfg):
-    """Give every row a raw physical scale and offset.
-
-    The trainer's causal scaler removes absolute level and scale, so this is not
-    about magnitude for its own sake.  It is about the three things that *do*
-    survive that transform: the integer lattice relative to the running standard
-    deviation, the outlier-to-scale ratio under arcsinh, and how ``loc``/``scale``
-    themselves evolve.  The large-offset regime is deliberately over-represented
-    because a tiny relative variance on a large level is the small-MASE-
-    denominator regime, and the sign-crossing regime is over-represented because
-    a small sum|y| is what makes WQL a relative-error amplifier.
-    """
     n, L = y.shape
     s = cfg["scale"]
     comps = s["log10_scale_mixture"]
@@ -1723,8 +1477,7 @@ def apply_scale(rng, y, flags, cfg):
                    np.where(reg == 1, big,
                             np.where(reg == 2, rng.standard_normal(n),
                                      -np.abs(rng.standard_normal(n)) * big)))
-    # hard invariant: |offset| / scale <= 1e7, so the fluctuation always keeps
-    # at least nine significant digits of float64 headroom
+
     off = np.clip(off, -1.0e7, 1.0e7).reshape(n, 1)
 
     idx = _rows(mode == 0)
@@ -1740,28 +1493,14 @@ def apply_scale(rng, y, flags, cfg):
         peak = np.maximum(np.abs(sub).max(axis=1, keepdims=True), 1e-200)
         mult = np.minimum(scale[idx] / mag, MAX_PEAK / peak)
         y[idx] = sub * mult
-    # keep the batch inside the magnitude envelope before anything downstream
-    # divides by a row statistic
+
     peak = np.abs(y).max(axis=1, keepdims=True)
     hot = _rows(peak[:, 0] > MAX_PEAK)
     if hot.size:
         y[hot] = y[hot] * (MAX_PEAK / peak[hot])
     return y
 
-
-# ═════════════════════ structured hierarchical aggregation ═════════════════
-
 def apply_aggregation(rng, y, flags, cad, cfg):
-    """Build a fraction of rows as genuine aggregates of same-cadence siblings.
-
-    A sum of K components driven by a common latent factor has a variance that
-    grows like K^2, while independent components give K.  That signature is the
-    correct model for national demand, grid totals, portfolio series and total
-    pageviews, and it is what a blind cross-family Dirichlet mixup destroys:
-    blending a Poisson count series with a chaotic attractor at a 1e4 scale ratio
-    produces a noised copy of the larger, not a composite.  We only ever combine
-    rows that share a cadence, and we restore the host row's own level and scale.
-    """
     n, L = y.shape
     sel = ((rng.random(n) < cfg["aggregation"]["rate"])
            & flags["allow_agg"] & (~flags["count"]) & (~flags["bounded"]))
@@ -1798,23 +1537,12 @@ def apply_aggregation(rng, y, flags, cad, cfg):
     y[rows] = np.where(ok, blended, host)
     return y
 
-
-# ═══════════════════════════════ sanitiser ═════════════════════════════════
-
 def sanitise(rng, y, flags, starts, cfg):
-    """Finiteness, degeneracy, cold-start and magnitude guards, in that order.
-
-    ``starts`` gives each row's emit offset, so the constant-prefix guard is
-    applied to the window the trainer will actually see: the causal scaler begins
-    at the first emitted sample, and a constant lead-in drives its standard
-    deviation to the 1e-5 floor and clamps the standardised input at +-64.
-    """
     n, L = y.shape
     bad = _rows(~np.isfinite(y.sum(axis=1)))
     if bad.size:
         y[bad] = np.nan_to_num(y[bad], nan=0.0, posinf=MAX_PEAK, neginf=-MAX_PEAK)
 
-    # degeneracy: regenerate from a cheap fallback rather than emit a flat row
     span = y.max(axis=1) - y.min(axis=1)
     ref = np.maximum(np.abs(y).mean(axis=1), 1e-300)
     dead = _rows((span <= 1e-12 * ref) | (span == 0.0))
