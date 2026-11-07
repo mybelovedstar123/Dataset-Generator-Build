@@ -19843,3 +19843,295 @@ def _xb_price(r, n, a, sod, day, dow0):
         zz = lev * (0.004 + 0.026 * u[33])
         x = np.where((np.abs(x) < zz) & (r.random(n) < 0.75), 0.0, x)
     return np.round(x, 2)
+
+def _xb_load(r, n, a, sod, day, dow0):
+    u = r.random(40)
+    nd = int(day[-1]) + 1
+    lev = _xb_lu(u[0], 500.0, 45000.0)
+    dow = (np.arange(nd) + dow0) % 7
+    sat = (dow == 5).astype(np.float64)
+    sun = (dow == 6).astype(np.float64)
+    if u[1] < 0.3:
+        wd = _xb_bump(52.0 + 18.0 * u[2], 14.0 + 8.0 * u[3]) - (0.1 + 0.3 * u[4]) * _xb_bump(12.0 + 8.0 * u[5], 8.0 + 4.0 * u[6])
+        we = wd
+    else:
+        ng = (0.3 + 0.5 * u[4]) * _xb_bump(10.0 + 10.0 * u[5], 8.0 + 6.0 * u[6])
+        md = (0.2 + 0.6 * u[7]) * _xb_bump(46.0 + 10.0 * u[8], 8.0 + 6.0 * u[9])
+        evb = (0.5 + 0.5 * u[10]) * _xb_bump(70.0 + 12.0 * u[11], 6.0 + 6.0 * u[12])
+        wd = (0.5 + 0.5 * u[2]) * _xb_bump(28.0 + 10.0 * u[3], 6.0 + 6.0 * u[13]) + md + evb - ng
+        we = (0.2 + 0.4 * u[2]) * _xb_bump(34.0 + 10.0 * u[3], 8.0 + 6.0 * u[13]) + md + evb - ng
+    sc = max(float(wd.std()), 1e-9)
+    wd = (wd - float(wd.mean())) / sc
+    we = (we - float(we.mean())) / sc
+    depth = 0.06 + 0.12 * u[14]
+    wkmix = sat * (0.5 + 0.5 * u[15]) + sun
+    amp = (1.0 - wkmix * (0.1 + 0.4 * u[16])) * np.exp(0.06 * r.standard_normal(nd))
+    lv = _xb_days(r, nd, 0.6 + 0.35 * u[17], 0.012 + 0.035 * u[18]) + sat * np.log(0.88 + 0.09 * u[19]) + sun * np.log(0.84 + 0.11 * u[20])
+    shape = wd[sod] * (1.0 - wkmix[day]) + we[sod] * wkmix[day]
+    x = lev * np.exp(_xb_dayline(a, lv)) * (1.0 + depth * amp[day] * shape)
+    x = x * (1.0 + _xb_lu(u[21], 0.003, 0.014) * _xb_ou2(r, n, _xb_lu(u[22], 4.0, 20.0), 1.0 + 2.0 * u[23]))
+    x = x + lev * _xb_lu(u[24], 0.0004, 0.006) * r.standard_normal(n)
+    return np.round(x, 0 if u[25] < 0.78 else 1)
+
+_XB_BUILD = (_xb_co2, _xb_solar, _xb_wind, _xb_price, _xb_load)
+
+def _xb_tail_len(r):
+    v = r.random(2)
+    if v[0] < 0.85:
+        return int(min(max(round(83.5 + 6.0 * float(r.standard_normal())), 69), 103))
+    if v[0] < 0.93:
+        return 50 + int(13 * v[1])
+    if v[0] < 0.97:
+        return 100 + int(13 * v[1])
+    return 126 + int(11 * v[1]) if v[1] < 0.6 else 190 + int(32.5 * (v[1] - 0.6))
+
+def _xb_draw(r, L):
+    L = int(L)
+    u = r.random(12)
+    kind = min(int(np.searchsorted(_XB_KIND_CUM, u[0], side="right")), len(_XB_KINDS) - 1)
+    hv = (64, 256, 720)[min(int(3.0 * u[1]), 2)]
+    feed = L + 64 if u[2] < _XB_P_FULL else int(1100.0 + (L + 64 - 1100.0) * u[3])
+    n = int(max(min(L, feed - hv), min(L, 384)))
+    s_end = int(13.0 * u[4])
+    late = hv == 720
+    if late:
+        s_end = (s_end - 48) % 96
+    a = np.arange(n, dtype=np.int64) + int((s_end - (n - 1)) % 96)
+    x = _XB_BUILD[kind](r, n, a, a % 96, a // 96, int(7.0 * u[5]))
+    x = np.asarray(x, dtype=np.float64)
+    end = n
+    if (not late) and u[6] < _XB_P_TAIL[kind]:
+        T = _xb_tail_len(r)
+        if n - T >= 256:
+            x[n - T:] = x[n - T - 1]
+            end = n - T
+    if u[7] < _XB_P_HOLE[kind]:
+        T = max(_xb_tail_len(r), 72)
+        hi = (end - 96) // 32
+        lo = (T + 96) // 32 + 1
+        if hi > lo:
+            e = n - 32 * ((n - end) // 32 + int(r.integers(0, hi - lo)) + 3)
+            e = n - 32 * int(r.integers((n - end) // 32 + 3, (n - T - 96) // 32)) if (n - T - 96) // 32 > (n - end) // 32 + 3 else -1
+            if e - T - 1 >= 64:
+                x[e - T:e] = x[e - T - 1]
+    return x, kind
+
+def _xb_grid15(r, L):
+    L = int(L)
+    if L < 512:
+        return None
+    x, _ = _xb_draw(r, L)
+    n = x.size
+    if n > L:
+        x = x[n - L:]
+        n = L
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+_XC_P = 1440
+_XC_TWO_PI = 2.0 * np.pi
+_XC_MIX = (0.85, 0.15)
+_XC_RATE_KINDS = np.cumsum([0.80, 0.08, 0.07, 0.05])
+
+_XC_TIDE_PER = np.array([745.236072, 720.0, 759.50085, 1436.068182, 1549.160502, 1612.101402,
+                         372.618036, 366.206358, 248.412024, 490.628394])
+
+def _xc_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _xc_filt(e, phi):
+    y = np.array(e, dtype=np.float64)
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _xc_ar1(r, n, tau, sd, tail=0.0):
+    n = int(n)
+    phi = float(np.exp(-1.0 / max(float(tau), 0.05)))
+    e = r.standard_normal(n)
+    if tail > 0.0:
+        e = e * np.exp(tail * r.standard_normal(n) - tail * tail)
+    e = e * (sd * np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    e[0] = r.standard_normal() * sd
+    return _xc_filt(e, phi)
+
+def _xc_box(x, m):
+    m = min(int(m), x.size)
+    if m <= 1:
+        return x
+    c = np.cumsum(np.concatenate(([0.0], x)))
+    out = np.empty(x.size, dtype=np.float64)
+    out[m - 1:] = (c[m:] - c[:-m]) / m
+    out[:m - 1] = c[1:m] / np.arange(1, m)
+    return out
+
+def _xc_cbox(p, h):
+    h = int(h)
+    if h <= 0:
+        return p
+    g = p.size
+    c = np.cumsum(np.concatenate(([0.0], p[g - h:], p, p[:h])))
+    return (c[2 * h + 1:2 * h + 1 + g] - c[:g]) / (2 * h + 1)
+
+def _xc_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+def _xc_store(r, x, mode):
+    if mode == 1:
+        return np.round(x)
+    if mode == 2:
+        return np.round(x, int(r.integers(1, 4)))
+    return x.astype(np.float32).astype(np.float64)
+
+def _xc_knots(r):
+    d0 = r.uniform(0.0, 0.04)
+    m1 = d0 + r.uniform(0.10, 0.22)
+    m2 = r.uniform(0.55, 0.72)
+    m3 = m2 + r.uniform(0.03, 0.09)
+    m4 = min(m3 + r.uniform(0.10, 0.22), 1.0 - d0)
+    if r.random() < 0.3:
+        v1 = r.uniform(0.25, 0.5)
+        v2 = r.uniform(max(v1, 0.4), 0.8)
+    else:
+        v1 = r.uniform(0.5, 0.85)
+        v2 = r.uniform(0.55, 0.9)
+    kx = [0.0, d0, m1, m2, m3, m4, 1.0]
+    kv = [0.0, r.uniform(0.0, 0.04), v1, v2, 1.0, r.uniform(0.0, 0.05), 0.0]
+    if r.random() < 0.35:
+        kx.insert(3, m1 + (m2 - m1) * r.uniform(0.3, 0.7))
+        kv.insert(3, 0.5 * (v1 + v2) * r.uniform(0.8, 1.15))
+    return np.array(kx), np.array(kv)
+
+def _xc_shape(kx, kv, h1, h2):
+    p = np.interp(np.arange(_XC_P) / float(_XC_P), kx, kv)
+    p = _xc_cbox(_xc_cbox(p, h1), h2)
+    lo = float(p.min())
+    hi = float(p.max())
+    return (p - lo) / max(hi - lo, 1e-9)
+
+def _xc_cycle(r, n, s_amp, s_lvl, s_warp, blend):
+    kx, kv = _xc_knots(r)
+    h1 = int(r.uniform(0.012, 0.045) * _XC_P)
+    h2 = int(r.uniform(0.004, 0.03) * _XC_P)
+    ta = _xc_shape(kx, kv, h1, h2)
+    jx = kx.copy()
+    jv = kv.copy()
+    jx[2:-1] = np.sort(np.clip(kx[2:-1] + r.normal(0.0, 0.015, kx.size - 3), kx[1] + 0.02, 0.97))
+    jv[2:-2] = np.clip(kv[2:-2] + r.normal(0.0, 0.08, kx.size - 4), 0.15, 1.0)
+    tb = _xc_shape(jx, jv, h1, h2)
+    u = (np.arange(n, dtype=np.float64) + float(r.integers(0, _XC_P))) / float(_XC_P)
+    nd = int(u[-1]) + 2
+    grid = np.arange(nd, dtype=np.float64)
+    half = np.arange(2 * nd, dtype=np.float64) * 0.5
+    warp = np.interp(u, half, r.normal(0.0, s_warp, 2 * nd))
+    g = ((u + warp) % 1.0) * _XC_P
+    i0 = np.minimum(g.astype(np.int64), _XC_P - 1)
+    f = g - i0
+    i1 = (i0 + 1) % _XC_P
+    w = np.interp(u, grid, blend * r.random(nd))
+    pa = ta[i0] * (1.0 - f) + ta[i1] * f
+    pb = tb[i0] * (1.0 - f) + tb[i1] * f
+    prof = (pa + w * (pb - pa)) * np.exp(np.interp(u, grid, r.normal(0.0, s_amp, nd)))
+    return prof, np.interp(u, grid, r.normal(0.0, s_lvl, nd))
+
+def _xc_smooth(r, n, tau, sd):
+    step = max(1, int(tau / 6.0))
+    m = n // step + 3
+    z = np.interp(np.arange(n, dtype=np.float64) / step + r.random(), np.arange(m, dtype=np.float64),
+                  _xc_ar1(r, m, tau / step, sd))
+    return _xc_box(z, step)
+
+def _xc_count(r, p_none, lo, hi):
+    if r.random() < p_none:
+        return 0
+    return int(r.poisson(_xc_lu(r, lo, hi)))
+
+def _xc_steps(r, n, k, w_lo, w_hi, a_lo, a_hi, p_up):
+    if k <= 0:
+        return 0.0
+    i0 = r.integers(0, n, k)
+    w = np.exp(r.uniform(np.log(w_lo), np.log(w_hi), k)).astype(np.int64) + 1
+    a = np.exp(r.uniform(np.log(a_lo), np.log(a_hi), k)) * np.where(r.random(k) < p_up, 1.0, -1.0)
+    d = np.bincount(i0, weights=a, minlength=n + 1) - np.bincount(np.minimum(i0 + w, n), weights=a, minlength=n + 1)
+    return np.cumsum(d)[:n]
+
+def _xc_needles(r, lx, k, d_lo, d_hi):
+    if k <= 0:
+        return lx
+    n = lx.size
+    idx = r.integers(0, n - 3, k)
+    a = np.log1p(-np.exp(r.uniform(np.log(d_lo), np.log(d_hi), k)))
+    lx[idx] += a
+    lx[idx + 1] += a * r.uniform(0.0, 0.8, k)
+    lx[idx + 2] += a * r.uniform(0.0, 0.35, k) * (r.random(k) < 0.5)
+    return lx
+
+def _xc_dips(r, lx, k, size):
+    n = lx.size
+    for _ in range(int(k)):
+        i = int(r.integers(0, n))
+        tau = _xc_lu(r, 1.5, 30.0)
+        w = min(n - i, int(7.0 * tau) + 2)
+        lx[i:i + w] -= size * _xc_lu(r, 0.2, 1.5) * np.exp(-np.arange(w) / tau)
+    return lx
+
+def _xc_rate_std(r, n):
+    base = float(np.clip(np.exp(r.normal(np.log(0.27), 0.42)), 0.07, 0.62))
+    q = float(np.exp(r.normal(0.0, 0.6)))
+    prof, lvl = _xc_cycle(r, n, _xc_lu(r, 0.008, 0.10), _xc_lu(r, 0.003, 0.05), _xc_lu(r, 0.002, 0.02),
+                          r.random() if r.random() < 0.6 else 0.0)
+    lc = np.log(base + (1.0 - base) * prof)
+    z = _xc_smooth(r, n, _xc_lu(r, 200.0, 1000.0), 0.012 * q * _xc_lu(r, 0.5, 2.0))
+    z = z + _xc_smooth(r, n, _xc_lu(r, 30.0, 150.0), 0.015 * q * _xc_lu(r, 0.5, 2.0))
+    fast = _xc_ar1(r, n, _xc_lu(r, 4.0, 30.0), 0.020 * q * _xc_lu(r, 0.6, 1.7), r.uniform(0.0, 0.6))
+    z = z + _xc_box(fast, int(r.integers(3, 8)))
+
+    lx = lc + lvl + z * np.exp(-r.uniform(0.2, 0.7) * (lc - float(lc.mean())))
+    size = 0.08 * q ** 0.5 * _xc_lu(r, 0.5, 2.0)
+    lx = lx + _xc_steps(r, n, _xc_count(r, 0.3, 0.5, 5.0), 15.0, 300.0, 0.3 * size, 4.0 * size, 0.8)
+    lx = lx + _xc_steps(r, n, _xc_count(r, 0.2, 1.0, 12.0), 2.0, 14.0, 0.2 * size, 2.5 * size, 0.9)
+    lx = _xc_dips(r, lx, _xc_count(r, 0.5, 0.4, 4.0), 2.0 * size)
+    lx = _xc_needles(r, lx, _xc_count(r, 0.2, 1.0, 10.0), 0.03, 0.85)
+    if r.random() < 0.10:
+        lx[int(r.integers(0, n)):] += r.normal(0.0, 0.06)
+    is_bytes = r.random() < 0.18
+    level = 10.0 ** (r.uniform(8.3, 9.4) if is_bytes else r.uniform(3.0, 5.0))
+    u = r.random()
+    return _xc_store(r, level * np.exp(lx), 1 if (is_bytes or u < 0.12) else (2 if u < 0.35 else 0))
+
+def _xc_pulses(r, n, rate, w_lo, w_hi, h_lo, h_hi):
+    k = int(r.poisson(rate * n))
+    if k <= 0:
+        return np.zeros(n)
+    i0 = r.integers(0, n, k)
+    w = np.exp(r.uniform(np.log(w_lo), np.log(w_hi), k)).astype(np.int64) + 1
+    h = np.exp(r.uniform(np.log(h_lo), np.log(h_hi), k))
+    d = np.bincount(i0, weights=h, minlength=n + 1) - np.bincount(np.minimum(i0 + w, n), weights=h, minlength=n + 1)
+    return np.maximum(np.cumsum(d)[:n], 0.0)
+
+def _xc_rate_burst(r, n):
+    base = float(np.clip(np.exp(r.normal(np.log(0.33), 0.35)), 0.12, 0.7))
+    prof, lvl = _xc_cycle(r, n, _xc_lu(r, 0.02, 0.15), _xc_lu(r, 0.005, 0.05), _xc_lu(r, 0.003, 0.02), r.random())
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _xc_ar1(r, n, _xc_lu(r, 100.0, 800.0), _xc_lu(r, 0.01, 0.06))
+    lx = lx + _xc_box(_xc_ar1(r, n, _xc_lu(r, 2.0, 15.0), _xc_lu(r, 0.01, 0.04), r.uniform(0.0, 0.6)), int(r.integers(2, 6)))
+    x = np.exp(lx) * (1.0 + _xc_pulses(r, n, _xc_lu(r, 0.01, 0.08), 1.0, 14.0, 0.08, 1.2))
+    lx = _xc_events(r, np.log(x), _xc_count(r, 0.5, 0.5, 4.0), 0, 0, _xc_count(r, 0.3, 1.0, 20.0), 0.3)
+    level = 10.0 ** r.uniform(3.5, 5.2)
+    return _xc_store(r, level * np.exp(lx), 2 if r.random() < 0.25 else 0)
