@@ -24610,3 +24610,252 @@ def _yk_sluice(r, n):
     np.add.at(d, at, size)
     np.add.at(d, np.where(rev, np.minimum(at + dur, n), n), np.where(rev, -size, 0.0))
     return np.cumsum(d[:n])
+
+def _yk_stage(r, n, P):
+    q = _yk_river(r, n, P, _YK_BASE_ST, _YK_P_BIG)
+    hr = q ** r.uniform(0.25, 0.6)
+    t = np.arange(n, dtype=np.float64)
+    lo, hi = np.quantile(hr, [0.01, 0.99])
+    if hi <= lo:
+        hi = lo + 1.0
+    hn = (hr - lo) / (hi - lo)
+    if r.random() < _YK_P_SLUICE:
+        hn = hn + _yk_sluice(r, n)
+    if r.random() < 0.06:
+        hn = hn + r.uniform(0.05, 0.4) * np.cos(_YK_TWO_PI * t / (P * 12.4206 / 24.0) + r.uniform(0.0, _YK_TWO_PI)) \
+            * (1.0 + 0.3 * np.cos(_YK_TWO_PI * t / (P * 14.765) + r.uniform(0.0, _YK_TWO_PI)))
+    _, tick, (m_lo, m_hi), (a_lo, a_hi) = _YK_ST_STYLE[_yk_pick(r, _YK_ST_CUM)]
+    A = _yk_lu(r, a_lo, a_hi)
+    med = _yk_lu(r, m_lo, m_hi) if m_lo > 0 else r.uniform(m_lo, m_hi)
+    h = med + tick * A * (hn - np.median(hn))
+    if m_lo > 0 and h.min() < 0.0:
+        h = h - h.min() + tick * A * r.uniform(0.02, 0.3)
+    noise = r.standard_normal(n) * _yk_lu(r, *_YK_ST_NOISE)
+    if r.random() < 0.10:
+        phi = r.uniform(0.3, 0.9)
+        noise = noise + _yk_ar1(r.standard_normal(n) * np.sqrt(1.0 - phi * phi), phi) * _yk_lu(r, 0.5, 3.0)
+    h = h + tick * noise
+    h = _yk_artefacts(r, h, tick, tick * A)
+    y = _yk_quant(h, tick)
+    return y if float(np.ptp(y)) > 0.0 else _yk_quant(h, tick / 10.0)
+
+def _yk_flow(r, n, P):
+    _, rnd, (m_lo, m_hi) = _YK_FL_STYLE[_yk_pick(r, _YK_FL_CUM)]
+    if rnd > 0:
+        q = _yk_river(r, n, P, _YK_BASE_FL, _YK_P_BIG, 0.25, (0.03, 0.2), 0.15, 0.0, (0.4, 0.8), 4.0)
+    else:
+        q = _yk_river(r, n, P, _YK_BASE_FL3, _YK_P_BIG_FL, 0.15, (0.03, 0.15), 0.15, 0.0, (0.4, 0.8), 4.0)
+    if r.random() < 0.50:
+        beta = r.uniform(0.35, 0.7)
+        hr = q ** beta
+        st = (np.quantile(hr, 0.99) - np.quantile(hr, 0.01)) / _yk_lu(r, 20.0, 400.0)
+        if st > 0:
+            hr = hr + st * _yk_lu(r, 0.05, 0.6) * r.standard_normal(n)
+            q = np.maximum(np.round(hr / st) * st, 0.0) ** (1.0 / beta)
+    else:
+        q = q * np.exp(r.standard_normal(n) * _yk_lu(r, 0.001, 0.02))
+    if r.random() < _YK_P_NOISY_FL:
+        q = q * np.exp(r.standard_normal(n) * _yk_lu(r, 0.01, 0.08))
+    q = q * (_yk_lu(r, m_lo, m_hi) / max(float(np.median(q)), 1e-12))
+    if r.random() < 0.03:
+        q = np.maximum(q - np.quantile(q, r.uniform(0.2, 0.6)), 0.0)
+    lo, hi = np.quantile(q, [0.05, 0.95])
+    q = _yk_artefacts(r, q, rnd, float(hi - lo))
+    q = np.maximum(q, 0.0)
+    y = _yk_quant(q, rnd) if rnd > 0 else _yk_sig3(q)
+    return y if float(np.ptp(y)) > 0.0 else _yk_sig3(q)
+
+def _yk_rain(r, n, P):
+    wet = _yk_spells(r, n, P, _yk_lu(r, 1.5, 8.0), _yk_lu(r, 0.7, 4.0))
+    rate_w = _yk_lu(r, 1.2, 6.0)
+    rate_d = rate_w * r.uniform(0.0, 0.1)
+    lam_max = rate_w
+    N = int(r.poisson(lam_max * n / P))
+    t0 = r.integers(0, n, N)
+    keep = r.random(N) * lam_max < np.where(wet[t0], rate_w, rate_d)
+    t0 = t0[keep]
+    N = t0.size
+    D = np.maximum(np.rint(_yk_lu(r, 0.5, 4.0) * P / 24.0 * np.exp(0.8 * r.standard_normal(N))), 1.0).astype(np.int64)
+    inten = np.minimum(np.exp(r.uniform(1.2, 1.8) * r.standard_normal(N)), 30.0)
+    du = np.zeros(n + 1)
+    np.add.at(du, t0, inten)
+    np.add.at(du, np.minimum(t0 + D, n), -inten)
+    I = np.maximum(np.cumsum(du[:n]), 0.0)
+    phi = r.uniform(0.4, 0.9)
+    z = _yk_ar1(r.standard_normal(n) * np.sqrt(1.0 - phi * phi), phi)
+    I = I * np.exp(np.minimum(r.uniform(0.8, 1.4) * z, 3.0))
+    I = I * _yk_spells(r, n, 1, _yk_lu(r, 3.5, 12.0), _yk_lu(r, 1.2, 4.5))
+    k = _yk_pick(r, _YK_RAIN_TICK_CUM)
+    tick = float(_YK_RAIN_TICK[k])
+    I = I * tick * (_yk_lu(r, 2.0, 15.0) if tick < 0.05 else _yk_lu(r, 0.6, 3.0))
+    if r.random() < 0.8:
+        I = I + tick * (r.random(n) < _yk_lu(r, 0.05, 1.0) / P)
+    v = np.floor(I / tick + r.random(n)) * tick
+    v = np.round(v, 3)
+    if not np.any(v > 0):
+        v[int(r.integers(0, n))] = tick
+    return v
+
+def _yk_reg(r, n, P):
+    t = np.arange(n, dtype=np.float64)
+    clock = t * 24.0 / P + r.uniform(0.0, 24.0)
+    hod = clock % 24.0
+    day = np.floor(clock / 24.0).astype(np.int64)
+    nd = int(day.max()) + 1
+    s_h = r.uniform(6.0, 15.0)
+    w_h = r.uniform(3.0, 11.0)
+    win = np.clip(np.minimum(hod - s_h, s_h + w_h - hod) * (P / 24.0) + 0.5, 0.0, 1.0)
+    dow0 = int(r.integers(0, 7))
+    wk = np.where(((np.arange(nd) + dow0) % 7) >= 5, r.uniform(0.2, 1.0), 1.0)
+    rd = np.exp(r.uniform(0.15, 0.5) * r.standard_normal(nd)) * wk * (r.random(nd) >= r.uniform(0.0, 0.25))
+    rel = win * rd[day]
+    if r.random() < 0.85:
+        rel = rel / max(float(rel.sum()) / max(nd, 1), 1e-9)
+        net = r.choice(np.array([-1.0, 1.0])) * _yk_lu(r, 0.5, 5.0)
+        nseg = int(r.integers(1, 4))
+        cps = np.sort(r.integers(0, n, nseg - 1))
+        mult = np.exp(0.5 * r.standard_normal(nseg)) * np.where(r.random(nseg) < 0.2, -1.0, 1.0)
+        mult[0] = abs(mult[0])
+        seg = np.searchsorted(cps, t, side="right")
+        inflow = (1.0 + net * mult[seg]) / P * (1.0 + r.uniform(0.0, 0.4) * _yk_slow(r, n, P * 3.0))
+        lvl = np.cumsum(inflow - rel)
+        lvl = lvl + r.uniform(0.0, 0.05) * _yk_slow(r, n, max(P / 4.0, 2.0))
+        k = _yk_pick(r, _YK_REG_TICK_CUM)
+        tick = float(_YK_REG_TICK[k])
+        span = float(np.ptp(lvl)) if np.ptp(lvl) > 0 else 1.0
+        x = _yk_lu(r, 150.0, 1300.0) + (lvl - lvl[0]) * tick * _yk_lu(r, 80.0, 1500.0) / span
+        x = x + tick * _yk_lu(r, 0.1, 0.8) * r.standard_normal(n)
+        x = _yk_gapfill(r, x, _yk_lu(r, 0.1, 4.0))
+        return _yk_quant(x, tick)
+
+    G = _yk_lu(r, 5.0, 3.0e4)
+    x = G * (_yk_lu(r, 0.02, 0.3) + rel) * np.exp(r.standard_normal(n) * _yk_lu(r, 0.002, 0.03))
+    x = _yk_gapfill(r, x, _yk_lu(r, 0.1, 4.0))
+    return _yk_sig3(x) if r.random() < 0.6 else np.round(x, 1)
+
+_YK_BUILD = (_yk_stage, _yk_flow, _yk_rain, _yk_reg)
+
+def _yk_draw(r, L):
+    kind = _yk_pick(r, _YK_KIND_CUM)
+    n = _yk_len(r, L, kind)
+    P = int(_YK_CAD[kind][_yk_pick(r, _YK_CAD_CUM[kind])])
+    x = _YK_BUILD[kind](r, n, P)
+    return x, kind, n, P
+
+def _yk_hydro(r, L):
+    L = int(L)
+    if L < _YK_MIN_L:
+        return None
+    x, _, _, _ = _yk_draw(r, L)
+    x = np.asarray(x, dtype=np.float64)
+    if x.size < 2 or not bool(np.all(np.isfinite(x))) or float(np.ptp(x)) <= 0.0:
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0) + np.round(np.abs(r.standard_normal(x.size)), 2)
+    return _yk_pad(x, L) + 0.0
+
+_YL_P_1MIN = 0.25
+_YL_STEP = ((1440, 60), (288, 12))
+
+_YL_LEN = (
+    ((0.658, 99999, 99999), (0.010, 320, 400), (0.004, 400, 500), (0.061, 500, 800), (0.150, 800, 960),
+     (0.029, 960, 1200), (0.029, 1200, 2000), (0.026, 2000, 3000), (0.032, 3000, 4160)),
+    ((0.375, 99999, 99999), (0.012, 320, 420), (0.363, 420, 486), (0.011, 486, 800), (0.070, 800, 1200),
+     (0.031, 1200, 2000), (0.070, 2000, 3000), (0.068, 3000, 4160)),
+)
+_YL_LEN_CUM = tuple(np.cumsum([b[0] for b in bands]) / sum(b[0] for b in bands) for bands in _YL_LEN)
+_YL_ACT = ((4.6, 1.85, 1.55), (3.65, 3.4, 1.6))
+_YL_ACT_LIM = (0.05, 2500.0)
+_YL_CAP = ((2.8, 2.6), 0.33, 0.42)
+_YL_CAP_MAX = 80
+_YL_ZONE = (0.05, 0.12)
+_YL_ZONE_ACT = ((3.0, 60.0), (0.2, 30.0))
+_YL_ZONE_CAP = (1.0, 12.0)
+_YL_ZONE_FILL = (0.0, 0.45)
+_YL_P_BIG = 0.01
+_YL_SDF = (0.10, 0.45)
+_YL_FILL = ((1.1, 1.6), (0.85, 1.5))
+_YL_K = (0.7, 60.0)
+_YL_TAU_MIN_H = (0.6, 2.5)
+_YL_TYPE_CUM = np.cumsum([0.32, 0.28, 0.22, 0.18])
+_YL_NIGHT = (0.45, 1.0)
+_YL_IMB = ((0.10, 0.45), (0.05, 0.20))
+_YL_XB = ((0.08, 0.55), 0.9, 300.0, (1.0, 1.0), (0.6, 0.25), (0.25, 0.8))
+
+_YL_REB_DAY = (0.1, 3.0)
+_YL_P_REB = 0.75
+_YL_REB_TRIG = (0.3, 0.7)
+_YL_DIP = (0.0003, 0.008)
+_YL_NOISY = (0.25, 0.0, 0.02, 0.10, 0.3, 3.0)
+
+_YL_P_DIP = 0.55
+_YL_DIP_LEN = (6.0, 2.5)
+_YL_DIP_DOWN = 0.6
+_YL_DIP_SIZE = (0.25, 0.8)
+_YL_FLICK = (0.01, 0.2)
+_YL_FLICK_FADE = 0.35
+_YL_P_STALE = 0.15
+_YL_STALE_H = (1.0, 30.0)
+_YL_WANDER = 0.18
+_YL_WANDER_D = (1.0, 6.0)
+
+def _yl_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yl_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yl_wall(v, tau):
+    pos = v > 0.0
+    if not pos.any():
+        return np.zeros(v.size, dtype=np.float64)
+    t = np.arange(v.size, dtype=np.float64) / tau
+    g = np.where(pos, np.log(np.where(pos, v, 1.0)) + t, -np.inf)
+    return np.exp(np.maximum.accumulate(g) - t)
+
+def _yl_len(r, L, cad):
+    cum = _YL_LEN_CUM[cad]
+    b = _YL_LEN[cad][min(int(np.searchsorted(cum, r.random(), side="right")), len(cum) - 1)]
+    if b[1] >= L:
+        return int(L)
+    return int(min(L, r.integers(b[1], b[2])))
+
+def _yl_gauss(h, c, w):
+    d = (h - c + 12.0) % 24.0 - 12.0
+    return np.exp(-0.5 * (d / w) ** 2)
+
+def _yl_profiles(r, per_day, kind):
+    h = np.arange(per_day, dtype=np.float64) * (24.0 / per_day)
+    u = r.random(12)
+    m_c, e_c = 7.0 + 2.0 * u[0], 16.5 + 2.5 * u[1]
+    night = _YL_NIGHT[0] + (_YL_NIGHT[1] - _YL_NIGHT[0]) * u[2]
+    nd = 1.0 / (1.0 + np.exp(-(np.abs((h - 3.5 + 12.0) % 24.0 - 12.0) - 3.5) / 0.8))
+    base = night + (1.0 - night) * nd
+    am = 0.3 + 1.5 * u[3]
+    pm = 0.3 + 1.5 * u[4]
+    wk = base * (1.0 + am * _yl_gauss(h, m_c, 1.0 + 0.6 * u[5]) + pm * _yl_gauss(h, e_c, 1.4 + 1.0 * u[6])
+                 + 0.4 * u[7] * _yl_gauss(h, 12.5, 2.5))
+    we = base * (1.0 + (0.5 + 1.0 * u[8]) * _yl_gauss(h, 14.0, 3.0 + 1.0 * u[9]))
+    wk = wk / _v2_meanm(wk)
+    we = we / _v2_meanm(we) * (0.6 + 0.7 * u[10])
+    lo, hi = _YL_IMB[0] if kind < 2 else _YL_IMB[1]
+    amp = (lo + (hi - lo) * u[11]) if kind < 3 else 0.0
+    sgn = -1.0 if kind == 0 else 1.0
+    s = sgn * (_yl_gauss(h, m_c, 1.3) - _yl_gauss(h, e_c, 1.8))
+    if kind == 2:
+        s = _yl_gauss(h, 11.0, 2.0) - _yl_gauss(h, 17.0, 2.0)
+    s = s - np.sum(s * wk) / np.sum(wk)
+    m = float(np.abs(s).max())
+    dk = amp * s / m if m > 0 else s
+    s = s - np.sum(s * we) / np.sum(we)
+    de = 0.5 * amp * s / m if m > 0 else s
+    return wk, np.clip(dk, -0.9, 0.9), we, np.clip(de, -0.9, 0.9)
