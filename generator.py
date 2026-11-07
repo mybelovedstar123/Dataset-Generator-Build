@@ -1562,19 +1562,11 @@ def sanitise(rng, y, flags, starts, cfg):
     peak = np.abs(y).max(axis=1, keepdims=True)
     hot = _rows(peak[:, 0] > MAX_PEAK)
     if hot.size:
-        # rescale rather than clip: clipping flat-tops exactly the extreme
-        # events we paid to generate
+
         y[hot] = y[hot] * (MAX_PEAK / peak[hot])
     return y
 
-
 def _break_constant_prefix(rng, y, flags, starts, window=128):
-    """No emitted window may open with ``window`` exactly constant samples.
-
-    Constant series are structurally forbidden here.  They waste token budget and
-    they are a degenerate input to the causal arcsinh scaler, so a cold start is
-    always a real onset carrying at least tick-level jitter.
-    """
     n, L = y.shape
     idx = np.minimum(starts[:, None] + np.arange(window)[None, :], L - 1)
     head = np.take_along_axis(y, idx, axis=1)
@@ -1593,28 +1585,7 @@ def _break_constant_prefix(rng, y, flags, starts, window=128):
         pos = np.minimum(starts[rows] + rng.integers(4, window - 4, m), L - 1)
         y[rows, pos] = y[rows, pos] + unit * sgn
 
-
-# ═════════════════════════════ count prior ═════════════════════════════════
-
 def apply_count_prior(rng, y, flags, cfg):
-    """Impose the eval pool's dominant signature on a share of rows.
-
-    Measured on the revealed pool (block 8838000, 2,256 series): the median
-    series is 100% integer-valued, p90 negativity is 0.00, and the median series
-    has only ~9% distinct values.  Transport (the largest domain) is 68% exact
-    repeats with ~16 levels; sales spans ~476.  A corpus of signed, continuous,
-    high-entropy series teaches the wrong prior for most of the eval mass.
-
-    For ``count_prior_rate`` of the non-bounded rows: shift so the minimum sits
-    at a small positive floor (``[0, count_floor_frac] * std``), then for
-    ``count_integer_share`` of those, quantise onto ``n_levels`` equally spaced
-    integer levels with ``log10(n_levels)`` uniform on ``count_levels_log10``.
-    Quantising to a *level count* rather than to 1.0 keeps the stage scale-free
-    (the row has already been through the log10 scale mixture) and lets the
-    corpus span the pool's whole resolution range instead of one point in it.
-    Runs after scale and aggregation, on its own stream, so rate 0 leaves every
-    byte untouched.
-    """
     o = cfg["observation"]
     rate = float(o.get("count_prior_rate", 0.0))
     if rate <= 0.0:
@@ -1639,55 +1610,22 @@ def apply_count_prior(rng, y, flags, cfg):
         rlo = r.min(axis=1, keepdims=True)
         span = np.maximum(r.max(axis=1, keepdims=True) - rlo, 1e-12)
         tick = span / np.maximum(nlev[imask], 2.0)
-        r = np.rint((r - rlo) / tick) + np.rint(rlo / tick)   # integers, >= 0
+        r = np.rint((r - rlo) / tick) + np.rint(rlo / tick)
         rows[imask] = np.maximum(r, 0.0)
         ii = sel[imask]
         flags["integer"][ii] = True
     y[sel] = rows
     return y
 
-
-# ═══════════════ chronoforge: cf_fam_met ═══════════════
-# Block A — meteorological / geophysical families.
-#
-# Why this block is the largest: the evaluation pool's weather source emits
-# roughly 252 global grid points x 12 ERA5 variables and attaches no ``source``
-# metadata, so every weather row is its own bootstrap cluster.  That makes weather
-# the dominant share of both eval windows and — far more importantly — of the
-# *clusters* the confidence bound is resampled over.  A consistent weather win
-# converts almost one-for-one into LCB.
-#
-# Composition of those twelve variables: three smooth thermal, two ultra-smooth
-# pressure, four **bounded with genuine probability mass on a boundary** (three
-# cloud-cover channels and relative humidity), and three non-negative
-# right-skewed (wind at two heights plus gusts).  The bounded-with-atoms group is
-# the single largest addressable block in the pool and is exactly what an
-# unbounded symmetric predictive distribution wastes quantile mass on.
-
-
-# ══════════════════════════ shared bounded latent ══════════════════════════
-
 def bounded_latent(rng, n, L, ell, beta, diurnal, phi_ar, ar_frac):
-    """Standardised latent for a hard-censored bounded process.
-
-    Combines a synoptic Matern field, an optional diurnal term and AR(1)
-    micro-structure, then standardises.  The *censoring* (not a logistic
-    squash) is applied by the caller, which is what makes the boundary a
-    genuine point mass rather than an asymptote.
-    """
     z = matern_gp(rng, n, L, ell, nu=1.5)
     if diurnal is not None:
         z = z + beta * diurnal
     z = z + ar_frac * ar1(rng, n, L, phi_ar)
     return unit_std(z)
 
-
 def censor(z, eta, c, upper):
-    """y = U * clip(eta z + c, 0, 1) — hard censoring, so both bounds are atoms."""
     return upper * np.clip(eta * z + c, 0.0, 1.0)
-
-
-# ══════════════════════════════ A1 met_thermal ═════════════════════════════
 
 def a1_params(rng, B, cfg):
     p = cfg["families"]["met_thermal"]
@@ -1714,7 +1652,6 @@ def a1_params(rng, B, cfg):
         "annual_amp": rng.normal(0.0, 1.0, B),
     }
 
-
 def a1_build(P, rng, L, cad, cal, cfg):
     n = cad.n
     t = time_grid(L)[None, :]
@@ -1722,8 +1659,6 @@ def a1_build(P, rng, L, cad, cal, cfg):
 
     syn = matern_gp(rng, n, L, P["ell_syn"], nu=1.5) * P["amp_syn"].reshape(n, 1)
 
-    # cloudiness latent — the same machinery as A3, which is why the diurnal
-    # amplitude envelope is physically correct rather than an arbitrary AM.
     cz = bounded_latent(rng, n, L, P["cloud_ell"], 0.0, None,
                         rng.uniform(0.3, 0.7, n), 0.25)
     cloud = np.clip(P["cloud_eta"].reshape(n, 1) * cz + P["cloud_c"].reshape(n, 1),
@@ -1734,13 +1669,12 @@ def a1_build(P, rng, L, cad, cal, cfg):
     ph = t / per + rng.random((n, 1))
     k = P["kappa"].reshape(n, 1)
     phw = ph + (k / _cf_prims_TWO_PI) * np.sin(_cf_prims_TWO_PI * ph)
-    # asymmetric daily shape: fast morning rise, slow evening fall
+
     daily = np.sin(_cf_prims_TWO_PI * phw) + 0.25 * np.sin(2.0 * _cf_prims_TWO_PI * phw + 0.9)
     amp_t = (P["amp_d"].reshape(n, 1) * P["amp_syn"].reshape(n, 1)
              * (1.0 - P["rho"].reshape(n, 1) * cloud))
     diurnal = np.where(has_diurnal, daily * amp_t, 0.0)
 
-    # frontal passages: smooth monotone ramps, not steps
     E = 6
     cnt = rng.poisson(np.maximum(P["front_rate"].reshape(n, 1) * L, 0.0), size=(n, E))
     pos = rng.integers(0, L, size=(n, E)).astype(np.float64)
@@ -1767,9 +1701,6 @@ def a1_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=0, quant_boost=0.7, quant_rel_hi=0.35)
     return y, fl
 
-
-# ═══════════════════════ A2 met_pressure_smooth ════════════════════════════
-
 def a2_params(rng, B, cfg):
     p = cfg["families"]["met_pressure_smooth"]
     return {
@@ -1782,15 +1713,11 @@ def a2_params(rng, B, cfg):
         "quant": rng.random(B) < p["quantise_rate"],
     }
 
-
 def a2_build(P, rng, L, cad, cal, cfg):
     n = cad.n
     t = time_grid(L)[None, :]
     p_day = cad.p_day.reshape(n, 1)
 
-    # Matern-5/2 is twice mean-square differentiable: it has genuinely
-    # extrapolable local curvature, which is the only thing a 64-step forecast
-    # of a pressure field can exploit.
     syn = matern_gp(rng, n, L, P["ell_syn"], nu=2.5)
 
     has_day = p_day >= 4.0
@@ -1816,22 +1743,16 @@ def a2_build(P, rng, L, cad, cal, cfg):
     eps = rng.standard_normal((n, L)) * P["sig_e"].reshape(n, 1)
 
     y = syn + tide + dip + eps
-    # The defining property is a tiny relative variance riding on a large level:
-    # that is the small-MASE-denominator regime, where any trend error explodes
-    # log-MASE.  offset_pref = 1 forces the large-offset scale regime.
+
     fl = new_flags(n, scale_mode=0, offset_pref=1, quant_rel_hi=0.55)
     fl["quant_boost"] = np.where(P["quant"], 3.0, 0.4)
     return y, fl
 
-
-# ═══════════════════════ A3 met_bounded_atom ═══════════════════════════════
-
 UPPER_GRID = np.array([1.0, 8.0, 10.0, 100.0, 1000.0])
-
 
 def a3_params(rng, B, cfg):
     p = cfg["families"]["met_bounded_atom"]
-    variant = categorical(rng, p["variant_mix"], B)          # cloud / humidity / utilisation
+    variant = categorical(rng, p["variant_mix"], B)
     return {
         "variant": variant,
         "ell": logu(rng, p["latent_ell"][0], p["latent_ell"][1], B),
@@ -1850,7 +1771,6 @@ def a3_params(rng, B, cfg):
         "event_len": logu(rng, 2.0, 30.0, B),
     }
 
-
 def a3_build(P, rng, L, cad, cal, cfg):
     n = cad.n
     t = time_grid(L)[None, :]
@@ -1865,7 +1785,7 @@ def a3_build(P, rng, L, cad, cal, cfg):
 
     beta = np.where((variant == 0).reshape(n, 1), P["beta_cloud"].reshape(n, 1),
                     np.where((variant == 1).reshape(n, 1),
-                             -P["beta_hum"].reshape(n, 1),  # humidity is anti-phase
+                             -P["beta_hum"].reshape(n, 1),
                              0.0))
     diurnal = np.where((variant == 2).reshape(n, 1), biz, daily)
     diurnal = np.where(has_day, diurnal, 0.0)
@@ -1876,7 +1796,6 @@ def a3_build(P, rng, L, cad, cal, cfg):
     upper = P["upper"].reshape(n, 1)
     y = censor(z, P["eta"].reshape(n, 1), P["c"].reshape(n, 1), upper)
 
-    # clustered saturation events (rain / overcast spells) pin the ceiling
     on = P["event_on"]
     if on.any():
         mu = np.where(on.reshape(n, 1), P["event_mu"].reshape(n, 1), 0.0)
@@ -1898,9 +1817,6 @@ def a3_build(P, rng, L, cad, cal, cfg):
     fl["integer"] = (P["quantise"] & (P["upper"] > 1.0))
     return y, fl
 
-
-# ═══════════════════════════ A4 met_wind_speed ═════════════════════════════
-
 def a4_params(rng, B, cfg):
     p = cfg["families"]["met_wind_speed"]
     return {
@@ -1914,7 +1830,6 @@ def a4_params(rng, B, cfg):
         "quantise": rng.random(B) < p["quantise_rate"],
         "quant_step": np.where(rng.random(B) < 0.5, 0.1, 1.0),
     }
-
 
 def a4_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -1933,7 +1848,7 @@ def a4_build(P, rng, L, cad, cal, cfg):
     drift = matern_gp(rng, n, L, np.full(n, L / 2.0), nu=1.5) \
         * P["drift_amp"].reshape(n, 1)
     mw = P["mean_wind"].reshape(n, 1)
-    # Rice/Weibull marginal with a genuine hard floor at zero
+
     s = np.sqrt((u * sig + drift) ** 2 + (v * sig) ** 2) * mw
 
     g = P["gust"].reshape(n, 1)
@@ -1948,9 +1863,6 @@ def a4_build(P, rng, L, cad, cal, cfg):
                    quant_rel_hi=0.4)
     return s, fl
 
-
-# ═══════════════════════ A5 wet_dry_intermittent ═══════════════════════════
-
 def a5_params(rng, B, cfg):
     p = cfg["families"]["wet_dry_intermittent"]
     return {
@@ -1961,7 +1873,6 @@ def a5_params(rng, B, cfg):
         "start_wet": rng.random(B) < 0.15,
         "bell": rng.random(B) < 0.7,
     }
-
 
 def a5_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -2009,26 +1920,11 @@ def a5_build(P, rng, L, cad, cal, cfg):
         fl['renewal_extended'] = extended
     return y, fl
 
-
-# ═══════════════ chronoforge: cf_fam_ops ═══════════════
-# Block B — operational telemetry / web-cloudops families.
-#
-# The web-cloudops domain is one of the two the field loses.  The diagnosis is
-# structural: these shapes are produced by *control systems*, and every family in
-# the competitive field is open-loop.  An autoscaling sawtooth, a rate-limit
-# plateau, a queue backlog, a deploy overshoot-and-settle and a counter reset are
-# all closed-loop artefacts.  A model trained only on open-loop processes treats a
-# sawtooth as a staircase plus noise and cannot anticipate the next scale-out.
-
-
 def _daily_phase(rng, n, L, p_day, min_res=3.0):
     t = time_grid(L)[None, :]
     pd = np.asarray(p_day).reshape(n, 1)
     has = pd >= min_res
     return np.where(has, t / np.where(has, pd, 1e9), 0.0) + rng.random((n, 1)), has
-
-
-# ═══════════════════════ B1 ops_diurnal_traffic ════════════════════════════
 
 def b1_params(rng, B, cfg):
     p = cfg["families"]["ops_diurnal_traffic"]
@@ -2050,14 +1946,11 @@ def b1_params(rng, B, cfg):
         "dst": rng.random(B) < p["dst_rate"],
     }
 
-
 def b1_demand(P, rng, L, cad, cal, cfg):
-    """Shared demand process — also the driver for B2's controller."""
     n = cad.n
     t = time_grid(L)[None, :]
     ph, has_day = _daily_phase(rng, n, L, cad.p_day)
-    # Civil-time operational feeds shift by an hour twice a year; the weather
-    # families deliberately do NOT, because that source requests UTC.
+
     ph = ph + np.where(P["dst"].reshape(n, 1), dst_shift(rng, cal, 1.0), 0.0)
     prof = profile_trapezoid(rng, n, L, ph)
     prof = np.where(has_day, prof, 0.0)
@@ -2075,7 +1968,6 @@ def b1_demand(P, rng, L, cad, cal, cfg):
 
     lam = P["base"].reshape(n, 1) * shape * weekly * trend
 
-    # bursts arrive when traffic is high: immigrant rate proportional to lambda
     mu = (P["burst_mu"].reshape(n, 1) * shape
           * np.where(P["burst_on"].reshape(n, 1), 1.0, 0.0))
     _, cnt = hawkes(rng, n, L, np.ascontiguousarray(mu), P["branch"], P["burst_tau"])
@@ -2084,11 +1976,10 @@ def b1_demand(P, rng, L, cad, cal, cfg):
     lam = lam * (1.0 + 2.5 * burst)
     return np.maximum(lam, 0.0)
 
-
 def b1_build(P, rng, L, cad, cal, cfg):
     n = cad.n
     lam = b1_demand(P, rng, L, cad, cal, cfg)
-    # Taylor's law heteroscedasticity: sigma proportional to lambda^theta
+
     z = rng.standard_normal((n, L))
     sig = P["cv"].reshape(n, 1) * np.power(np.maximum(lam, 1e-12),
                                            P["theta_taylor"].reshape(n, 1))
@@ -2099,9 +1990,6 @@ def b1_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.8)
     fl["integer"] = P["count_emit"]
     return y, fl
-
-
-# ════════════════════ B2 ops_saturating_feedback ═══════════════════════════
 
 def b2_params(rng, B, cfg):
     p = cfg["families"]["ops_saturating_feedback"]
@@ -2117,7 +2005,6 @@ def b2_params(rng, B, cfg):
         "u_scale": np.array([1.0, 100.0])[categorical(rng, [0.35, 0.65], B)],
     })
     return q
-
 
 def b2_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -2140,9 +2027,6 @@ def b2_build(P, rng, L, cad, cal, cfg):
     fl["scale_mode"] = np.where(P["mode"] == 0, 2, 1).astype(np.int8)
     return y, fl
 
-
-# ═══════════════════════ B3 ops_counter_reset ══════════════════════════════
-
 def b3_params(rng, B, cfg):
     p = cfg["families"]["ops_counter_reset"]
     return {
@@ -2157,7 +2041,6 @@ def b3_params(rng, B, cfg):
         "revise_depth": rng.uniform(0.02, 0.3, B),
         "integer": rng.random(B) < 0.55,
     }
-
 
 def b3_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -2183,7 +2066,6 @@ def b3_build(P, rng, L, cad, cal, cfg):
     k_counter_reset_cal(np.ascontiguousarray(inc),
                           np.ascontiguousarray(reset).astype(np.int8), out)
 
-    # revisions: the last few published points are corrected downward
     if P["revise"].any():
         age = (L - 1) - np.arange(L)[None, :]
         w = np.clip(1.0 - age / np.maximum(P["revise_k"].reshape(n, 1), 1), 0.0, 1.0)
@@ -2193,9 +2075,6 @@ def b3_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.5, quant_boost=0.3)
     fl["integer"] = P["integer"] & (~P["revise"])
     return out, fl
-
-
-# ═══════════════════════ B4 ops_latency_queue ══════════════════════════════
 
 def b4_params(rng, B, cfg):
     p = cfg["families"]["ops_latency_queue"]
@@ -2210,7 +2089,6 @@ def b4_params(rng, B, cfg):
         "agg": rng.random(B) < p["percentile_rate"],
         "agg_m": rng.integers(8, 201, B),
     }
-
 
 def b4_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -2229,8 +2107,6 @@ def b4_build(P, rng, L, cad, cal, cfg):
     obs = np.where(P["lognorm"].reshape(n, 1), ln, par)
     y = mean * obs
 
-    # a percentile aggregate has a Gumbel-shaped marginal, quite different from
-    # the mean series it is computed from
     if P["agg"].any():
         m = np.maximum(P["agg_m"].reshape(n, 1).astype(np.float64), 2.0)
         um = np.maximum(rng.random((n, L)), 1e-12)
@@ -2246,9 +2122,6 @@ def b4_build(P, rng, L, cad, cal, cfg):
 
     fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.9)
     return y, fl
-
-
-# ═══════════════════════ B5 ops_deploy_transient ═══════════════════════════
 
 def b5_params(rng, B, cfg):
     p = cfg["families"]["ops_deploy_transient"]
@@ -2266,7 +2139,6 @@ def b5_params(rng, B, cfg):
         "out_len": logu(rng, 4.0, 300.0, B),
         "out_mode": categorical(rng, p["outage_mix"], B),
     }
-
 
 def b5_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -2304,7 +2176,6 @@ def b5_build(P, rng, L, cad, cal, cfg):
 
     y = base * var_mult + lvl + trans
 
-    # outages: hold-last / exact zero / linear backfill
     starts = rng.integers(0, L, size=(n, 4))
     lens = P["out_len"].reshape(n, 1) * np.exp(rng.normal(0.0, 0.5, size=(n, 4)))
     live_o = np.arange(4)[None, :] < P["n_out"].reshape(n, 1)
@@ -2326,11 +2197,7 @@ def b5_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=0, quant_boost=1.0)
     return y, fl
 
-
-# ═══════════════════════ B6 ops_rate_plateau ═══════════════════════════════
-
 _LADDER_MANT = np.array([1.0, 2.0, 5.0])
-
 
 def b6_params(rng, B, cfg):
     p = cfg["families"]["ops_rate_plateau"]
@@ -2346,7 +2213,6 @@ def b6_params(rng, B, cfg):
         "demand_cv": rng.uniform(0.15, 0.8, B),
         "diurnal_amp": rng.uniform(0.1, 1.0, B),
     }
-
 
 def b6_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -2386,7 +2252,6 @@ def b6_build(P, rng, L, cad, cal, cfg):
         fl['renewal_extended'] = extended
     return y, fl
 
-
 from numba import njit as _cas1_njit
 
 @_cas1_njit(cache=False, fastmath=False, nogil=True)
@@ -2402,9 +2267,7 @@ def _cas1_lindley_kernel(service, gap, initial):
             waits[i, t] = max(work, 0.)
     return waits
 
-
 def _cas1_workload_waits(service, gap, initial):
-    """gap[:,t] precedes job t; gap[:,0] is unused. +inf clears the queue."""
     b, a = (np.asarray(x, dtype=np.float64) for x in (service, gap))
     w = np.asarray(initial, dtype=np.float64)
     if b.ndim != 2 or a.shape != b.shape or w.shape != (len(b),):
@@ -2417,9 +2280,7 @@ def _cas1_workload_waits(service, gap, initial):
         raise ValueError('Workload overflow; do not silently clip')
     return out
 
-
 def _cas1_initial_workload(rng, rho, lognormal, sigma, shape, service):
-    """Ideal constant-rho M/G/1 initial workload, before subsequent time variation."""
     rho, sigma, shape, service = (np.asarray(x, dtype=np.float64)
                                  for x in (rho, sigma, shape, service))
     ln = np.asarray(lognormal)
@@ -2445,9 +2306,7 @@ def _cas1_initial_workload(rng, rho, lognormal, sigma, shape, service):
         raise ValueError('Initial workload overflow; do not truncate its tail')
     return out
 
-
 def _cas1_workload_response(P, rho, obs, parent, rng):
-    """Only non-aggregate rows change; all old draws precede this child stream."""
     rows = np.flatnonzero(~P['agg'])
     out = parent.copy()
     if rows.size == 0 or parent.shape[1] == 0:
@@ -2465,30 +2324,9 @@ def _cas1_workload_response(P, rho, obs, parent, rng):
         raise ValueError('Nonfinite response time')
     return out
 
-
 _CAS1_WORKLOAD_ENABLED = True
 
-
-# ═══════════════ chronoforge: cf_fam_health ═══════════════
-# Block C — healthcare / epidemiological / administrative families.
-#
-# Healthcare is the worst domain for the incumbent field.  The failure is almost
-# certainly *reporting structure*, not dynamics: public-health and hospital-admin
-# feeds carry weekend factors of 0.2-0.9x, Monday catch-up spikes of 1.3-2.4x,
-# batched multi-day releases with exact zeros in between, systematic revisions of
-# the most recent points, holiday collapses with compensation, and genuinely
-# under-dispersed counts.  A +-0.12 additive log day-of-week offset — which is
-# what the field ships — is an order of magnitude too weak.
-#
-# C1 adds the dynamics half: a real renewal equation, so the 64-step forecast
-# depends on whether R_t has crossed 1.  That is the actual forecasting question
-# for those feeds and it is not representable by a piecewise-linear log trend.
-
-
 MAX_TAPS = 64
-
-
-# ═════════════════════════════ C1 epi_renewal ══════════════════════════════
 
 def c1_params(rng, B, cfg):
     p = cfg["families"]["epi_renewal"]
@@ -2509,9 +2347,7 @@ def c1_params(rng, B, cfg):
     q.update(c2_params(rng, B, cfg))
     return q
 
-
 def _serial_interval(mu_g, cv_g, n):
-    """Discretised Gamma serial-interval kernel, truncated at 4 mu_g."""
     a = 1.0 / np.maximum(cv_g.reshape(n, 1) ** 2, 1e-3)
     scale = np.maximum(mu_g.reshape(n, 1), 1.0) / a
     s = np.arange(MAX_TAPS, dtype=np.float64)[None, :] + 0.5
@@ -2524,7 +2360,6 @@ def _serial_interval(mu_g, cv_g, n):
     taps = np.clip(trunc[:, 0].astype(np.int64), 1, MAX_TAPS)
     return np.ascontiguousarray(w), taps
 
-
 def c1_build(P, rng, L, cad, cal, cfg):
     n = cad.n
     logr = ou(rng, n, L, P["r_tau"]) * P["r_sig"].reshape(n, 1) \
@@ -2534,10 +2369,7 @@ def c1_build(P, rng, L, cad, cal, cfg):
     w, taps = _serial_interval(P["mu_g"], P["cv_g"], n)
     imp = np.where(rng.random((n, L)) < (1.0 / P["import_tau"].reshape(n, 1)),
                    P["import_size"].reshape(n, 1), 0.0)
-    # A pure renewal process with heavy over-dispersion has zero as an absorbing
-    # state, so most windows would be extinct.  Real notifiable-disease feeds
-    # carry a background importation rate; endemic rows get one, and the rest
-    # keep the sporadic-introduction behaviour.
+
     imp = imp + np.where(P["endemic"].reshape(n, 1),
                          P["endemic_rate"].reshape(n, 1), 0.0)
 
@@ -2561,9 +2393,6 @@ def c1_build(P, rng, L, cad, cal, cfg):
     )
     return out, fl
 
-
-# ═══════════════════ C2 admin_reporting_counts ═════════════════════════════
-
 def c2_params(rng, B, cfg):
     p = cfg["families"]["admin_reporting_counts"]
     return {
@@ -2584,15 +2413,11 @@ def c2_params(rng, B, cfg):
         "month_end_lift": rng.uniform(1.2, 3.0, B),
     }
 
-
 def _reporting_layer(P, rng, latent, cal, cfg):
-    """Multiplicative calendar + emission, applied to a non-negative latent."""
     n, L = latent.shape
     fac = dow_factors(rng, n, cfg)
     dow = apply_dow(fac, cal)
-    # holidays only for the rows that use them: the moving-feast masks and the
-    # compensation convolve are full-(rows, L) work, so computing them for
-    # every row and then masking was most of this family's cost.
+
     hol_rows = np.nonzero(P["hol_on"])[0]
     hol = np.ones((n, L))
     comp = np.zeros((n, L))
@@ -2606,8 +2431,6 @@ def _reporting_layer(P, rng, latent, cal, cfg):
                         P["month_end_lift"].reshape(n, 1), 1.0)
         mu = np.where(P["month_end"].reshape(n, 1), mu * lift, mu)
 
-    # one count model per row, sampled only on the rows that select it (the
-    # three full-grid draws + a where() were three times the sampling cost)
     emit = np.asarray(P["emit"]).reshape(n)
     y = np.zeros((n, L))
     r_nb = np.nonzero(emit == 0)[0]
@@ -2621,7 +2444,7 @@ def _reporting_layer(P, rng, latent, cal, cfg):
         phi = P["under_phi"][r_bi].reshape(-1, 1)
         ntr = np.maximum(np.round(mu[r_bi] / np.maximum(1.0 - phi, 1e-3)), 0.0)
         ntr = np.minimum(ntr, 1e7)
-        # under-dispersed counts: var = mu * phi < mu.  Exists nowhere in the field.
+
         y[r_bi] = rng.binomial(ntr.astype(np.int64),
                                np.broadcast_to(1.0 - phi, (r_bi.size, L))).astype(np.float64)
 
@@ -2632,7 +2455,6 @@ def _reporting_layer(P, rng, latent, cal, cfg):
         rv = revision_ramp(rng, y, P["revise_k"], P["revise_depth"])
         y = np.where(P["revise_on"].reshape(n, 1), rv, y)
     return y
-
 
 def c2_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -2645,11 +2467,7 @@ def c2_build(P, rng, L, cad, cal, cfg):
     fl["integer"] = (~P["revise_on"])
     return y, fl
 
-
-# ═══════════════════ C3 physio_quasiperiodic ═══════════════════════════════
-
 TEMPLATE_S = 256
-
 
 def c3_params(rng, B, cfg):
     p = cfg["families"]["physio_quasiperiodic"]
@@ -2670,11 +2488,9 @@ def c3_params(rng, B, cfg):
         "noise": logu(rng, 0.005, 0.15, B),
     }
 
-
 def c3_build(P, rng, L, cad, cal, cfg):
     n = cad.n
 
-    # waveform template: sharp systolic peak, slow recovery (or biphasic)
     s = np.arange(TEMPLATE_S, dtype=np.float64)[None, :] / TEMPLATE_S
     tmpl = np.zeros((n, TEMPLATE_S))
     sharp = P["peak_sharp"].reshape(n, 1)
@@ -2687,7 +2503,6 @@ def c3_build(P, rng, L, cad, cal, cfg):
     tmpl = np.where(bip, tmpl - 0.6 * np.roll(tmpl, TEMPLATE_S // 6, axis=1), tmpl)
     tmpl = unit_std(tmpl)
 
-    # instantaneous period: respiratory sinus arrhythmia + 1/f variability
     resp_p = P["p0"] * P["resp_ratio"]
     t = time_grid(L)[None, :]
     resp = np.sin(_cf_prims_TWO_PI * t / resp_p.reshape(n, 1) + rng.random((n, 1)) * _cf_prims_TWO_PI)
@@ -2708,7 +2523,6 @@ def c3_build(P, rng, L, cad, cal, cfg):
     art = rng.random((n, L)) < P["artefact_p"].reshape(n, 1)
     y = np.where(art, y + rng.standard_normal((n, L)) * P["artefact_amp"].reshape(n, 1), y)
 
-    # electrode-off flatlines
     starts = rng.integers(0, L, size=(n, 4))
     hit = rng.random((n, 4)) < (L / P["flat_tau"].reshape(n, 1) / 4.0)
     lens = P["flat_len"].reshape(n, 1) * np.exp(rng.normal(0.0, 0.6, size=(n, 4)))
@@ -2718,16 +2532,12 @@ def c3_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=0, quant_boost=0.8)
     return y, fl
 
-
-# ═══════════════════ C4 clinical_bounded_vitals ════════════════════════════
-
 VITAL_RANGES = np.array([
-    [70.0, 100.0],    # SpO2
-    [35.0, 190.0],    # heart rate
-    [34.5, 41.5],     # core temperature
-    [50.0, 200.0],    # blood pressure
+    [70.0, 100.0],
+    [35.0, 190.0],
+    [34.5, 41.5],
+    [50.0, 200.0],
 ])
-
 
 def c4_params(rng, B, cfg):
     p = cfg["families"]["clinical_bounded_vitals"]
@@ -2747,7 +2557,6 @@ def c4_params(rng, B, cfg):
         "noise": logu(rng, 1e-3, 0.03, B),
     }
 
-
 def c4_build(P, rng, L, cad, cal, cfg):
     n = cad.n
     t = time_grid(L)[None, :]
@@ -2759,9 +2568,6 @@ def c4_build(P, rng, L, cad, cal, cfg):
         + P["bias"].reshape(n, 1)
     base = lo + span * np.clip(1.0 / (1.0 + np.exp(-np.clip(slow, -30.0, 30.0))), 0.0, 1.0)
 
-    # asymmetric excursions: fast fall, slow recovery.  A symmetric predictive
-    # distribution cannot represent this, and the ceiling pinning makes the
-    # lag-m MASE denominator tiny, so a missed desaturation is catastrophic.
     E = 8
     cnt = rng.random((n, E)) < (L / (P["ev_tau"].reshape(n, 1) * E))
     pos = rng.integers(0, L, size=(n, E)).astype(np.float64)
@@ -2789,26 +2595,6 @@ def c4_build(P, rng, L, cad, cal, cfg):
     fl["integer"] = (P["tick"] == 1.0)
     return y, fl
 
-
-# ═══════════════ chronoforge: cf_fam_regime ═══════════════
-# Block D — persistence / regime core.
-#
-# This is the incumbent prior, and it is here to protect against regression on a
-# warm-started checkpoint rather than to differentiate.  We match it in *effect*
-# and improve its statistics in three specific ways:
-#
-# * dwell times are heavy-tailed (LogN mixed with a Pareto tail) instead of
-#   uniform — uniform dwell teaches a wrong hazard function;
-# * there is a third regime type, ``transitional``: a smooth monotone ramp
-#   between levels, because real regime changes are frequently gradual;
-# * the *variance* switches with the regime, not only the level.
-#
-# D2's staircase snaps 40% of its levels onto a recurring ``{1,2,5}x10^k`` tick
-# ladder, so successive levels sit on the same grid.  That is a real, learnable
-# regularity (policy rates, price ladders, config values, thermostat setpoints)
-# which an arbitrary-real staircase destroys.
-
-
 DORMANT_FLAT = 0
 DORMANT_MICRO = 1
 DORMANT_COUNTER = 2
@@ -2817,11 +2603,7 @@ DORMANT_TRANS = 4
 
 N_ACTIVE_KINDS = 6
 
-
-# ───────────────────────── active-regime base menu ─────────────────────────
-
 def active_base(rng, n, L, kind, cad, cfg):
-    """Unit-std active-regime carrier; each kind is built for its rows only."""
     out = np.zeros((n, L))
     for k in range(N_ACTIVE_KINDS):
         m = kind == k
@@ -2833,7 +2615,7 @@ def active_base(rng, n, L, kind, cad, cfg):
         elif k == 1:
             phi = np.stack([rng.uniform(0.1, 1.35, cnt),
                             rng.uniform(-0.75, 0.15, cnt)], axis=1)
-            # keep the AR(2) inside the stationarity triangle
+
             phi[:, 1] = np.minimum(phi[:, 1], 0.98 - np.abs(phi[:, 0]))
             e = rng.standard_normal((cnt, L))
             sub = np.zeros((cnt, L))
@@ -2856,9 +2638,6 @@ def active_base(rng, n, L, kind, cad, cfg):
         out[m] = sub
     return out
 
-
-# ═════════════════════════════ D1 regime_dwell ═════════════════════════════
-
 def d1_params(rng, B, cfg):
     p = cfg["families"]["regime_dwell"]
     return {
@@ -2880,7 +2659,6 @@ def d1_params(rng, B, cfg):
         "noise": logu(rng, 1e-3, 0.2, B),
     }
 
-
 def _heavy_dwell(rng, n, M, mean, sigma, pareto_a, heavy):
     ln = np.exp(rng.normal(np.log(np.maximum(mean, 1.0)).reshape(n, 1),
                            sigma.reshape(n, 1), size=(n, M)))
@@ -2888,7 +2666,6 @@ def _heavy_dwell(rng, n, M, mean, sigma, pareto_a, heavy):
     par = np.maximum(mean, 1.0).reshape(n, 1) * np.power(u, -1.0 / pareto_a.reshape(n, 1))
     take_par = (rng.random((n, M)) < 0.15) & heavy.reshape(n, 1)
     return np.maximum(np.where(take_par, par, ln), 2.0)
-
 
 def d1_build_factory(mode):
     def build(P, rng, L, cad, cal, cfg):
@@ -2906,7 +2683,6 @@ def d1_build_factory(mode):
         seg_len = gather_levels(dwell, seg_id)
         is_active = ((seg_id % 2) == 1) ^ sa
 
-        # segment levels follow a random walk; the variance switches too
         steps = rng.standard_normal((n, M)) * P["level_step"].reshape(n, 1)
         levels = np.cumsum(steps, axis=1)
         lvl_t = gather_levels(levels, seg_id)
@@ -2933,7 +2709,7 @@ def d1_build_factory(mode):
                              rng.standard_normal((n, L)) * P["sparse_amp"].reshape(n, 1),
                              0.0)
             dormant = np.abs(spike)
-        else:  # DORMANT_TRANS — a smooth monotone ramp between levels
+        else:
             w = np.clip(pos / np.maximum(P["ramp_frac"].reshape(n, 1), 1e-3), 0.0, 1.0)
             w = 0.5 * (1.0 + np.tanh(6.0 * (w - 0.5)))
             dormant = prev_lvl + (lvl_t - prev_lvl) * w
@@ -2970,7 +2746,7 @@ def d1_build_factory(mode):
                     tick = P['counter_step'][rr, None]
                     calm = np.round(now / tick) * tick
                 elif mode == DORMANT_ZERO:
-                    calm = dormant[rr]  # already-drawn sparse observations
+                    calm = dormant[rr]
                 else:
                     progress = (t - start) / np.maximum(slen, 1.0)
                     w = np.clip(progress / np.maximum(P['ramp_frac'][rr, None], 1e-3), 0.0, 1.0)
@@ -2993,11 +2769,7 @@ def d1_build_factory(mode):
 
     return build
 
-
-# ═══════════════════ D2 level_ladder_staircase ═════════════════════════════
-
 _MANT = np.array([1.0, 2.0, 5.0])
-
 
 def d2_params(rng, B, cfg):
     p = cfg["families"]["level_ladder_staircase"]
@@ -3015,7 +2787,6 @@ def d2_params(rng, B, cfg):
         "monotone": rng.random(B) < p["monotone_rate"],
         "noise": logu(rng, 1e-3, 0.3, B),
     }
-
 
 def d2_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -3066,9 +2837,6 @@ def d2_build(P, rng, L, cad, cal, cfg):
         fl['renewal_extended'] = extended
     return y, fl
 
-
-# ═══════════════ D3 smooth_drift_extrapolable ══════════════════════════════
-
 def d3_params(rng, B, cfg):
     p = cfg["families"]["smooth_drift_extrapolable"]
     return {
@@ -3088,9 +2856,7 @@ def d3_params(rng, B, cfg):
         "obs_ratio": logu(rng, p["obs_noise_ratio"][0], p["obs_noise_ratio"][1], B),
     }
 
-
 NU_VALUES = (0.5, 1.5, 2.5)
-
 
 def d3_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -3127,40 +2893,10 @@ def d3_build(P, rng, L, cad, cal, cfg):
     fl["offset_pref"] = np.where(P["obs_ratio"] < 0.02, 1, 0).astype(np.int8)
     return y, fl
 
-
-# ═══════════════ chronoforge: cf_fam_stoch ═══════════════
-# Block E — the stochastic backbone.
-#
-# Four things here have no analogue anywhere in the competitive field:
-#
-# * **moving-average and seasonal-differenced structure** (E1).  The field's whole
-#   linear vocabulary is AR(1)/AR(2)/threshold-AR.  MA terms and ``(1 - B^m)``
-#   differencing change the 64-step conditional-mean path and the error-variance
-#   profile in ways no pure-AR family can express, and via the batched ARMA kernel
-#   they cost the same as AR(2).
-# * **true conditional heteroscedasticity with leverage** (E2).  CRPS is a
-#   distributional score, so the largest relative gains come from conditioning
-#   interval *width* on the recent context.
-# * **self-exciting clustered arrivals with a power-law kernel** (E3), including
-#   genuine long-memory clustering built from four exponentials.
-# * **spectral-mixture kernels** (E5), which give quasi-periodic structure at
-#   non-integer, mutually incommensurate periods — a direct attack on the
-#   field-wide fixed integer period grid, at O(L log L).
-
-
 MAX_SEASONAL_M = 48
 MAX_ORDER = 3 + 2 * MAX_SEASONAL_M
 
-
-# ═════════════════════════════ E1 arma_sarima ══════════════════════════════
-
 def _poly_from_inverse_roots(rng, n, order, lo=0.05, hi=0.97):
-    """Degree-3 polynomial coefficients from drawn inverse roots.
-
-    Building the polynomial from roots (rather than drawing coefficients and
-    rejecting) makes stationarity and invertibility hold *by construction* — no
-    rejection loop, so the cost is a fixed handful of vector ops.
-    """
     r = rng.uniform(lo, hi, size=(n, 3)) * np.sign(rng.standard_normal((n, 3)))
     live = np.arange(3)[None, :] < np.asarray(order).reshape(n, 1)
     r = np.where(live, r, 0.0)
@@ -3168,14 +2904,11 @@ def _poly_from_inverse_roots(rng, n, order, lo=0.05, hi=0.97):
     rho = rng.uniform(lo, hi, n)
     th = rng.uniform(0.15, np.pi - 0.15, n)
     a, b, c = r[:, 0], r[:, 1], r[:, 2]
-    # all-real product
+
     c1_r = a + b + c
     c2_r = a * b + a * c + b * c
     c3_r = a * b * c
-    # one real root x one complex-conjugate pair.  At order 2 the pair IS the
-    # polynomial: drop the real root so the degree stays 2 (c3 == 0).  Leaving
-    # it in made a degree-3 seasonal factor whose B^3m term _expand_seasonal
-    # then truncated, and a truncated polynomial is not stationary.
+
     a_c = np.where(np.asarray(order) >= 3, a, 0.0)
     two_rc = 2.0 * rho * np.cos(th)
     c1_c = a_c + two_rc
@@ -3185,19 +2918,13 @@ def _poly_from_inverse_roots(rng, n, order, lo=0.05, hi=0.97):
     c1 = np.where(use, c1_c, c1_r)
     c2 = np.where(use, c2_c, c2_r)
     c3 = np.where(use, c3_c, c3_r)
-    # (1 - aB)(1 - bB)(1 - cB) = 1 - e1*B + e2*B^2 - e3*B^3: the elementary
-    # symmetric coefficients ALTERNATE in sign.  _expand_seasonal builds
-    # ``1 - k1*B - k2*B^2 - k3*B^3`` from what we return, so hand it
-    # (e1, -e2, e3) — returning (e1, e2, e3) flips the B^2 term and about a
-    # quarter of the draws land outside the unit circle and explode.
+
     return np.stack([c1, -c2, c3], axis=1)
 
-
 def _expand_seasonal(base, seas, m, n):
-    """Convolve a degree-3 polynomial with a seasonal polynomial at lag m."""
     out = np.zeros((n, MAX_ORDER + 1))
-    poly = np.concatenate([np.ones((n, 1)), -base], axis=1)          # 1 - c1 B - ...
-    spol = np.concatenate([np.ones((n, 1)), -seas], axis=1)          # 1 - S1 B^m - ...
+    poly = np.concatenate([np.ones((n, 1)), -base], axis=1)
+    spol = np.concatenate([np.ones((n, 1)), -seas], axis=1)
     rows = np.arange(n)
     for j in range(4):
         for k in range(3):
@@ -3205,7 +2932,6 @@ def _expand_seasonal(base, seas, m, n):
             idx = np.clip(idx, 0, MAX_ORDER)
             np.add.at(out, (rows, idx), poly[:, j] * spol[:, k])
     return -out[:, 1:]
-
 
 def e1_params(rng, B, cfg):
     p = cfg["families"]["arma_sarima"]
@@ -3224,7 +2950,6 @@ def e1_params(rng, B, cfg):
         "sig": logu(rng, 0.05, 20.0, B),
         "drift": rng.normal(0.0, 0.02, B),
     }
-
 
 def e1_build(P, rng, L, cad, cal, cfg):
     n = cad.n
