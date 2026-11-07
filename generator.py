@@ -30980,3 +30980,63 @@ def _c259r_dapr(r, L):
 # inserts' billed points: a (4096,) univariate record bills 4096). Hygiene gate per insert: shape (4096,), float64,
 # finite, non-constant, >= 20 distinct values, <= 2 % exact zeros (RULEBOOK D3).
 _C259B_TAG = 0xC259B001
+_C259B_L = 4096
+_C259B_KINDS = (
+    ("dapr", 0.0, "_c259r_dapr"),
+    ("aqr", 0.004, "_c259r_aqr"),
+    ("osm", 0.004, "_c201o_draw"),
+)
+
+
+def _c259b_ok(w):
+    if not (isinstance(w, np.ndarray) and w.shape == (_C259B_L,) and w.dtype == np.float64):
+        return False
+    if not bool(np.all(np.isfinite(w))) or not float(w.max()) > float(w.min()):
+        return False
+    return int(np.unique(w).size) >= 20 and float(np.mean(w == 0.0)) <= 0.02
+
+
+_C259BParent = Generator
+
+
+class Generator(_C259BParent):
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        kinds = [(k, q, globals()[fn]) for k, (_nm, q, fn) in enumerate(_C259B_KINDS) if q > 0.0]
+        slots = len(_C259B_KINDS)
+        out = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                yield x
+                out += 1
+                if out >= n:
+                    return
+                if not kinds:
+                    continue
+                u = _fcx_coins(seed, _C259B_TAG, i, slots)
+                for k, q, f in kinds:
+                    if u[k] >= q:
+                        continue
+                    w = None
+                    try:
+                        with np.errstate(all="ignore"):
+                            w = f(np.random.default_rng(np.random.SeedSequence([seed, _C259B_TAG, k + 1], spawn_key=(i,))), _C259B_L)
+                    except Exception:
+                        w = None
+                    if _c259b_ok(w):
+                        yield np.ascontiguousarray(w, dtype=np.float64)
+                        out += 1
+                        if out >= n:
+                            return
+        finally:
+            base.close()
+
+
+# ═══════════════ c215-LP: post-hoc continuation law (rmin=4, scope=all, quiet=False, rate=1.0, back>=256,
+# quiet_ext=False, late=(0.6, 0), NO pad guard: c268-P40U). Own SeedSequence per record; parent stream untouched. ═══════════════
+_C215LP_TAG = 0xC215B0
