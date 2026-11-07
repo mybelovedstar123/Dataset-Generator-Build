@@ -2997,9 +2997,6 @@ def e1_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=0, quant_boost=0.9)
     return out, fl
 
-
-# ═══════════════════════════ E2 garch_leverage ═════════════════════════════
-
 def e2_params(rng, B, cfg):
     p = cfg["families"]["garch_leverage"]
     persist = rng.uniform(p["persistence"][0], p["persistence"][1], B)
@@ -3020,7 +3017,6 @@ def e2_params(rng, B, cfg):
         "s0": logu(rng, 1.0, 5.0e4, B),
         "mu_drift": rng.normal(0.0, 3e-4, B),
     }
-
 
 def e2_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -3051,16 +3047,12 @@ def e2_build(P, rng, L, cad, cal, cfg):
     y = np.where(emit == 0, r, np.where(emit == 1, price, np.sqrt(np.maximum(rv, 0.0))))
 
     fl = new_flags(n, scale_mode=0, quant_boost=0.9)
-    # mean-zero return series have a small sum|y| and are therefore the
-    # relative-WQL amplifiers; anchor them at zero rather than on a big offset
+
     fl["offset_pref"] = np.where(P["emit"] == 0, 3,
                                  np.where(P["emit"] == 1, 1, 2)).astype(np.int8)
     fl["scale_mode"] = np.where(P["emit"] == 0, 0, 1).astype(np.int8)
     fl["positive"] = (P["emit"] > 0)
     return y, fl
-
-
-# ════════════════════════════ E3 hawkes_marked ═════════════════════════════
 
 def e3_params(rng, B, cfg):
     p = cfg["families"]["hawkes_marked"]
@@ -3075,7 +3067,6 @@ def e3_params(rng, B, cfg):
         "mark_sig": rng.uniform(0.4, 1.8, B),
         "decay_tau": logu(rng, 2.0, 120.0, B),
     }
-
 
 def e3_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -3099,16 +3090,12 @@ def e3_build(P, rng, L, cad, cal, cfg):
     fl["offset_pref"] = np.full(n, 2, dtype=np.int8)
     return y, fl
 
-
-# ═══════════════════════════ E4 chaotic_delay ══════════════════════════════
-
 _SYS_PAR = {
-    0: (10.0, 28.0, 8.0 / 3.0, 0.0),      # Lorenz
-    1: (0.2, 0.2, 5.7, 0.0),              # Rossler
-    2: (1.0, 0.35, 10.0, 15.0),           # Chua (cubic)
-    3: (1.0, 3.0, 5.0, 3.2),              # Hindmarsh-Rose
+    0: (10.0, 28.0, 8.0 / 3.0, 0.0),
+    1: (0.2, 0.2, 5.7, 0.0),
+    2: (1.0, 0.35, 10.0, 15.0),
+    3: (1.0, 3.0, 5.0, 3.2),
 }
-
 
 def e4_params(rng, B, cfg):
     p = cfg["families"]["chaotic_delay"]
@@ -3133,7 +3120,6 @@ def e4_params(rng, B, cfg):
         "mg_tau": rng.uniform(15.0, 40.0, B),
         "obs_noise": logu(rng, 1e-4, 5e-2, B),
     }
-
 
 def e4_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -3164,11 +3150,7 @@ def e4_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=0, quant_boost=0.6)
     return y, fl
 
-
-# ═══════════════════════ E5 spectral_kernel_zoo ════════════════════════════
-
 N_PSD_TYPES = 7
-
 
 def e5_params(rng, B, cfg):
     p = cfg["families"]["spectral_kernel_zoo"]
@@ -3192,7 +3174,6 @@ def e5_params(rng, B, cfg):
         "warp": rng.random(B) < p["warp_rate"],
         "noise": logu(rng, 1e-3, 0.25, B),
     }
-
 
 def _psd_slot(rng, P, f, n, slot):
     types = P["types"][:, slot]
@@ -3223,7 +3204,6 @@ def _psd_slot(rng, P, f, n, slot):
         out[m] = s / np.maximum(s.sum(axis=1, keepdims=True), 1e-300)
     return out
 
-
 def e5_build(P, rng, L, cad, cal, cfg):
     n = cad.n
     f = freq_grid(L)
@@ -3235,13 +3215,10 @@ def e5_build(P, rng, L, cad, cal, cfg):
         slots.append(s * live)
         psd += s * P["weights"][:, slot:slot + 1] * live
 
-    # spectral-mixture component: Q Gaussian peaks at arbitrary centres, giving
-    # quasi-periodic structure at mutually incommensurate, non-integer periods
     sm = psd_spectral_mixture(f, P["sm_c"], P["sm_w"],
                               P["sm_a"] * (np.arange(4)[None, :] < P["sm_q"].reshape(n, 1)))
     psd += sm / np.maximum(sm.sum(axis=1, keepdims=True), 1e-300)
 
-    # A kernel *product* is a PSD convolution; it needs two live components.
     prod_on = P["product"] & (P["n_comp"] >= 2)
     if prod_on.any():
         prod = psd_convolve(np.maximum(slots[0], 1e-300), np.maximum(slots[1], 1e-300))
@@ -3269,11 +3246,7 @@ def e5_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=0, quant_boost=0.9)
     return y, fl
 
-
-# ═══════════════════════ E6 changepoint_composite ══════════════════════════
-
 MAX_SEG = 5
-
 
 def e6_params(rng, B, cfg):
     p = cfg["families"]["changepoint_composite"]
@@ -3290,18 +3263,15 @@ def e6_params(rng, B, cfg):
         "ladder_run": logu(rng, 20.0, 600.0, (B, MAX_SEG)),
     }
 
-
 def e6_build(P, rng, L, cad, cal, cfg):
     n = cad.n
     t = time_grid(L)[None, :]
 
-    # Build MAX_SEG candidate processes per row, each with its own family.
     kinds = P["kinds"].reshape(-1)
     cad_rep = cad.take(np.repeat(np.arange(n), MAX_SEG))
     base_kind = np.minimum(kinds, N_ACTIVE_KINDS - 1)
     cands = active_base(rng, n * MAX_SEG, L, base_kind, cad_rep, cfg)
 
-    # two extra menu entries beyond the shared active-base menu
     tr = kinds == N_ACTIVE_KINDS
     if tr.any():
         slope = P["trend_slope"].reshape(-1)[tr].reshape(-1, 1)
@@ -3319,9 +3289,6 @@ def e6_build(P, rng, L, cad, cal, cfg):
     cands = cands.reshape(n, MAX_SEG, L) * P["amps"].reshape(n, MAX_SEG, 1)
     cands = cands + P["levels"].reshape(n, MAX_SEG, 1)
 
-    # Break hazard: uniform in time, elevated after a high-volatility stretch.
-    # The model therefore learns break hazard conditioned on observable
-    # precursors rather than on a fixed relative position.
     v = np.abs(np.diff(cands[:, 0, :], axis=1, prepend=cands[:, 0, :1]))
     v = decay_convolve(v, np.full(n, 64.0))
     v = (v - v.mean(axis=1, keepdims=True)) / np.maximum(v.std(axis=1, keepdims=True), 1e-9)
@@ -3355,7 +3322,7 @@ def e6_build(P, rng, L, cad, cal, cfg):
         y = np.where(join == 1, blend, y)
 
     if (P["join"] == 2).any():
-        # level-matched continuous joins: remove the jump at each break
+
         step = np.zeros((n, L))
         for j in range(MAX_SEG - 1):
             cj = np.clip(cut[:, j:j + 1], 0, L - 1)
@@ -3366,25 +3333,6 @@ def e6_build(P, rng, L, cad, cal, cfg):
 
     fl = new_flags(n, scale_mode=0, quant_boost=0.9)
     return y, fl
-
-
-# ═══════════════ chronoforge: cf_fam_domain ═══════════════
-# Block F — energy / transport / retail / macro families.
-#
-# Three of these encode a *nonlinear map from a smooth latent to the observable*,
-# which is what actually generates the shapes and what a purely additive prior
-# cannot represent:
-#
-# * electricity load is a hockey-stick function of temperature (heating below one
-#   breakpoint, cooling above another), and the price is a convex supply stack, so
-#   a modest change in residual load produces an extreme price spike;
-# * traffic flow is non-monotone in demand — past capacity, density rises and flow
-#   *falls* along the backward-bending branch of the fundamental diagram;
-# * solar output is a clipped diurnal bell times a cloud latent, i.e. an exact zero
-#   every night and a lag-24 difference of approximately zero through it.
-
-
-# ══════════════════ F1 energy_load_price_solar ═════════════════════════════
 
 def f1_params(rng, B, cfg):
     p = cfg["families"]["energy_load_price_solar"]
@@ -3411,7 +3359,6 @@ def f1_params(rng, B, cfg):
         "day_frac": rng.uniform(0.32, 0.55, B),
     }
 
-
 def f1_build(P, rng, L, cad, cal, cfg):
     n = cad.n
     t = time_grid(L)[None, :]
@@ -3420,7 +3367,6 @@ def f1_build(P, rng, L, cad, cal, cfg):
     ph = t / np.where(has_day, pd, 1e9) + rng.random((n, 1))
     frac = ph - np.floor(ph)
 
-    # latent temperature (the same construction as the thermal weather family)
     temp = matern_gp(rng, n, L, P["temp_ell"], nu=1.5) * P["temp_amp"].reshape(n, 1) \
         + 15.0 + np.where(has_day, 4.0 * np.sin(_cf_prims_TWO_PI * ph - 1.9), 0.0)
 
@@ -3433,13 +3379,11 @@ def f1_build(P, rng, L, cad, cal, cfg):
     wk[:, 6] = P["weekend"] * 0.97
     weekly = apply_dow(wk, cal)
 
-    # the hockey stick: heating below t_heat, cooling above t_cool
     resp = (1.0 + P["b_cool"].reshape(n, 1) * np.maximum(temp - P["t_cool"].reshape(n, 1), 0.0)
             + P["c_heat"].reshape(n, 1) * np.maximum(P["t_heat"].reshape(n, 1) - temp, 0.0))
     load = P["base"].reshape(n, 1) * shape * weekly * resp
     load = load * np.exp(rng.standard_normal((n, L)) * P["noise"].reshape(n, 1))
 
-    # convex supply stack -> occasional extreme spikes near capacity
     cap = load.mean(axis=1, keepdims=True) * (1.0 + 1.4 * P["cap_q"].reshape(n, 1))
     excess = (load - cap) / np.maximum(cap, 1e-9)
     price = P["p0"].reshape(n, 1) + P["kappa"].reshape(n, 1) * (
@@ -3447,7 +3391,6 @@ def f1_build(P, rng, L, cad, cal, cfg):
     neg = P["negative"].reshape(n, 1)
     price = np.where(neg, price - P["p0"].reshape(n, 1) * 1.35, price)
 
-    # solar: clipped bell x cloud, exactly zero every night
     bell = np.cos(np.pi * (frac - 0.5) / np.maximum(P["day_frac"].reshape(n, 1), 1e-3))
     bell = np.maximum(bell, 0.0)
     cz = unit_std(matern_gp(rng, n, L, P["cloud_ell"], nu=1.5))
@@ -3464,9 +3407,6 @@ def f1_build(P, rng, L, cad, cal, cfg):
     fl["offset_pref"] = np.where(P["mode"] == 1, 3, 2).astype(np.int8)
     return y, fl
 
-
-# ═══════════════════════════ F2 transport_flow ═════════════════════════════
-
 def f2_params(rng, B, cfg):
     p = cfg["families"]["transport_flow"]
     return {
@@ -3481,7 +3421,6 @@ def f2_params(rng, B, cfg):
         "inc_recover": logu(rng, 20.0, 200.0, B),
         "noise": logu(rng, 0.02, 0.35, B),
     }
-
 
 def f2_build(P, rng, L, cad, cal, cfg):
     n = cad.n
@@ -3500,14 +3439,12 @@ def f2_build(P, rng, L, cad, cal, cfg):
     demand = P["base"].reshape(n, 1) * shape * np.exp(
         ar1(rng, n, L, np.full(n, 0.97)) * P["noise"].reshape(n, 1))
 
-    # fundamental diagram: flow rises to capacity, then FALLS as density grows
     cap = P["capacity"].reshape(n, 1) * P["base"].reshape(n, 1)
     over = np.maximum(demand - cap, 0.0)
     flow = np.minimum(demand, cap) - P["jam_slope"].reshape(n, 1) * over \
         / (1.0 + over / np.maximum(cap, 1e-9))
     flow = np.maximum(flow, 0.0)
 
-    # incidents: sharp drop, queue build, slow recovery ramp
     E = 6
     hit = rng.random((n, E)) < (L / (P["inc_tau"].reshape(n, 1) * E))
     pos = rng.integers(0, L, size=(n, E)).astype(np.float64)
@@ -3528,9 +3465,6 @@ def f2_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.7)
     fl["integer"] = P["count_emit"]
     return y, fl
-
-
-# ═══════════════════ F3 retail_promo_intermittent ══════════════════════════
 
 def f3_params(rng, B, cfg):
     p = cfg["families"]["retail_promo_intermittent"]
@@ -3557,7 +3491,6 @@ def f3_params(rng, B, cfg):
         "nb_k": logu(rng, 0.3, 60.0, B),
     }
 
-
 def f3_build(P, rng, L, cad, cal, cfg):
     n = cad.n
     t = time_grid(L)[None, :]
@@ -3568,12 +3501,11 @@ def f3_build(P, rng, L, cad, cal, cfg):
     lam = P["base"].reshape(n, 1) * np.exp(
         P["trend"].reshape(n, 1) * t / L + P["season_amp"].reshape(n, 1) * season)
 
-    # promotions are calendar-locked: same weekday, monthly/quarterly recurrence
     per = np.maximum(P["promo_period"].reshape(n, 1), 1.0)
     phase = (day % per)
     on = phase < P["promo_len"].reshape(n, 1)
     lift = np.where(on, P["promo_lift"].reshape(n, 1), 1.0)
-    # pull-forward cannibalisation: a trough follows every promotion
+
     after = (phase >= P["promo_len"].reshape(n, 1)) & \
         (phase < (P["promo_len"] + P["trough_len"]).reshape(n, 1))
     lift = np.where(after, P["trough_depth"].reshape(n, 1), lift)
@@ -3584,12 +3516,11 @@ def f3_build(P, rng, L, cad, cal, cfg):
     if P["launch"].any():
         at = P["launch_at"].reshape(n, 1) * L
         ramp = np.clip((t - at) / P["launch_ramp"].reshape(n, 1), 0.0, 1.0)
-        # a genuine ramp from zero, never a constant prefix
+
         lam = np.where(P["launch"].reshape(n, 1), lam * ramp, lam)
 
     y = nb_counts(rng, lam, P["nb_k"])
 
-    # slow movers: Croston-style intermittency with correlated interval and size
     if P["slow"].any():
         M = 128
         gaps = np.maximum(np.exp(rng.normal(
@@ -3615,9 +3546,6 @@ def f3_build(P, rng, L, cad, cal, cfg):
     fl["offset_pref"] = np.full(n, 2, dtype=np.int8)
     return y, fl
 
-
-# ═══════════════════ F4 econ_release_staircase ═════════════════════════════
-
 def f4_params(rng, B, cfg):
     p = cfg["families"]["econ_release_staircase"]
     rel = np.array([7.0, 30.436875, 91.310625])
@@ -3637,14 +3565,11 @@ def f4_params(rng, B, cfg):
         "month_end_amp": rng.normal(0.0, 0.6, B),
     }
 
-
 def f4_build(P, rng, L, cad, cal, cfg):
     n = cad.n
     t = time_grid(L)[None, :]
     latent = matern_gp(rng, n, L, P["latent_ell"], nu=2.5)
 
-    # The release calendar advances in days; for business-day feeds it advances
-    # only on weekdays, which makes the effective weekly period 5.
     day_eff = np.where(P["biz_grid"].reshape(n, 1),
                        business_day_index(cal), cal.day_index).astype(np.float64)
     blk = np.floor(day_eff / np.maximum(P["release_days"].reshape(n, 1), 1.0))
@@ -3655,12 +3580,10 @@ def f4_build(P, rng, L, cad, cal, cfg):
     idx = np.maximum.accumulate(idx, axis=1)
     stair = np.take_along_axis(latent, idx, axis=1)
 
-    # revisions to the last 1-3 published values
     age_blk = blk.max(axis=1, keepdims=True) - blk
     rev = (age_blk < P["revise_n"].reshape(n, 1))
     stair = np.where(rev, stair * (1.0 - P["revise_depth"].reshape(n, 1)), stair)
 
-    # Nelson-Siegel term structure: level / slope / curvature, each near unit root
     if P["ns"].any():
         f = np.zeros((n, L, 3))
         for j in range(3):
@@ -3674,7 +3597,6 @@ def f4_build(P, rng, L, cad, cal, cfg):
         ns = f[:, :, 0] + f[:, :, 1] * l1 + f[:, :, 2] * l2
         stair = np.where(P["ns"].reshape(n, 1), ns, stair)
 
-    # month-end level jumps on econ/admin feeds
     if P["month_end"].any():
         me = np.cumsum(month_boundary(cal).astype(np.float64), axis=1)
         me = me - me.mean(axis=1, keepdims=True)
@@ -3685,32 +3607,7 @@ def f4_build(P, rng, L, cad, cal, cfg):
     fl = new_flags(n, scale_mode=0, offset_pref=1, quant_boost=1.5, quant_rel_hi=0.4)
     return y, fl
 
-
-# ═══════════════ chronoforge: cf_registry ═══════════════
-# Family registry and the batch builder.
-#
-# Thirty-two dispatch slots in six blocks.  Every slot carries a non-zero weight:
-# there are no dead families held at weight zero, because a family that cannot
-# earn its weight should be deleted rather than shipped as ballast.
-#
-# The key structural decision here is **per-family stream isolation**.  Family
-# ``f``'s per-row parameters are drawn as a *dense* batch draw of size ``B`` from
-# its own stream and then indexed by the group's row positions — not drawn at
-# group size.  Consequences:
-#
-# * changing family ``f``'s weight changes only *which* rows are family ``f``;
-#   every other family's rows stay byte-identical and, for a given row index,
-#   ``f``'s own parameters are unchanged;
-# * changing family ``f``'s code changes nothing outside ``f``;
-# * adding a family at a new slot perturbs nothing.
-#
-# That makes every weight and parameter A/B a genuinely paired comparison against
-# a noisy downstream metric, which is worth far more than the handful of
-# microseconds per series it costs.
-
-
 from typing import Callable, NamedTuple
-
 
 class Family(NamedTuple):
     name: str
@@ -3718,27 +3615,26 @@ class Family(NamedTuple):
     params: Callable
     build: Callable
 
-
 FAMILIES: tuple[Family, ...] = (
-    # ── Block A: meteorological / geophysical ──
+
     Family("met_thermal", "A", a1_params, a1_build),
     Family("met_pressure_smooth", "A", a2_params, a2_build),
     Family("met_bounded_atom", "A", a3_params, a3_build),
     Family("met_wind_speed", "A", a4_params, a4_build),
     Family("wet_dry_intermittent", "A", a5_params, a5_build),
-    # ── Block B: operational telemetry / web-cloudops ──
+
     Family("ops_diurnal_traffic", "B", b1_params, b1_build),
     Family("ops_saturating_feedback", "B", b2_params, b2_build),
     Family("ops_counter_reset", "B", b3_params, b3_build),
     Family("ops_latency_queue", "B", b4_params, b4_build),
     Family("ops_deploy_transient", "B", b5_params, b5_build),
     Family("ops_rate_plateau", "B", b6_params, b6_build),
-    # ── Block C: healthcare / epidemiological / administrative ──
+
     Family("epi_renewal", "C", c1_params, c1_build),
     Family("admin_reporting_counts", "C", c2_params, c2_build),
     Family("physio_quasiperiodic", "C", c3_params, c3_build),
     Family("clinical_bounded_vitals", "C", c4_params, c4_build),
-    # ── Block D: persistence / regime core (D1 has five dormant modes) ──
+
     Family("regime_dwell_flat", "D", d1_params,
            d1_build_factory(DORMANT_FLAT)),
     Family("regime_dwell_microdrift", "D", d1_params,
@@ -3751,14 +3647,14 @@ FAMILIES: tuple[Family, ...] = (
            d1_build_factory(DORMANT_TRANS)),
     Family("level_ladder_staircase", "D", d2_params, d2_build),
     Family("smooth_drift_extrapolable", "D", d3_params, d3_build),
-    # ── Block E: stochastic backbone ──
+
     Family("arma_sarima", "E", e1_params, e1_build),
     Family("garch_leverage", "E", e2_params, e2_build),
     Family("hawkes_marked", "E", e3_params, e3_build),
     Family("chaotic_delay", "E", e4_params, e4_build),
     Family("spectral_kernel_zoo", "E", e5_params, e5_build),
     Family("changepoint_composite", "E", e6_params, e6_build),
-    # ── Block F: energy / transport / retail / macro ──
+
     Family("energy_load_price_solar", "F", f1_params, f1_build),
     Family("transport_flow", "F", f2_params, f2_build),
     Family("retail_promo_intermittent", "F", f3_params, f3_build),
@@ -3767,7 +3663,6 @@ FAMILIES: tuple[Family, ...] = (
 
 FAMILY_INDEX = {f.name: i for i, f in enumerate(FAMILIES)}
 
-
 def family_weight_vector(cfg) -> np.ndarray:
     w = np.array([float(cfg["family_weights"][f.name]) for f in FAMILIES],
                  dtype=np.float64)
@@ -3775,27 +3670,15 @@ def family_weight_vector(cfg) -> np.ndarray:
         raise ValueError("family_weights must be finite, non-negative and non-zero")
     return w / w.sum()
 
-
 def coarse_pref_vector(cfg) -> np.ndarray:
     return np.array([float(cfg["family_coarse_pref"][f.name]) for f in FAMILIES],
                     dtype=np.float64)
 
-
-# ─────────────────────────────── batch schedule ────────────────────────────
-
 def batch_size(b: int, cfg) -> int:
-    """Batch size as a function of the batch index alone.
-
-    It must never depend on ``n_series``: that is what makes ``generate(k)`` a
-    byte-exact prefix of ``generate(K)`` for every ``k <= K``.  The final batch
-    is generated in full and truncated only on emit, so its contents are
-    unchanged by the request size.
-    """
     ramp = cfg["batch_schedule"]["ramp"]
     if b < len(ramp):
         return int(ramp[b])
     return int(cfg["batch_schedule"]["steady"])
-
 
 def batches_for(n_series: int, cfg) -> int:
     ramp = [int(x) for x in cfg["batch_schedule"]["ramp"]]
@@ -3808,22 +3691,11 @@ def batches_for(n_series: int, cfg) -> int:
     remain = n_series - total
     return len(ramp) + (remain + steady - 1) // steady
 
-
-# ───────────────────────────────── the builder ─────────────────────────────
-
 def build_batch(seed_hi: int, seed_lo: int, b: int, cfg: dict,
                 weights: np.ndarray, coarse: np.ndarray):
-    """Build batch ``b``: returns ``(values (B, L), emit_lengths (B,))``.
-
-    Series are generated at the full internal length and cropped to the row's
-    ladder length on emit, so the ladder costs nothing in vectorisation while
-    still exposing the model to the 256-4096 context regime the evaluation
-    actually spans.
-    """
     with np.errstate(over="ignore", invalid="ignore", divide="ignore",
                      under="ignore"):
         return _build_batch(seed_hi, seed_lo, b, cfg, weights, coarse)
-
 
 def _build_batch(seed_hi, seed_lo, b, cfg, weights, coarse):
     L = int(cfg["internal_length"])
@@ -3852,16 +3724,8 @@ def _build_batch(seed_hi, seed_lo, b, cfg, weights, coarse):
         for k in flags:
             flags[k][rows] = fl[k]
 
-    # Families that emit genuine counts are recorded before the observation layer
-    # can widen ``integer`` to mean "on some lattice"; the scale stage leaves
-    # counts at their own natural level so the integer lattice survives.
     flags["count"] = flags["integer"].copy()
 
-    # Scale first, then observe: a real feed is measured at its physical scale
-    # and only then reported with a granularity, a sensor range and a glitch
-    # process in those same physical units.  Rounding before scaling would make
-    # every "round human tick" and every clip level an accident of the family's
-    # internal normalisation.
     out = apply_scale(stream(seed_hi, seed_lo, b, STAGE_SCALE), out, flags, cfg)
     out = apply_observation(stream(seed_hi, seed_lo, b, STAGE_OBSERVE),
                             out, flags, cfg)
@@ -3873,30 +3737,12 @@ def _build_batch(seed_hi, seed_lo, b, cfg, weights, coarse):
                    out, flags, starts, cfg)
     return out, cad.length.astype(np.int64)
 
-
-# ═══════════════ chronoforge: cf_produce ═══════════════
-# Threaded batch producer with a strict-order reorder buffer.
-#
-# ``multiprocessing`` is on the static-guard blocked list, but threads are not,
-# and the sandbox is affinity-pinned to a whole lane core slice.  NumPy's FFT,
-# the numba kernels (compiled ``nogil=True``) and the bulk elementwise work all
-# release the GIL, so a handful of worker threads convert lane CPU that would
-# otherwise idle into a richer prior.
-#
-# Determinism is preserved exactly: a batch's contents depend only on
-# ``(seed, batch_index)`` — never on thread identity, scheduling, or the worker
-# count.  Workers may finish out of order; the reorder buffer emits strictly by
-# batch index, so the byte stream is identical at any thread count.  A bounded
-# in-flight window keeps peak memory flat.
-
-
 def worker_count(requested: int) -> int:
     try:
         avail = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
         avail = os.cpu_count() or 1
     return max(1, min(int(requested), int(avail)))
-
 
 class BatchProducer:
     def __init__(self, seed_hi: int, seed_lo: int, cfg: dict, weights, coarse,
@@ -3913,7 +3759,6 @@ class BatchProducer:
         return build_batch(self._hi, self._lo, b, self._cfg, self._w, self._c)
 
     def batches(self, n_series: int):
-        """Yield ``(values, lengths, n_to_emit)`` in strict batch order."""
         n_batches = batches_for(n_series, self._cfg)
         if self._workers <= 1:
             emitted = 0
@@ -3948,7 +3793,7 @@ class BatchProducer:
                         break
                 try:
                     res = self._build(b)
-                except BaseException as exc:  # surface to the consumer thread
+                except BaseException as exc:
                     with cv:
                         if state["error"] is None:
                             state["error"] = exc
@@ -3986,39 +3831,18 @@ class BatchProducer:
             for th in threads:
                 th.join(timeout=5.0)
 
-
-# ═══════════════ chronoforge: cf_config_schema ═══════════════
-# Eager, strict validation of ``config.json``.
-#
-# The config is plain and readable — there are no decoy keys and no identifier
-# obfuscation.  Obfuscation costs tuning velocity and buys nothing (every
-# obfuscated submission in this competition has been reverse-engineered anyway);
-# the moat is the priors, not the spelling.
-#
-# What we *do* enforce is strictness: unknown keys are rejected at every level,
-# probabilities must lie in [0, 1], paired ranges must be ordered, weight vectors
-# must be non-negative with a positive sum, and every family named in the registry
-# must have a weight and a cadence preference.  A typo in a swept parameter should
-# fail at construction, not silently produce a different corpus.
-
-
 from numbers import Real
 
-# spec kinds
-P = ("prob",)          # float in [0, 1]
-NUM = ("num",)         # any finite float
-POS = ("pos",)         # finite float > 0
-RANGE = ("range",)     # [lo, hi] with lo <= hi
-
+P = ("prob",)
+NUM = ("num",)
+POS = ("pos",)
+RANGE = ("range",)
 
 def W(k):
-    """Weight vector of exactly k non-negative entries."""
     return ("weights", k)
-
 
 def INT(lo, hi):
     return ("int", lo, hi)
-
 
 FAMILY_SCHEMA = {
     "met_thermal": {"synoptic_ell": RANGE, "synoptic_amp": RANGE,
@@ -4127,10 +3951,8 @@ SCHEMA = {
     "families": ("families",),
 }
 
-
 class ConfigError(ValueError):
     pass
-
 
 def _num(v, path):
     if isinstance(v, bool) or not isinstance(v, Real):
@@ -4139,7 +3961,6 @@ def _num(v, path):
     if f != f or f in (float("inf"), float("-inf")):
         raise ConfigError(f"{path}: value must be finite")
     return f
-
 
 def _weightlist(v, path, k):
     if not isinstance(v, (list, tuple)) or not v:
@@ -4154,7 +3975,6 @@ def _weightlist(v, path, k):
         total += f
     if total <= 0.0:
         raise ConfigError(f"{path}: weights sum to zero")
-
 
 def _check_scalar(spec, v, path):
     kind = spec[0]
@@ -4235,7 +4055,6 @@ def _check_scalar(spec, v, path):
     else:
         raise ConfigError(f"{path}: unhandled spec {spec!r}")
 
-
 def _check_node(spec, node, path, family_names):
     if isinstance(spec, dict):
         if not isinstance(node, dict):
@@ -4284,9 +4103,7 @@ def _check_node(spec, node, path, family_names):
         return
     _check_scalar(spec, node, path)
 
-
 def validate(cfg, family_names):
-    """Validate eagerly at construction; raise ``ConfigError`` on any problem."""
     if not isinstance(cfg, dict):
         raise ConfigError("config.json must be a JSON object")
     _check_node(SCHEMA, cfg, "", tuple(family_names))
@@ -4316,10 +4133,7 @@ def validate(cfg, family_names):
         raise ConfigError("internal_length must be a multiple of 32")
     return cfg
 
-
-# ═══════════════ engine ═══════════════
 def _cumulative_counter_params(rng: np.random.Generator, n: int, cfg: dict) -> dict:
-    """Parameters for persistent usage counters with observable increment laws."""
     high_dispersion = rng.random(n) < 0.45
     return {
         "base": np.exp(rng.uniform(np.log(0.08), np.log(5.0e4), size=n)),
@@ -4346,10 +4160,8 @@ def _cumulative_counter_params(rng: np.random.Generator, n: int, cfg: dict) -> d
         "reset_at": rng.uniform(0.20, 0.80, size=n),
     }
 
-
 def _cumulative_counter_build(P: dict, rng: np.random.Generator, L: int,
                               cad: Any, cal: Any, cfg: dict):
-    """Build monotone cumulative counters without a terminal plateau rewrite."""
     n = int(cad.n)
     t = np.arange(L, dtype=np.float64)[None, :]
     phi = np.asarray(P["phi"], dtype=np.float64).reshape(n, 1)
@@ -4402,9 +4214,6 @@ def _cumulative_counter_build(P: dict, rng: np.random.Generator, L: int,
     flags["integer"] = np.asarray(P["integer"], dtype=bool).copy()
     return out, flags
 
-
-# Replace only the native counter slot. The registry index and every other
-# family remain unchanged, so this is a bounded family-law intervention.
 _counter_index = FAMILY_INDEX["ops_counter_reset"]
 _counter_families = list(FAMILIES)
 _counter_spec = _counter_families[_counter_index]
@@ -4414,13 +4223,6 @@ _counter_families[_counter_index] = _counter_spec._replace(
 )
 FAMILIES = tuple(_counter_families)
 
-
-# Station thermometers and barometers publish in fixed units: tenths of a
-# degree or of a hectopascal, whole degrees, or whole Fahrenheit degrees
-# converted to Celsius. The thermal and pressure laws emit anomalies of a few
-# natural units, so an integer publication step turns them into staircases of
-# three to six levels; expressing each row in a drawn published unit restores
-# the measured station resolution (a tick of 1-5% of the series spread).
 def _met_published_units(build, units, probs, natural_lo, natural_hi):
     units = np.asarray(units, dtype=np.float64)
     probs = np.asarray(probs, dtype=np.float64)
@@ -4433,7 +4235,6 @@ def _met_published_units(build, units, probs, natural_lo, natural_hi):
         return y * (unit * natural)[:, None], flags
 
     return published
-
 
 _met_families = list(FAMILIES)
 for _met_name, _met_units, _met_probs, _met_lo, _met_hi in (
@@ -4486,14 +4287,7 @@ CF_GRAFT: tuple[str, ...] = (
     'econ_release_staircase',
 )
 
-
 def _cf_builder(name: str, config: dict | None = None):
-    """Adapt the native builder without discarding its per-row capabilities.
-
-    The ordinary callable still returns only an array, preserving the original
-    interface and draw order. The host may explicitly request metadata through
-    ``with_metadata``; metadata is local to the call, never thread-global.
-    """
     f = FAMILY_INDEX[name]
     spec = FAMILIES[f]
     cf_config = _CF_CFG if config is None else config
@@ -4514,20 +4308,14 @@ def _cf_builder(name: str, config: dict | None = None):
     build.with_metadata = build_with_metadata
     return build
 
-
 CF_BUILDERS: tuple = tuple(_cf_builder(name) for name in CF_GRAFT)
 
-
 def chunk_batch_size(produced: int) -> int:
-    """Match Midas v47 monolithic chunk ramp (256 → 1024 → 2048)."""
     if produced == 0:
         return _STARTUP_CHUNK
     if produced == _STARTUP_CHUNK:
         return _RAMP_CHUNK
     return _CHUNK
-
-
-# --- domain mix (inlined from cascade_gen/domains.py) ---
 
 DOMAINS: tuple[str, ...] = (
     "econ_fin",
@@ -4539,12 +4327,10 @@ DOMAINS: tuple[str, ...] = (
     "web_cloudops",
 )
 
-# Sentinel fam slot for the per-chunk domain-assignment stream (impl uses 999).
 DISPATCH_STREAM_DOMAIN = 998
 
-# Domain-targeted families (Chronoforge blocks, POOL4, ED5, native domain laws).
 FAMILY_DOMAIN: dict[str, str] = {
-    # nature
+
     "met_thermal": "nature",
     "met_pressure_smooth": "nature",
     "met_bounded_atom": "nature",
@@ -4557,7 +4343,7 @@ FAMILY_DOMAIN: dict[str, str] = {
     "coastal_residual": "nature",
     "flow_recession": "nature",
     "rk4_flows": "nature",
-    # web_cloudops
+
     "ops_diurnal_traffic": "web_cloudops",
     "ops_saturating_feedback": "web_cloudops",
     "ops_counter_reset": "web_cloudops",
@@ -4570,7 +4356,7 @@ FAMILY_DOMAIN: dict[str, str] = {
     "cluster_job_attr": "web_cloudops",
     "web_traffic_plateau": "web_cloudops",
     "weekly_web_counts": "web_cloudops",
-    # healthcare
+
     "epi_renewal": "healthcare",
     "admin_reporting_counts": "healthcare",
     "physio_quasiperiodic": "healthcare",
@@ -4582,7 +4368,7 @@ FAMILY_DOMAIN: dict[str, str] = {
     "sticky_station": "healthcare",
     "capacity_counts": "healthcare",
     "overdispersed_counts": "healthcare",
-    # energy
+
     "energy_load_price_solar": "energy",
     "storm_outage_counts": "energy",
     "grid_flow": "energy",
@@ -4590,11 +4376,11 @@ FAMILY_DOMAIN: dict[str, str] = {
     "spiky_price": "energy",
     "broadband_path_attr": "energy",
     "dispatch_price": "energy",
-    # transport
+
     "transport_flow": "transport",
     "transport_flow_tail": "transport",
     "settle_hold": "transport",
-    # sales
+
     "retail_promo_intermittent": "sales",
     "retail_promo_tail": "sales",
     "weekly_demand": "sales",
@@ -4602,7 +4388,7 @@ FAMILY_DOMAIN: dict[str, str] = {
     "store_sales_panel": "sales",
     "sales_promo_stockout_panel": "sales",
     "biz_day_counts": "sales",
-    # econ_fin
+
     "econ_release_staircase": "econ_fin",
     "level_ladder_staircase": "econ_fin",
     "smooth_drift_extrapolable": "econ_fin",
@@ -4619,7 +4405,6 @@ FAMILY_DOMAIN: dict[str, str] = {
     "road_commute_counts": "transport",
 }
 
-# Cross-domain stochastic / regime backbone — included in every domain pool.
 GENERAL_FAMILIES: frozenset[str] = frozenset(
     {
         "trend_seasonal_ar",
@@ -4658,9 +4443,7 @@ GENERAL_FAMILIES: frozenset[str] = frozenset(
     }
 )
 
-
 def validate_family_coverage(families: tuple[str, ...]) -> None:
-    """Every registry family must be domain-tagged or general."""
     missing = [
         f
         for f in families
@@ -4670,7 +4453,6 @@ def validate_family_coverage(families: tuple[str, ...]) -> None:
         raise ValueError(
             f"families missing domain tag: {sorted(missing)}"
         )
-
 
 def _parse_weight_dict(
     raw: dict[str, Any],
@@ -4689,12 +4471,10 @@ def _parse_weight_dict(
         raise ValueError(f"{label} must not be all zero")
     return w / w.sum()
 
-
 def parse_domain_mix(
     cfg: dict[str, Any],
     families: tuple[str, ...],
 ) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
-    """Return (enabled, final_domain_weights, start_domain_weights)."""
     validate_family_coverage(families)
     block = dict(cfg.get("domain_mix", {}))
     if not block.get("enabled", False):
@@ -4707,11 +4487,9 @@ def parse_domain_mix(
         start = final.copy()
     return True, final, start
 
-
 def build_domain_pool_indices(
     families: tuple[str, ...],
 ) -> dict[str, np.ndarray]:
-    """For each domain, family indices = tagged ∪ general."""
     validate_family_coverage(families)
     general = np.array(
         [i for i, f in enumerate(families) if f in GENERAL_FAMILIES],
@@ -4726,9 +4504,7 @@ def build_domain_pool_indices(
                                    dtype=np.int64)
     return pools
 
-
 def _largest_remainder(weights: np.ndarray, total: int) -> np.ndarray:
-    """Allocate ``total`` integer slots proportional to ``weights`` (sum 1)."""
     exact = weights * total
     counts = np.floor(exact).astype(np.int64)
     remainder = total - int(counts.sum())
@@ -4739,7 +4515,6 @@ def _largest_remainder(weights: np.ndarray, total: int) -> np.ndarray:
             counts[i] += 1
     return counts
 
-
 def dispatch_domain_mix(
     base_seed: int,
     chunk_index: int,
@@ -4748,7 +4523,6 @@ def dispatch_domain_mix(
     family_weights: np.ndarray,
     pool_indices: dict[str, np.ndarray],
 ) -> np.ndarray:
-    """Two-stage stratified dispatch: domain quota, then family within domain."""
     fam_ids = np.empty(batch_size, dtype=np.int64)
 
     counts = _largest_remainder(domain_weights, batch_size)
@@ -4789,14 +4563,12 @@ def dispatch_domain_mix(
 
     return fam_ids
 
-
 def assign_domain_slots(
     base_seed: int,
     chunk_index: int,
     batch_size: int,
     domain_weights: np.ndarray,
 ) -> np.ndarray:
-    """Return shuffled domain index per slot (stage 1 only; for tests)."""
     counts = _largest_remainder(domain_weights, batch_size)
     domain_ids = np.empty(batch_size, dtype=np.int64)
     pos = 0
@@ -4811,25 +4583,16 @@ def assign_domain_slots(
     domain_rng.shuffle(domain_ids)
     return domain_ids
 
-
 def family_allowed_in_domain(family_name: str, domain: str) -> bool:
-    """True if ``family_name`` may be dispatched under ``domain``."""
     tagged = FAMILY_DOMAIN.get(family_name)
     if tagged is not None:
         return tagged == domain
     return family_name in GENERAL_FAMILIES
 
-# ==============================================================================
-# Seasonal period tables
-# ==============================================================================
-
-
 _CHUNK = 2048
-
 
 _STARTUP_CHUNK = 256
 _RAMP_CHUNK = 1024
-
 
 _SEASONAL_PERIODS = np.array(
     [4, 7, 12, 15, 24, 30, 48, 52, 60, 90, 96, 144, 168, 183, 240, 288,
@@ -4845,22 +4608,12 @@ _SEASONAL_PROBS /= _SEASONAL_PROBS.sum()
 _SEASONAL_PROBS_CDF = _SEASONAL_PROBS.cumsum()
 _SEASONAL_PROBS_CDF /= _SEASONAL_PROBS_CDF[-1]
 
-
 _SEASONAL_PAIRS = np.array(
     [[15, 60], [60, 240], [24, 168], [48, 336], [96, 672], [7, 365],
      [12, 52]],
     dtype=np.float64,
 )
 
-
-# ==============================================================================
-# Family registry, weights, dispatch
-# ==============================================================================
-
-# --- ported from jupiter-king-ed2351 ---------------------------------
-# The members of the proven six-family block this host lacks.
-# Appended, never inserted: at weight 0.0 the corpus digest is
-# unchanged, which this script asserts against the unported host.
 _ED5: tuple[str, ...] = (
     "transport_flow_tail",
     "capacity_counts",
@@ -4869,15 +4622,6 @@ _ED5: tuple[str, ...] = (
     "retail_promo_tail",
 )
 
-
-# --- ported from tianyiswufeng/ts-c123f85468 (v6-rain) ----------------
-# Four count/gauge laws written against the revealed eval pool, three of
-# which are dormant at zero weight in the donor itself. Each is mostly
-# flat, like held_rate, but flat in the shape of one specific heavy
-# domain: traffic -> web_cloudops, admin -> healthcare, outage -> energy,
-# rain -> nature. Appended, never inserted: family order indexes both the
-# builder tuple and the dispatch CDF, so at weight 0.0 the corpus digest
-# is unchanged -- build_pool4_gens.py --verify-inert asserts exactly that.
 _POOL4: tuple[str, ...] = (
     "heavy_traffic_counts",
     "sparse_admin_counts",
@@ -4885,7 +4629,6 @@ _POOL4: tuple[str, ...] = (
     "gauge_rain",
 )
 
-# --- DeepEcho/DoppelGANger-inspired (reference only; no deps) ----------
 _DEEP1: tuple[str, ...] = (
     "store_sales_panel",
     "web_session_attr",
@@ -4893,13 +4636,11 @@ _DEEP1: tuple[str, ...] = (
     "cluster_job_attr",
 )
 
-# --- lab3: three families from competitors/153 (receipt holes) ---------------
 _LAB3: tuple[str, ...] = (
     "biz_day_counts",
     "weekly_web_counts",
     "dispatch_price",
 )
-
 
 _FAMILIES: tuple[str, ...] = (
     "trend_seasonal_ar",
@@ -4938,15 +4679,12 @@ _FAMILIES: tuple[str, ...] = (
     "tidal_constituents",
     "envelope_mod",
     "rate_counts",
-    # Appended, never inserted: family order indexes the builder tuple and the
-    # dispatch CDF, so appending at zero weight leaves every existing row's family
-    # assignment and draw sequence untouched. scripts/check_body_default_exact.py
-    # holds that claim to a byte-identical corpus.
+
     "dispersion_counts",
     "dispatch_blocks",
-    # grafted chronoforge families (appended, zero weight => byte-identical corpus)
+
     *CF_GRAFT,
-    # grafted vanta native family (appended LAST, zero weight => byte-identical corpus)
+
     "cycle_profile",
     *_ED5,
     *_POOL4,
@@ -4965,7 +4703,6 @@ _FAMILIES: tuple[str, ...] = (
     "intraday_spot_price",
     "road_commute_counts",
 )
-
 
 _DEFAULT_WEIGHTS: dict[str, float] = {
     "tidal_constituents": 0.0,
@@ -5006,7 +4743,7 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
     "grid_flow": 0.0,
     "price_shock": 0.0,
     "coastal_residual": 0.0,
-    # grafts default to zero: absent from config => throne corpus unchanged
+
     **{name: 0.0 for name in CF_GRAFT},
     **{name: 0.0 for name in _ED5},
     **{name: 0.0 for name in _POOL4},
