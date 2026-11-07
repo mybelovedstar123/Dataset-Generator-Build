@@ -30183,3 +30183,37 @@ class Generator(_K32G_PARENT):
 # comes back as a record with only "values" rescaled (groups and any other field untouched, same object); a bare array comes
 # back as an array (identical to magguard_layer.py). The inner generator is closed in finally.
 _MG2_PEAK = 1.0e4
+_MG2_BASE = Generator
+
+
+def _mg2_cap(y):
+    a = np.asarray(y, dtype=np.float64)
+    pk = np.abs(a).max(axis=-1)
+    big = pk > _MG2_PEAK
+    if big.any():
+        k = np.ceil(np.log10(pk[big] / _MG2_PEAK))
+        a = a.copy()
+        a[big] = a[big] / (10.0 ** k)[:, None]
+    return a
+
+
+class Generator(_MG2_BASE):
+    def generate(self, n_series):
+        inner = super().generate(n_series)
+        try:
+            for y in inner:
+                if isinstance(y, dict):
+                    out = dict(y)
+                    out["values"] = _mg2_cap(y["values"])
+                    yield out
+                else:
+                    yield _mg2_cap(y)
+        finally:
+            inner.close()
+
+
+# ═══════════════ SINGLETONS (append-only, last): every channel its own group ════════════════════════════════════════════
+# K0-32G labels each packed c268 record as one group, so a multichannel record's 2-5 rows still attend to each other in the
+# variate blocks. ~88 % of scored eval windows are univariate (C = 1: the model sees only that channel), so this arm makes
+# every channel a singleton: the values are byte-identical to K0-32G, only the labels change (np.arange(32) is canonical).
+_SG_BASE = Generator
