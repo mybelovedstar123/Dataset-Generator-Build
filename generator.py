@@ -20135,3 +20135,303 @@ def _xc_rate_burst(r, n):
     lx = _xc_events(r, np.log(x), _xc_count(r, 0.5, 0.5, 4.0), 0, 0, _xc_count(r, 0.3, 1.0, 20.0), 0.3)
     level = 10.0 ** r.uniform(3.5, 5.2)
     return _xc_store(r, level * np.exp(lx), 2 if r.random() < 0.25 else 0)
+
+def _xc_rate_shallow(r, n):
+    base = float(r.uniform(0.55, 0.88))
+    prof, lvl = _xc_cycle(r, n, _xc_lu(r, 0.03, 0.2), _xc_lu(r, 0.004, 0.03), _xc_lu(r, 0.003, 0.02), r.random())
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _xc_ar1(r, n, _xc_lu(r, 60.0, 600.0), _xc_lu(r, 0.01, 0.05))
+    lx = lx + _xc_ar1(r, n, _xc_lu(r, 6.0, 40.0), _xc_lu(r, 0.006, 0.03))
+    lx = lx + _xc_box(_xc_ar1(r, n, _xc_lu(r, 2.0, 12.0), _xc_lu(r, 0.004, 0.015), r.uniform(0.0, 0.9)), int(r.integers(2, 6)))
+    lx = _xc_events(r, lx, _xc_count(r, 0.1, 2.0, 12.0), _xc_count(r, 0.5, 0.5, 4.0), _xc_count(r, 0.5, 0.5, 6.0),
+                    _xc_count(r, 0.3, 1.0, 12.0), _xc_lu(r, 0.04, 0.2))
+    level = 10.0 ** r.uniform(4.2, 6.1)
+    return _xc_store(r, level * np.exp(lx), 2 if r.random() < 0.4 else 0)
+
+def _xc_rate_error(r, n):
+    base = float(r.uniform(0.35, 0.8))
+    prof, lvl = _xc_cycle(r, n, _xc_lu(r, 0.05, 0.3), _xc_lu(r, 0.01, 0.1), _xc_lu(r, 0.003, 0.02), r.random())
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _xc_ar1(r, n, _xc_lu(r, 30.0, 400.0), _xc_lu(r, 0.03, 0.15))
+    lx = lx + _xc_ar1(r, n, _xc_lu(r, 0.5, 4.0), _xc_lu(r, 0.05, 0.25), r.uniform(0.2, 0.9))
+    x = np.exp(lx) * (1.0 + _xc_pulses(r, n, _xc_lu(r, 0.004, 0.05), 1.0, 30.0, 0.3, 6.0))
+    level = 10.0 ** r.uniform(-0.6, 0.4)
+    return _xc_store(r, level * x, 0)
+
+def _xc_rate(r, L):
+    n = L if (r.random() < 0.7 or L <= 3440) else int(r.integers(3440, L))
+    k = int(np.searchsorted(_XC_RATE_KINDS, r.random() * _XC_RATE_KINDS[-1], side="right"))
+    if k <= 0:
+        x = _xc_rate_std(r, n)
+    elif k == 1:
+        x = _xc_rate_burst(r, n)
+    elif k == 2:
+        x = _xc_rate_shallow(r, n)
+    else:
+        x = _xc_rate_error(r, n)
+    return _xc_pad(np.maximum(x, 0.0), L)
+
+def _xc_tide(r, L):
+    u = r.random()
+    if u < 0.30 or L <= 1024:
+        n = L
+    elif u < 0.72:
+        n = int(_xc_lu(r, 900.0, 1750.0))
+    else:
+        n = int(_xc_lu(r, 400.0, float(L)))
+    n = max(64, min(n, L))
+    t = np.arange(n, dtype=np.float64) + r.uniform(0.0, 5e5)
+    a2 = _xc_lu(r, 0.03, 1.4)
+    form = float(np.clip(np.exp(r.normal(np.log(0.45), 0.9)), 0.03, 6.0))
+    s2 = a2 * 0.46 * float(np.exp(r.normal(0.0, 0.35)))
+    a1 = form * (a2 + s2)
+    k1 = a1 * r.uniform(0.5, 0.66)
+    shallow = r.random() < 0.15
+    r4 = r.uniform(0.07, 0.3) if shallow else float(min(np.exp(r.normal(np.log(0.03), 0.8)), 0.25))
+    amps = np.array([a2, s2, a2 * 0.19 * float(np.exp(r.normal(0.0, 0.3))), k1, a1 - k1,
+                     (a1 - k1) * 0.19 * float(np.exp(r.normal(0.0, 0.3))), a2 * r4, a2 * r4 * r.uniform(0.3, 0.7),
+                     a2 * (r.uniform(0.03, 0.1) if shallow else float(min(np.exp(r.normal(np.log(0.012), 0.8)), 0.08))),
+                     a2 * float(min(np.exp(r.normal(np.log(0.03), 0.8)), 0.2))])
+    ph = r.uniform(0.0, _XC_TWO_PI, amps.size)
+    x = np.zeros(n)
+    for j in range(amps.size):
+        x += amps[j] * np.cos(t * (_XC_TWO_PI / _XC_TIDE_PER[j]) + ph[j])
+    a_tot = float(a2 + s2 + a1)
+
+    x = x + _xc_smooth(r, n, r.uniform(120.0, 1440.0), float(np.clip(a_tot * np.exp(r.normal(np.log(0.1), 0.6)), 0.006, 0.35))
+                       + _xc_lu(r, 0.003, 0.025))
+    if r.random() < 0.6:
+        p_s = _xc_lu(r, 8.0, 90.0)
+        amp_s = _xc_lu(r, 0.0015, 0.035) * (r.uniform(1.5, 4.0) if (a_tot < 0.1 and r.random() < 0.5) else 1.0)
+        env = np.exp(_xc_smooth(r, n, 18.0 * 60.0 / 3.0, 0.45))
+        psi = np.cumsum(r.standard_normal(n)) * float(np.sqrt(_XC_TWO_PI / (p_s * r.uniform(4.0, 25.0))))
+        x = x + amp_s * env * np.cos(t * (_XC_TWO_PI / p_s) + psi)
+    s_w = _xc_lu(r, 0.0005, 0.01) if r.random() < 0.8 else _xc_lu(r, 0.01, 0.05)
+    if r.random() < 0.35:
+        e = r.standard_t(float(r.uniform(2.5, 6.0)), n)
+        e = e / max(float(e.std()), 1e-9)
+    else:
+        e = r.standard_normal(n)
+    x = x + s_w * e
+    if r.random() < 0.12:
+        k = int(r.poisson(max(n * r.uniform(0.0002, 0.001), 0.5))) + 1
+        idx = r.integers(0, n, k)
+        x[idx] += np.where(r.random(k) < 0.5, -1.0, 1.0) * r.uniform(4.0, 30.0, k) * max(s_w, 0.004)
+    if r.random() < 0.04:
+        x[int(r.integers(n // 8, n - n // 8)):] += (1.0 if r.random() < 0.5 else -1.0) * r.uniform(0.02, 0.3)
+    half = 1.1 * float(np.max(np.abs(x)))
+    u = r.random()
+    if u < 0.6:
+        datum = half * r.uniform(0.9, 2.2) + r.uniform(0.0, 1.6)
+    elif u < 0.76:
+        datum = r.uniform(2.5, 7.0)
+    elif u < 0.92:
+        datum = -r.uniform(1.2, 8.5)
+    else:
+        datum = half * r.uniform(-0.8, 0.8)
+    u = r.random()
+    q = 0.001 if u < 0.87 else (0.01 if u < 0.94 else 0.0001)
+    return _xc_pad(np.round((x + datum) / q) * q, L)
+
+def _xc_min1440(r, L):
+    try:
+        L = int(L)
+        if L < 256:
+            return None
+        with np.errstate(all="ignore"):
+            w = _xc_rate(r, L) if r.random() < _XC_MIX[0] else _xc_tide(r, L)
+        if (isinstance(w, np.ndarray) and w.shape == (L,) and bool(np.all(np.isfinite(w)))
+                and float(w.max()) > float(w.min()) and float(np.max(np.abs(w))) < 1e12):
+            return np.ascontiguousarray(w, dtype=np.float64)
+    except Exception:
+        pass
+    return None
+
+_XD_KIND_CUM = (0.50, 0.92)
+_XD_POST = 0.90
+
+_XD_LEN_CUM = ((0.81, 0.85, 0.93, 1.00), (0.76, 0.78, 0.84, 1.00), (0.58, 0.58, 0.75, 0.95))
+_XD_LEN_LO = (2380, 2720, 800, 410)
+_XD_LEN_HI = (2720, 3100, 2380, 800)
+_XD_MKT_CUM = (0.45, 0.70)
+_XD_MIRROR = 0.06
+_XD_GRID = (0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.125, 0.5, 0.1, 0.05)
+
+def _xd_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _xd_len(r, L, kind):
+    c = _XD_LEN_CUM[kind]
+    u = r.random()
+    j = 0
+    while j < 4 and u >= c[j]:
+        j += 1
+    if j >= 4:
+        return int(L)
+    n = int(r.integers(_XD_LEN_LO[j], _XD_LEN_HI[j] + 1))
+    return int(max(64, min(n, L)))
+
+def _xd_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+def _xd_ou(z, tau, x0):
+    n = z.size
+    tau = max(float(tau), 8.0, n / 600.0)
+    g = np.exp(np.arange(n, dtype=np.float64) / tau)
+    return (x0 + np.cumsum(z * g)) / g
+
+def _xd_volreg(r, n, mean_len, s):
+    k = int(n / mean_len * 1.6) + 8
+    lens = (1.0 + r.exponential(mean_len, k)).astype(np.int64)
+    v = np.exp(r.normal(0.0, s, k) - s * s)
+    out = np.repeat(v, lens)
+    if out.size < n:
+        out = np.concatenate((out, np.full(n - out.size, v[-1])))
+    return out[:n]
+
+def _xd_smooth(x, w):
+    h = int(w) // 2
+    if h < 1 or x.size < 2:
+        return x
+    c = np.cumsum(np.concatenate((np.full(h + 1, x[0]), x, np.full(h, x[-1]))))
+    return (c[2 * h + 1:] - c[:-(2 * h + 1)]) / float(2 * h + 1)
+
+def _xd_carry(r, x, p):
+    n = x.size
+    if p <= 0.0 or n < 3:
+        return x
+    h = r.random(n) < p
+    h[0] = False
+    return x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
+
+def _xd_cycle(r, tb, f):
+    d_rise = r.uniform(230.0, 560.0)
+    d_top = r.uniform(60.0, 340.0)
+    d_ret = r.uniform(240.0, 660.0)
+    if r.random() < _XD_POST:
+        e = r.uniform(430.0, 800.0)
+    else:
+        e = r.uniform(-(d_top + 0.9 * d_rise), 1900.0)
+    t_ret = -e
+    t_top = t_ret - d_top
+    t_rise = t_top - d_rise
+    top2 = 1.0 + r.uniform(-0.05, 0.05)
+    kt = [t_rise, t_rise + 0.45 * d_rise, t_top, t_ret, t_ret + 0.4 * d_ret, t_ret + d_ret]
+    kv = [0.0, r.uniform(0.48, 0.72), 1.0, top2, top2 - f * r.uniform(0.42, 0.7), top2 - f]
+    if r.random() < 0.35:
+        a0 = r.uniform(0.12, 0.5)
+        t2e = t_rise - r.uniform(200.0, 1300.0)
+        t2s = t2e - r.uniform(120.0, 450.0)
+        t1e = t2s - r.uniform(40.0, 400.0)
+        t1s = t1e - r.uniform(200.0, 650.0)
+        c0 = r.uniform(-0.1, 0.2)
+        kt = [t1s, t1e, t2s, t2e] + kt
+        kv = [c0, c0 + a0, c0 + a0, r.uniform(-0.08, 0.12)] + kv
+    else:
+        kt = [t_rise - r.uniform(600.0, 2600.0)] + kt
+        kv = [r.uniform(-0.1, 0.25)] + kv
+    if r.random() < 0.40:
+        t3 = kt[-1] + r.uniform(30.0, 350.0)
+        kt = kt + [t3, t3 + r.uniform(60.0, 350.0)]
+        kv = kv + [kv[-1], kv[-1] + r.uniform(-0.15, 0.25)]
+    return np.interp(tb, np.array(kt), np.array(kv))
+
+def _xd_stairs(r, lvl, gap, q):
+    n = lvl.size
+    k = int(n / (0.8 * gap)) + 3
+    m = np.concatenate(([0.0], np.cumsum(r.uniform(0.8, 1.25, k) * gap))) - r.uniform(0.0, 0.8 * gap)
+    v = np.round(lvl[np.clip(m, 0.0, n - 1.0).astype(np.int64)] / q) * q
+    return v[np.searchsorted(m, np.arange(n, dtype=np.float64), side="right") - 1]
+
+def _xd_round(r, x, cum):
+    u = r.random()
+    return np.round(x, 2 if u < cum[0] else 3 if u < cum[1] else 4 if u < cum[2] else 5)
+
+def _xd_mkt(r, n):
+    tb = np.arange(n, dtype=np.float64) - float(n - 1)
+    u = r.random()
+    sub = 0 if u < _XD_MKT_CUM[0] else 1 if u < _XD_MKT_CUM[1] else 2
+    if sub == 0:
+        f = r.uniform(-0.35, 0.12)
+    elif sub == 1:
+        f = r.uniform(0.15, 0.6)
+    else:
+        f = r.uniform(0.2, 0.65) if r.random() < 0.8 else r.uniform(-0.1, 0.2)
+    lvl = _xd_cycle(r, tb, f)
+    amp = r.uniform(2.0, 5.0)
+    base = -r.uniform(0.05, 0.95) if r.random() < 0.5 else r.uniform(0.0, 2.5)
+    act = np.clip(lvl, 0.0, 1.0)
+    if sub == 0:
+        path = _xd_smooth(lvl, r.integers(20, 140))
+        sd = amp * r.uniform(0.015, 0.024)
+        rho = r.uniform(0.45, 0.8)
+        w1 = r.uniform(0.1, 0.35)
+        tau2 = _xd_lu(r, 700.0, 4000.0)
+        cum = (0.25, 0.33, 0.75)
+    elif sub == 1:
+        lam = r.uniform(0.0, 0.6)
+        st = _xd_stairs(r, lvl, r.uniform(28.0, 60.0), 0.25 / amp)
+        path = _xd_smooth(lam * st + (1.0 - lam) * lvl, r.integers(10, 80))
+        sd = amp * r.uniform(0.008, 0.014)
+        rho = r.uniform(0.3, 0.7)
+        w1 = r.uniform(0.0, 0.2)
+        tau2 = _xd_lu(r, 400.0, 3000.0)
+        cum = (0.35, 0.5, 0.7)
+    else:
+        lam = r.uniform(0.4, 1.0)
+        st = _xd_stairs(r, lvl, r.uniform(28.0, 60.0), (0.25 if r.random() < 0.8 else 0.5) / amp)
+        path = _xd_smooth(lam * st + (1.0 - lam) * lvl, r.integers(3, 40))
+        sd = amp * r.uniform(0.001, 0.004)
+        rho = r.uniform(0.35, 1.0)
+        w1 = r.uniform(0.0, 0.3)
+        tau2 = _xd_lu(r, 60.0, 600.0)
+        cum = (0.85, 0.95, 0.98)
+    if r.random() < _XD_MIRROR:
+        path = 1.0 - path
+    env = rho + (1.0 - rho) * act
+    vol = sd * env * _xd_volreg(r, n, r.uniform(15.0, 60.0), r.uniform(0.25, 0.45))
+    z1 = r.standard_normal(n) * vol
+    z2 = r.standard_normal(n) * vol
+    jp = r.random(n) < r.uniform(0.0, 0.012)
+    z2 = np.where(jp, z2 * r.uniform(2.5, 4.5), z2)
+    s1 = np.sqrt(w1)
+    s2 = np.sqrt(1.0 - w1)
+    x0 = r.standard_normal() * s2 * sd * rho * np.sqrt(0.5 * min(tau2, 600.0))
+    x = base + amp * path + _xd_ou(s1 * z1, r.uniform(12.0, 50.0), 0.0) + _xd_ou(s2 * z2, tau2, x0)
+    if sub == 2:
+        sm = r.uniform(0.4, 0.8)
+        eta = amp * r.uniform(0.006, 0.012) * env * np.exp(sm * r.standard_normal(n) - sm * sm)
+        x = x + np.where(r.random(n) < r.uniform(0.25, 0.6), eta * r.standard_normal(n), 0.0)
+    x = _xd_round(r, x, cum)
+    return _xd_carry(r, x, r.uniform(0.0, 0.02))
+
+def _xd_fx(r, n):
+    s = _xd_lu(r, 0.0022, 0.0085)
+    vol = s * _xd_volreg(r, n, r.uniform(10.0, 40.0), r.uniform(0.2, 0.45))
+    z1 = r.standard_normal(n) * vol
+    z2 = r.standard_normal(n) * vol
+    jp = r.random(n) < r.uniform(0.0, 0.015)
+    z1 = np.where(jp, z1 * r.uniform(2.0, 4.0), z1)
+    w_rw = r.uniform(0.15, 0.7)
+    tau_s = _xd_lu(r, 200.0, 1500.0)
+    tau_f = r.uniform(10.0, 80.0)
+    c_f = r.uniform(0.0, 0.5)
+    s_rw = np.sqrt(w_rw)
+    s_sl = np.sqrt(1.0 - w_rw)
+    y = (np.cumsum(s_rw * z1) + c_f * s_rw * _xd_ou(z1, tau_f, 0.0)
+         + _xd_ou(s_sl * z2, tau_s, r.standard_normal() * s_sl * s * np.sqrt(0.5 * tau_s)))
+    if r.random() < 0.05:
+        y = y + r.uniform(-1.0, 1.0) * r.uniform(0.5, 2.0) * np.arange(n, dtype=np.float64) / max(n, 1)
+    u = r.random()
+    lev = _xd_lu(r, 0.1, 15.0) if u < 0.75 else _xd_lu(r, 0.0005, 0.1) if u < 0.93 else _xd_lu(r, 15.0, 200.0)
+    x = lev * np.exp(y - y[-1])
+    dp = int(np.clip(int(r.integers(4, 7)) - 1 - np.floor(np.log10(lev)), 2, 6))
+    x = np.round(x, dp)
+    return _xd_carry(r, x, r.uniform(0.0, 0.012) if r.random() < 0.85 else r.uniform(0.03, 0.1))
