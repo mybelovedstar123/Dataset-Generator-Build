@@ -27974,3 +27974,254 @@ def _yss_fams(block, table, cap):
     return tuple(out)
 
 _YSSParent = Generator
+
+class Generator(_YSSParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_yss_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yss_json.load(fh).get("y_sched", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        ph = []
+        for p in cfg.get("phases", []) if isinstance(cfg.get("phases", []), list) else []:
+            try:
+                fr = float(p.get("from"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if 0.0 < fr < 1.0:
+                ph.append((fr, p))
+        self._yss_phases = sorted(ph, key=lambda t: t[0])
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def _yss_apply(self, p: dict) -> None:
+        g_ = globals()
+        for k, v in (p.get("globals") or {}).items():
+            if k in _YSS_GLOBALS and k in g_:
+                try:
+                    g_[k] = type(g_[k])(v)
+                except (TypeError, ValueError):
+                    pass
+        for blk, attr in _YSS_ATTRS.items():
+            if isinstance(p.get(blk), dict) and hasattr(self, attr):
+                try:
+                    q = float(p[blk].get("q", 0.0))
+                    if 0.0 <= q <= 1.0:
+                        setattr(self, attr, q)
+                except (TypeError, ValueError):
+                    pass
+        if isinstance(p.get("y_insert"), dict) and hasattr(self, "_yz_fams") and "_YZ_FAMS" in g_:
+            self._yz_fams = _yss_fams(p["y_insert"], _YZ_FAMS, _YZ_MAX_SHARE)
+        if isinstance(p.get("y_channel"), dict) and hasattr(self, "_yc_fams") and "_YC_FAMS" in g_:
+            self._yc_fams = _yss_fams(p["y_channel"], _YC_FAMS, _YC_MAX_SHARE)
+
+        if isinstance(p.get("x_insert"), dict) and hasattr(self, "_xz_fams") and "_XZ_FAMS" in g_:
+            self._xz_fams = _yss_fams(p["x_insert"], _XZ_FAMS, _XZ_MAX_SHARE)
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        todo = list(self._yss_phases)
+        budget = _YZ_CHILD_BUDGET if "_YZ_CHILD_BUDGET" in globals() else 13_320_000_000
+        pos = 0
+        base = super().generate(n)
+        try:
+            for x in base:
+                yield x
+                if todo:
+                    pos += _yz_points(x)
+                    while todo and pos >= todo[0][0] * budget:
+                        self._yss_apply(todo.pop(0)[1])
+        finally:
+            base.close()
+
+_C91_OPEN_NUM = 1
+
+_KNC91OPEN1Parent = Generator
+
+class Generator(_KNC91OPEN1Parent):
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+_K2_Q = 0.0
+
+_KNK2Parent = Generator
+
+class Generator(_KNK2Parent):
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+ACTIVE_KEYS = tuple(ACTIVE_KEYS) + (("year",) if "year" not in ACTIVE_KEYS else ())
+
+_YCParent = Generator
+
+class Generator(_YCParent):
+
+    @property
+    def name(self) -> str:
+        return "c1823"
+
+_RAParent = Generator
+
+class Generator(_RAParent):
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        if type(self).generate is not _RA_GENERATE:
+            yield from _RAParent.generate(self, n_series)
+            return
+        n = int(n_series)
+        if n <= 0:
+            return
+        prev = getattr(self, "_ra_prev", None)
+        if prev is not None and prev[0].is_alive():
+            if not prev[1].is_set():
+                yield from _RAParent.generate(self, n)
+                return
+            prev[0].join()
+        q = Queue(maxsize=64)
+        stop = Event()
+        done = object()
+
+        def put(item) -> bool:
+            while not stop.is_set():
+                try:
+                    q.put(item, timeout=0.05)
+                    return True
+                except Full:
+                    continue
+            return False
+
+        def run() -> None:
+            it = None
+            try:
+                it = _RAParent.generate(self, n)
+                for x in it:
+                    if not put(x):
+                        break
+            except BaseException as exc:
+                put(exc)
+            finally:
+                if it is not None:
+                    try:
+                        it.close()
+                    except BaseException:
+                        pass
+                put(done)
+
+        th = Thread(target=run, daemon=True, name="cascade-runahead")
+        try:
+            th.start()
+        except RuntimeError:
+            yield from _RAParent.generate(self, n)
+            return
+        self._ra_prev = (th, stop)
+        try:
+            while True:
+                item = q.get()
+                if item is done:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            stop.set()
+            th.join(timeout=5.0)
+
+_RA_GENERATE = Generator.generate
+
+import json as _yqh_json
+import os as _yqh_os
+
+_YQH_TAG = 0x59E0_0011
+_YQH_DEF = {"q": 0.0, "p": 0.9, "min_run": 32, "min_d": 64, "mean_d": 96.0, "max_d": 512, "max_total": 2048,
+            "w": 256, "qmin": 0.95, "min_n": 16, "cap": 100.0, "alpha": 0.0, "couple": 0.5}
+
+def _yqh_station(s, cap):
+    if s.dtype.kind != "f" or not np.all(np.isfinite(s)):
+        return False
+    d = np.diff(s)
+    mv = np.flatnonzero(d != 0.0)
+    if mv.size < 4:
+        return False
+    real = s[int(mv[0]):]
+    if real.size < 256 or float(real.min()) < 0.0 or float(real.max()) > cap:
+        return False
+    if float(np.mean(real == np.rint(real))) < 0.98:
+        return False
+    return float(np.median(np.abs(d[mv]))) <= 1.0
+
+def _yqh_groups(rows, st, thr):
+    C, L = rows.shape
+    cps = [np.flatnonzero(rows[c, 1:] != rows[c, :-1]) for c in range(C)]
+    groups, used = [], set()
+    for c in st:
+        if c in used:
+            continue
+        a = cps[c]
+        g = [c]
+        for o in range(C):
+            b = cps[o]
+            if o == c or a.size == 0 or b.size == 0:
+                continue
+            sh = int(np.intersect1d(a, b, assume_unique=True).size)
+            if sh >= thr * min(a.size, b.size) and sh >= 3.0 * a.size * b.size / max(L - 1, 1):
+                g.append(o)
+        if any(o in used for o in g[1:]):
+            used.update(g)
+            continue
+        used.update(g)
+        groups.append(g)
+    return groups
+
+def _yqh_extend(v, r, k):
+    L = int(v.shape[1])
+    same = np.all(v[:, 1:] == v[:, :-1], axis=0)
+    ch = np.flatnonzero(~same) + 1
+    starts = np.concatenate(([0], ch)).tolist()
+    ends = np.concatenate((ch, [L])).tolist()
+    cand = [(s, e) for s, e in zip(starts, ends) if s > 0 and e - s >= k["min_run"]]
+    if not cand:
+        return None
+    ceq = np.concatenate(([0], np.cumsum(same)))
+    chosen, ins = {}, 0
+    for j in r.permutation(len(cand)).tolist():
+        if r.random() >= k["p"]:
+            continue
+        if k["alpha"] > 0.0:
+            d = int(min(k["min_d"] * (1.0 - r.random()) ** (-1.0 / k["alpha"]), k["max_d"]))
+        else:
+            d = int(min(k["min_d"] + int(r.geometric(1.0 / k["mean_d"])), k["max_d"]))
+        s = cand[j][0]
+        a = max(1, s - k["w"])
+        nd = s - a
+        if nd < k["min_n"] or int(ceq[s - 1] - ceq[a - 1]) < k["qmin"] * nd:
+            continue
+        if ins + d > k["max_total"]:
+            continue
+        chosen[j] = d
+        ins += d
+    if ins == 0:
+        return None
+    pieces, prev = [], 0
+    for j, (s, e) in enumerate(cand):
+        d = chosen.get(j)
+        if d is None:
+            continue
+        pieces.append(v[:, prev:e])
+        pieces.append(np.repeat(v[:, e - 1:e], d, axis=1))
+        prev = e
+    pieces.append(v[:, prev:])
+    w = np.concatenate(pieces, axis=1)[:, ins:]
+    return w if w.shape[1] == L else None
+
+_YQHParent = Generator
