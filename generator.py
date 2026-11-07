@@ -19561,3 +19561,285 @@ def _xa_ar1(e, phi):
         out[a:a + b] = seg
         c = float(seg[-1])
     return out
+
+def _xa_series(r, n, kind):
+    K = _XA_KINDS[kind]
+    t = np.arange(n, dtype=np.int64) + int(r.integers(0, 168))
+    hod = t % 24
+    day = t // 24
+    sig = r.uniform(*K['sig'])
+
+    tau_s = _xa_lu(r, 190.0, 1440.0)
+    phi = float(np.exp(-1.0 / tau_s))
+    s_sd = sig * r.uniform(*K['slow'])
+    e = r.standard_normal(n) * (s_sd * np.sqrt(1.0 - phi * phi))
+    e[0] = r.standard_normal() * s_sd
+    z = _xa_ar1(e, phi)
+    u_shift, u_sign = r.random(), r.random()
+    a_shift = sig * r.uniform(*K['shift'])
+    t0 = r.uniform(0.10, 0.90) * max(n, 720)
+    w_shift = _xa_lu(r, 5.0, 90.0)
+    if u_shift < _XA_P_SHIFT:
+        if u_sign >= _XA_P_UP:
+            a_shift = -a_shift
+        z += a_shift / (1.0 + np.exp(np.clip((t0 - np.arange(n)) / w_shift, -40.0, 40.0)))
+
+    tau_m = r.uniform(*K['tau'])
+    phi = float(np.exp(-1.0 / tau_m))
+    ph1 = float(np.exp(-1.0 / r.uniform(*K['sm'])))
+    nb = int(6.0 * tau_m) + 8
+    m_sd = sig * r.uniform(*K['syn'])
+    v_ar2 = (1.0 + ph1 * phi) / ((1.0 - ph1 * phi) * (1.0 - ph1 * ph1) * (1.0 - phi * phi))
+    e = r.standard_normal(n + nb) * (m_sd / float(np.sqrt(v_ar2)))
+    p_j = r.uniform(*K['jmp'])
+    j_sz = sig * r.uniform(*K['jsz']) / float(((phi ** _XA_KPEAK - ph1 ** _XA_KPEAK) / (phi - ph1)).max())
+    e += (r.random(n + nb) < p_j) * np.minimum(r.exponential(j_sz, n + nb), 2.5 * j_sz)
+    m = _xa_ar1(_xa_ar1(e, ph1), phi)[nb:]
+    z += m[::-1] if r.random() < K['rev'] else m
+
+    hh = np.arange(24, dtype=np.float64)
+    p2 = r.uniform(0.0, 24.0)
+    p1 = p2 + r.uniform(4.0, 14.0)
+    c2 = r.uniform(*K['h2'])
+    c3 = r.uniform(0.0, 0.25)
+    prof = (np.cos(_XA_TWO_PI * (hh - p1) / 24.0) + c2 * np.cos(2.0 * _XA_TWO_PI * (hh - p2) / 24.0)
+            + c3 * np.cos(3.0 * _XA_TWO_PI * (hh - r.uniform(0.0, 24.0)) / 24.0))
+    prof *= sig * r.uniform(*K['prof']) / float(np.sqrt(np.mean(prof * prof)))
+    nd = int(day[-1]) + 1
+    dayf = np.clip(1.0 + r.uniform(0.25, 0.60) * r.standard_normal(nd), 0.15, 2.4)
+    wk = np.zeros(7)
+    w_lo = r.uniform(*K['wk'])
+    wk[5] = np.log(0.5 * (1.0 + w_lo))
+    wk[6] = np.log(w_lo)
+    z += prof[hod] * dayf[day] + wk[day % 7]
+
+    df = r.uniform(*K['df'])
+    z += np.clip(r.standard_t(df, n), -12.0, 12.0) * (sig * r.uniform(*K['noi']) * float(np.sqrt((df - 2.0) / df)))
+
+    lam = r.uniform(*K['lam'])
+    if lam > 0.02:
+        x = np.maximum(1.0 + lam * z, 0.03) ** (1.0 / lam)
+    else:
+        x = np.exp(np.clip(z, -12.0, 12.0))
+    level = _xa_lu(r, 0.2, 50.0)
+    x *= level / float(np.mean(x))
+
+    rho = _xa_lu(r, *K['grid'])
+    u_odd, u_dec = r.random(), r.random()
+    k10 = int(np.floor(np.log10(rho * level)))
+    mant = rho * level / 10.0 ** k10
+    if u_odd < 0.15:
+        q = rho * level
+        dec = int(min(max(3 - k10, 2), 8)) if u_dec < 0.5 else int(min(max(2 - k10, 1), 8))
+    else:
+        if mant < 1.6:
+            q, dec = 1.0, -k10
+        elif mant < 3.6:
+            q, dec = 2.5, 1 - k10
+        elif mant < 7.0:
+            q, dec = 5.0, -k10
+        else:
+            q, dec = 10.0, -k10 - 1
+        q *= 10.0 ** k10
+        dec = int(min(max(dec, 0), 8))
+    x = np.maximum(np.round(x / q), 1.0) * q
+
+    n_gap = int(r.poisson(n * r.uniform(*K['gap']) / 1000.0))
+    if n_gap > 0 and n > 64:
+        ln = _XA_GAP_LEN[np.searchsorted(_XA_GAP_CUM, r.random(n_gap) * _XA_GAP_CUM[-1])]
+        ln = np.where(r.random(n_gap) < K['glong'], r.integers(8, 41, n_gap), ln)
+        st = r.integers(1, n - 44, n_gap)
+        miss = np.zeros(n, dtype=bool)
+        for a, g in zip(st.tolist(), ln.tolist()):
+            miss[a:a + g] = True
+        miss[0] = False
+        miss[n - 3:] = False
+        idx = np.arange(n, dtype=np.float64)
+        keep = ~miss
+        x[miss] = np.interp(idx[miss], idx[keep], x[keep])
+    return np.round(x, int(min(dec + 3, 10)))
+
+def _xa_airq(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    u = r.random()
+    if u < _XA_N_CUM[0]:
+        n = int(r.integers(_XA_N_LONG[0], _XA_N_LONG[1] + 1))
+    elif u < _XA_N_CUM[1]:
+        lo, hi = _XA_N_SHORT
+        n = int(r.uniform(lo, hi)) if r.random() < 0.5 else int(_xa_lu(r, lo, hi))
+    else:
+        n = int(r.integers(_XA_N_FWD[0], _XA_N_FWD[1] + 1))
+    n = int(min(max(n, 96), L - 32))
+    kind = int(np.searchsorted(_XA_KIND_CUM, r.random() * _XA_KIND_CUM[-1], side='right'))
+    x = _xa_series(r, n, min(kind, len(_XA_KINDS) - 1))
+    if not (np.all(np.isfinite(x)) and float(x.max()) > float(x.min()) and float(x.min()) > 0.0):
+        return None
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    return out
+
+_XB_DAY = 96
+_XB_SOD = np.arange(96, dtype=np.float64)
+_XB_UG = np.linspace(0.0, 1.0, 129)
+_XB_KINDS = ("co2", "solar", "wind", "price", "load")
+_XB_KIND_CUM = np.cumsum([0.28, 0.20, 0.17, 0.19, 0.16])
+_XB_P_TAIL = (1.0, 0.0, 0.07, 0.0, 0.12)
+_XB_P_HOLE = (0.10, 0.0, 0.04, 0.0, 0.04)
+_XB_P_FULL = 0.65
+
+def _xb_lu(u, lo, hi):
+    return float(lo * (hi / lo) ** u)
+
+def _xb_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _xb_ou(r, m, tau, tail=0.0):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(m)
+    if tail > 0.0:
+        e *= np.exp(tail * r.standard_normal(m) - tail * tail)
+    e0 = float(e[0])
+    e *= float(np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    e[0] = e0
+    return _xb_ar1(e, phi)
+
+def _xb_ou2(r, m, tau1, tau2, tail=0.0, vol=None):
+    b = int(4.0 * tau2) + 4
+    p1 = float(np.exp(-1.0 / max(tau1, 0.2)))
+    p2 = float(np.exp(-1.0 / max(tau2, 0.2)))
+    e = r.standard_normal(m + b)
+    if tail > 0.0:
+        e *= np.exp(tail * r.standard_normal(m + b) - tail * tail)
+    if vol is not None:
+        e[b:] *= vol
+    e0 = float(e[0])
+    e *= float(np.sqrt(max(1.0 - p1 * p1, 1e-12)))
+    e[0] = e0
+    y = _xb_ar1(_xb_ar1(e, p1), p2)[b:]
+    return y * float(np.sqrt((1.0 - p2 * p2) * (1.0 - p1 * p2) / (1.0 + p1 * p2)))
+
+def _xb_bump(c, w):
+    d = np.abs((_XB_SOD - c + 48.0) % 96.0 - 48.0)
+    return np.exp(-0.5 * (d / w) ** 2)
+
+def _xb_dayline(a, f, lo=22.0, hi=86.0):
+    nd = f.size
+    d = np.arange(nd, dtype=np.float64) * 96.0
+    xp = np.empty(2 * nd, dtype=np.float64)
+    xp[0::2] = d + lo
+    xp[1::2] = d + hi
+    return np.interp(a, xp, np.repeat(f, 2))
+
+def _xb_days(r, nd, phi, sd):
+    e = r.standard_normal(nd) * (sd * float(np.sqrt(max(1.0 - phi * phi, 1e-12))))
+    e[0] = e[0] / float(np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    return _xb_ar1(e, phi)
+
+def _xb_co2(r, n, a, sod, day, dow0):
+    u = r.random(24)
+    nd = int(day[-1]) + 1
+    base = _xb_lu(u[0], 22.0, 640.0)
+    c = 0.07 + 0.42 * u[1]
+    qp = 0.02 + 0.85 * u[2] ** 1.2
+    fs = 0.5 + 0.4 * u[3]
+
+    dip = _xb_bump(50.0 + 6.0 * u[4], 8.0 + 8.0 * u[5])
+    rest = (0.1 + 0.5 * u[6]) * _xb_bump(74.0 + 10.0 * u[7], 5.0 + 6.0 * u[8]) + 0.3 * u[9] * _xb_bump(28.0 + 6.0 * u[10], 4.0 + 5.0 * u[11])
+    sun = 0.25 + 0.75 * r.beta(1.5 + 2.5 * u[12], 0.8 + 1.0 * u[13], nd)
+    prof = rest[sod] - dip[sod] * sun[day]
+    prof = prof - float(prof.mean())
+    prof = prof / max(float(prof.std()), 1e-9)
+    slow = _xb_ou2(r, n, _xb_lu(u[14], 50.0, 260.0), 2.0 + 4.0 * u[15])
+    res = _xb_ou2(r, n, _xb_lu(u[16], 5.0, 22.0), 1.0 + 2.5 * u[17], tail=0.15 + 0.5 * u[18])
+    z = float(np.sqrt(qp)) * prof + float(np.sqrt(1.0 - qp)) * (float(np.sqrt(fs)) * slow + float(np.sqrt(1.0 - fs)) * res)
+    return np.round(base * np.exp(c * z), 1)
+
+def _xb_solar(r, n, a, sod, day, dow0):
+    u = r.random(24)
+    nd = int(day[-1]) + 1
+    cap = _xb_lu(u[0], 8.0, 45000.0)
+    noon = 45.0 + 8.0 * u[1]
+    hw = 19.0 + 12.0 * u[2] + (-5.5 + 6.0 * u[3]) * (np.arange(nd, dtype=np.float64) - (nd - 1)) / 43.0 * -1.0 * 0.0
+    hw = 19.0 + 12.0 * u[2] - (-5.5 + 6.0 * u[3]) * ((nd - 1) - np.arange(nd, dtype=np.float64)) / 43.0
+    hw = np.clip(hw, 16.0, 34.0)
+    uu = (sod - (noon - hw[day])) / (2.0 * hw[day])
+    bell = np.interp(uu, _XB_UG, np.sin(np.pi * _XB_UG) ** (1.5 + 1.7 * u[4]))
+    clear = 0.12 + 0.88 * r.beta(1.0 + 2.5 * u[5], 0.7 + 1.1 * u[6], nd)
+    sig = _xb_lu(u[7], 0.012, 0.3)
+    cloud = np.minimum(np.exp(sig * _xb_ou2(r, n, _xb_lu(u[8], 3.0, 16.0), 1.0 + 2.0 * u[9], tail=0.4 * u[10])), 1.35)
+    x = cap * bell * clear[day] * cloud
+    if u[11] < 0.25:
+        x = np.minimum(x, cap * (0.5 + 0.4 * u[12]))
+    if u[13] < 0.28:
+        fl = cap * _xb_lu(u[14], 0.002, 0.04)
+        x = np.maximum(x, fl * (1.0 + (0.01 + 0.1 * u[15]) * _xb_ou(r, n, 6.0 + 30.0 * u[16])))
+    return np.round(x, 1 if u[17] < 0.8 else 0)
+
+def _xb_wind(r, n, a, sod, day, dow0):
+    u = r.random(24)
+    cap = _xb_lu(u[0], 60.0, 16000.0)
+    nk = n // 48 + 3
+    vol = np.exp((0.25 + 0.5 * u[1]) * np.interp(a - a[0], np.arange(nk, dtype=np.float64) * 48.0, _xb_ou(r, nk, 3.0)))
+    g = _xb_ou2(r, n, _xb_lu(u[2], 30.0, 150.0), 1.0 + 4.5 * u[3], tail=0.3 * u[4], vol=vol)
+    g = g / max(float(g.std()), 1e-9)
+    z = g + _xb_lu(u[5], 0.02, 0.12) * _xb_ou(r, n, 1.5 + 8.0 * u[6])
+    if u[7] < 0.5:
+        z = z + (0.05 + 0.35 * u[8]) * (_xb_bump(96.0 * u[9], 14.0 + 10.0 * u[10]) - 0.3)[sod]
+    x = cap / (1.0 + np.exp(-((0.9 + 1.0 * u[11]) * z + (-1.9 + 1.5 * u[12]))))
+    if u[13] < 0.25:
+        x = np.maximum(x - cap * _xb_lu(u[14], 0.003, 0.04), 0.0)
+    return np.round(x, 1 if u[15] < 0.78 else 0)
+
+def _xb_price(r, n, a, sod, day, dow0):
+    u = r.random(40)
+    nd = int(day[-1]) + 1
+    lev = 60.0 + 130.0 * u[0] if u[1] < 0.8 else _xb_lu(u[0], 25.0, 60.0)
+    nordic = u[2] < 0.25
+    dow = (np.arange(nd) + dow0) % 7
+    we = (dow >= 5).astype(np.float64)
+    lv = _xb_days(r, nd, 0.5 + 0.4 * u[3], (0.2 + 0.4 * u[4]) if nordic else (0.05 + 0.1 * u[4]))
+    lv = lv + np.where(dow == 5, np.log(0.8 + 0.17 * u[5]), 0.0) + np.where(dow == 6, np.log(0.65 + 0.28 * u[6]), 0.0)
+    an = (0.2 + 0.4 * u[7]) if nordic else 1.0
+    am = (0.15 + 0.35 * u[8]) * _xb_bump(28.0 + 8.0 * u[9], 4.0 + 3.0 * u[10])
+    ev = (0.3 + 0.6 * u[11]) * _xb_bump(76.0 + 8.0 * u[12], 5.0 + 4.0 * u[13])
+    ng = 0.25 * u[14] * _xb_bump(10.0 + 8.0 * u[15], 8.0 + 5.0 * u[16])
+    sol = _xb_bump(50.0 + 6.0 * u[17], 7.0 + 4.0 * u[18])
+    sd_ = np.exp((0.1 + 0.25 * u[19]) * r.standard_normal(nd))
+    scar = np.exp((0.2 + 0.5 * u[20]) * np.abs(r.standard_normal(nd)) * (r.random(nd) < 0.25))
+    sunny = r.beta(2.0 + 2.0 * u[21], 0.7 + 0.7 * u[22], nd) * (1.0 + 0.4 * we)
+    S = (0.5 + 0.8 * u[23]) if (not nordic or u[24] < 0.35) else 0.25 * u[23]
+    shape = (am[sod] - ng[sod]) * sd_[day] + ev[sod] * (sd_ * scar)[day]
+    p = lev * np.exp(_xb_dayline(a, lv) + an * shape) - lev * S * sunny[day] * sol[sod]
+
+    st = np.flatnonzero((a % 4) == 0)
+    if st.size == 0 or st[0] != 0:
+        st = np.concatenate(([0], st))
+    cnt = np.diff(np.concatenate((st, [n])))
+    m = np.add.reduceat(p, st) / cnt
+    hr = (a // 4) - int(a[0] // 4)
+    kap = 0.0 if u[25] < 0.03 else 1.2 + 2.0 * u[26]
+    hn = _xb_ou(r, st.size, 0.6 + 2.5 * u[27], tail=0.3 + 0.5 * u[28])
+    x = m[hr] + kap * (p - m[hr]) + lev * _xb_lu(u[29], 0.01, 0.06) * hn[hr]
+    if kap > 0.0:
+        e = r.standard_normal(n) * np.exp(0.6 * r.standard_normal(n) - 0.36)
+        x = x + lev * _xb_lu(u[30], 0.003, 0.02) * e
+    if u[31] < 0.3:
+        x = np.maximum(x, 0.0)
+    else:
+        F = lev * (0.02 + 0.1 * u[32])
+        neg = x < 0.0
+        x[neg] = -F * (1.0 - np.exp(np.maximum(x[neg], -50.0 * F) / F))
+        zz = lev * (0.004 + 0.026 * u[33])
+        x = np.where((np.abs(x) < zz) & (r.random(n) < 0.75), 0.0, x)
+    return np.round(x, 2)
