@@ -29455,3 +29455,123 @@ if _c91_extend is _c124b2_extend:
 # Everything else in the function is uid76's code verbatim. _ACUH_FAMS is rebuilt with the new function object
 # (same names, weights and order) because the table holds the original function.
 _C251_ACUH_LIN = np.zeros((4, 3), dtype=np.float64)
+for _c251_rise in (1, 2, 3):
+    _C251_ACUH_LIN[_c251_rise, :_c251_rise] = np.linspace(0, 1, _c251_rise + 1)[1:]
+del _c251_rise
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_negk_over(em, ed):
+    tot = 0
+    for j in range(em.shape[0]):
+        tot += em[j]
+    out = np.empty(tot, dtype=np.float64)
+    o = 0
+    for j in range(em.shape[0]):
+        d = ed[j]
+        for k in range(1, em[j] + 1):
+            out[o] = float(-k) / d
+            o += 1
+    return out
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_acuh_accum(ep, starts, ea, er, em, ex, lin):
+    n = ep.shape[0]
+    off = 0
+    for j in range(starts.shape[0]):
+        s = starts[j]
+        rise = er[j]
+        m = em[j]
+        a = ea[j]
+        e = s + rise + m
+        if e > n:
+            e = n
+        for t in range(e - s):
+            if t < rise:
+                v = lin[rise, t]
+            else:
+                v = ex[off + t - rise]
+            ep[s + t] = ep[s + t] + a * v
+        off += m
+
+
+def _c251_acuh_air(r, L):
+    k = _ACUH_AIR_NAMES[int(np.searchsorted(_ACUH_AIR_CUM, r.random() * 0.999999, side="right"))]
+    _, lev, shape, amp, phi, rate, ep_mu, zfloor, p_int, quantum = _ACUH_AIR_P[k]
+    u = r.random()
+    n = int(r.integers(650, 1001)) if u < 0.92 else int(r.integers(1000, min(L, 4160) + 1))
+    t = np.arange(n, dtype=np.float64)
+    hours = t + r.uniform(0, 24)
+    base = np.log(np.exp(r.uniform(np.log(lev[0]), np.log(lev[1]))))
+    prof = _acuh_air_profile(r, shape, hours) * r.uniform(*amp) * 1.25
+    wk = r.uniform(0.0, 0.15) * (((hours // 24) % 7) < 5) if shape == "traffic" else 0.0
+    syn = _acuh_smooth_noise(r, n, 1.0 / r.uniform(48, 240)) * r.uniform(0.15, 0.45)
+    drift = np.linspace(0.0, r.normal(0.0, 0.6), n)
+    ph = r.uniform(*phi)
+    noise = _acuh_ar1(r, n, ph, r.uniform(0.10, 0.25) * np.sqrt(1 - ph * ph) * 1.5)
+    lx = base + prof + wk + syn + drift + noise
+
+    ep = np.zeros(n)
+    nep = r.poisson(n * r.uniform(*rate) / 1000.0)
+    starts = r.integers(0, n, nep)
+    ne = int(starts.shape[0])
+    if ne:
+        ea = np.empty(ne, dtype=np.float64)
+        er = np.empty(ne, dtype=np.int64)
+        em = np.empty(ne, dtype=np.int64)
+        ed = np.empty(ne, dtype=np.float64)
+        for j in range(ne):
+            ea[j] = np.exp(r.normal(ep_mu - 0.6, 0.55))
+            rise, decay = int(r.integers(1, 4)), r.uniform(1.0, 4.0)
+            er[j] = rise
+            em[j] = int(6 * decay) + 1
+            ed[j] = decay
+        ex = np.exp(_c251_negk_over(em, ed))
+        _c251_acuh_accum(ep, np.ascontiguousarray(starts, dtype=np.int64), ea, er, em, ex, _C251_ACUH_LIN)
+    if r.random() < 0.5 and k in ("pm25", "pm10", "no2", "bc", "other"):
+        for _ in range(int(r.integers(1, 3))):
+            s = int(r.integers(0, n)); d = int(r.integers(24, 96))
+            env = np.sin(np.linspace(0, np.pi, d)) ** 2 * r.uniform(0.4, 1.3)
+            e = min(n, s + d); lx[s:e] += env[:e - s]
+    x = np.exp(lx) * (1.0 + ep)
+    if zfloor > 0:
+        thr = np.quantile(x, r.uniform(0.6, 1.4) * zfloor)
+        x = np.where(x < thr, 0.0, x)
+    signed = k in ("no2", "no", "o3", "other") and zfloor < 0.3 and r.random() < 0.3
+    if signed:
+        x = x + r.normal(0.0, r.uniform(0.3, 2.0)) * 0.3 + r.standard_normal(n) * r.uniform(0.2, 1.2)
+    if r.random() < p_int:
+        x = np.round(x)
+    else:
+        x = _acuh_quantise(x, quantum if r.random() < 0.8 else quantum / 10.0)
+    if not signed:
+        x = np.maximum(x, 0.0)
+    if np.ptp(x) == 0:
+        x = x + _acuh_quantise(np.abs(r.standard_normal(n)) * 0.1, 0.1)
+    return _acuh_pad(x, L)
+
+
+if any(fn is _acuh_air for _, _, fn in _ACUH_FAMS):
+    _ACUH_FAMS = tuple((nm, w, (_c251_acuh_air if fn is _acuh_air else fn)) for nm, w, fn in _ACUH_FAMS)
+    _acuh_air = _c251_acuh_air
+
+
+# ═══════════════ c251-P9: exact numba _k87_quiet_eval (the quiet-tail test behind _k87_quiet; ~0.7 memo misses per record). ═══════════════
+# Same statistic, same decision: sorted values (np.sort -> exact order statistics), uid76's _k87_lin interpolation
+# ((n - 1) * q, floor, g, a + (b - a) * g or b - (b - a) * (1 - g)), Python max() semantics for span/tol (first
+# maximal argument kept), count(d <= tol) / d.size >= 0.35, the 90% lin-quantile of the sorted |diff|, and the
+# (m[15] + m[16]) / 2 mid-values of the first/last 32 points. Non-finite inputs (and any other shape) return -1 and
+# take uid76's own path (_k87_quiet_slow). A selected zero's sign cannot change the decision: span >= 1e-12 > 0 and
+# every other use goes through abs() of a difference.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_k87_lin(s, q):
+    v = (s.shape[0] - 1) * q
+    j = int(np.floor(v))
+    g = v - float(j)
+    a = s[j]
+    b = s[j + 1]
+    diff = b - a
+    if g >= 0.5:
+        return b - diff * (1 - g)
+    return a + diff * g
