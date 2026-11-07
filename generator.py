@@ -28225,3 +28225,104 @@ def _yqh_extend(v, r, k):
     return w if w.shape[1] == L else None
 
 _YQHParent = Generator
+
+class Generator(_YQHParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_yqh_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yqh_json.load(fh).get("y_qhold", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        k = dict(_YQH_DEF)
+        for key, dv in _YQH_DEF.items():
+            try:
+                v = float(cfg.get(key, dv))
+                k[key] = v if np.isfinite(v) else dv
+            except (TypeError, ValueError):
+                pass
+        for key in ("min_run", "min_d", "max_d", "max_total", "w", "min_n"):
+            k[key] = max(1, int(k[key]))
+        k["q"] = min(max(k["q"], 0.0), 1.0)
+        k["p"] = min(max(k["p"], 0.0), 1.0)
+        self._yqh = k
+
+    @property
+    def name(self) -> str:
+        return "c1859"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        k = self._yqh
+        lo = _C91_OPEN_NUM * int(_C91_CHILD_BUDGET)
+        pos = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if (k["q"] > 0.0 and _C91_OPEN_DEN * pos >= lo and isinstance(x, np.ndarray) and x.dtype == np.float64
+                        and x.ndim == 2 and x.shape[0] > 1 and x.shape[1] >= 256):
+                    st = [c for c in range(x.shape[0]) if _yqh_station(x[c], k["cap"])]
+                    if st:
+                        out = None
+                        for g in _yqh_groups(x, st, k["couple"]):
+                            r = np.random.default_rng(np.random.SeedSequence([seed, _YQH_TAG], spawn_key=(i, g[0])))
+                            if r.random() >= k["q"]:
+                                continue
+                            try:
+                                w = _yqh_extend(x[g], r, k)
+                            except Exception:
+                                w = None
+                            if w is not None and np.all(np.isfinite(w)):
+                                if out is None:
+                                    out = x.copy()
+                                out[g] = w
+                        if out is not None:
+                            x = out
+                pos += _c91_points(x)
+                yield x
+        finally:
+            base.close()
+
+import json as _sl_json
+import os as _sl_os
+
+_SLParent = Generator
+
+class Generator(_SLParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        salt = 0
+        try:
+            with open(_sl_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                salt = int(_sl_json.load(fh).get("salt", 0)) & ((1 << 64) - 1)
+        except (OSError, ValueError, TypeError, AttributeError):
+            salt = 0
+        super().__init__(config_dir, seed=((int(seed) ^ salt) & ((1 << 64) - 1)) if salt else seed)
+
+    @property
+    def name(self) -> str:
+        return "c1933"
+
+
+# ═══════════════ c251-P1: exact fast kernel for the long-cycle lag menu (_cycle_menu_errors, uid76's #1 hotspot). ═══════════════
+# Same per-(row, lag) arithmetic as uid76's kernel: template phases from the SAME compare-swap networks (_v2_cm_medians),
+# |observed - template| with the same subtraction/abs, the SAME 8-lane sequential sums + ((r0+r1)+(r2+r3))+((r4+r5)+(r6+r7))
+# per 128-point leaf (0.0 + x == x for the abs values, never -0.0), the same leaf combination / abort tests and the same
+# final ((0.0 + bound) / points) / span. Two changes, both exact:
+#  (a) slice views indexed by range() induction variables (no signed-index wraparound fix-ups) -> LLVM vectorises
+#      the loops; the per-lane operation sequence is unchanged (no reassociation: fastmath stays OFF);
+#  (b) provable early abort inside a leaf: every 32 points the partial lanes are combined with the same tree; all
+#      addends are >= 0 and IEEE round-to-nearest addition is monotone, so the partial combination is <= the full
+#      leaf value; if ((0.0 + partial) / points) / span > limit then the full leaf bound also exceeds it, and uid76
+#      aborts at the end of that leaf (errors = inf) -- the same inf is written. Only at leaves where uid76 can abort
+#      with a bound that grows inside the leaf (leaf 0; leaf 1 of a 4-leaf menu). Non-aborted values are bit-identical.
+#  (c) the abort test f(b) = ((0.0 + b) / points) / span > limit is evaluated as b >= x*, where x* is the smallest
+#      double with f(x*) > limit, found per row by bisection over the (order-preserving) bit patterns of [0, +inf]:
+#      f is monotone non-decreasing (correctly rounded divisions by positive numbers), so b >= x* <=> f(b) > limit.
+#  (d) count == 1 lags (median of one cycle = the history itself) read the history slice directly instead of a copy.
+from numba import njit as _c251_njit
