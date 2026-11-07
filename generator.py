@@ -31040,3 +31040,147 @@ class Generator(_C259BParent):
 # ═══════════════ c215-LP: post-hoc continuation law (rmin=4, scope=all, quiet=False, rate=1.0, back>=256,
 # quiet_ext=False, late=(0.6, 0), NO pad guard: c268-P40U). Own SeedSequence per record; parent stream untouched. ═══════════════
 _C215LP_TAG = 0xC215B0
+_C215LP_RMIN = 4
+_C215LP_SCOPE = 'all'
+_C215LP_QUIET = False
+_C215LP_RATE = 1.0
+_C215LP_BACK_LO = 256
+_C215LP_QEXT = False
+_C215LP_LATE_FRAC = 0.6
+_C215LP_LATE_H2E = 0
+_C215LP_STREAM_POINTS = 39960000000 // 3
+
+
+def _c215lp_quiet(pre):
+    recent = pre[-192:]
+    delta = np.abs(np.diff(recent))
+    q10, q90 = np.quantile(recent, (0.10, 0.90))
+    peak = float(np.max(np.abs(recent)))
+    span = max(float(q90 - q10), peak * 1e-12, 1e-12)
+    tol = max(peak * 1e-12, 1e-12)
+    repeat_fraction = float(np.mean(delta <= tol))
+    local_move = float(np.quantile(delta, 0.90)) / span
+    drift = abs(float(np.median(recent[-32:])) - float(np.median(recent[:32]))) / span
+    return (repeat_fraction >= 0.35) or (local_move <= 0.03 and drift <= 0.12)
+
+
+def _c215lp_lp(x, r):
+    a = np.asarray(x)
+    if a.ndim == 1:
+        arr = a[None, :]
+    elif a.ndim == 2:
+        arr = a
+    else:
+        return x
+    C, L = arr.shape
+    if _C215LP_SCOPE == "uni" and C != 1:
+        return x
+    if _C215LP_SCOPE == "mv" and C < 2:
+        return x
+    if L < 608 or not bool(np.all(np.isfinite(arr))):
+        return x
+    b = L - int(r.integers(_C215LP_BACK_LO, min(721, L - 32)))
+    coins = r.random(C)
+    out = None
+    for c in range(C):
+        v = arr[c]
+        last = v[b - 1]
+        if not bool(np.any(v[b:] != last)):
+            continue
+        hold_at = None
+        if bool(np.all(v[b - _C215LP_RMIN:b] == last)):
+            if (not _C215LP_QUIET) or _c215lp_quiet(v[:b]):
+                hold_at = last
+        elif _C215LP_QEXT and b >= 256 and _c215lp_quiet(v[:b]):
+            hold_at = float(np.median(v[b - 16:b]))
+        if hold_at is None or coins[c] >= _C215LP_RATE:
+            continue
+        if out is None:
+            out = np.array(arr, dtype=np.float64, copy=True)
+        out[c, b:] = hold_at
+    if out is None:
+        return x
+    return out[0] if a.ndim == 1 else out
+
+
+def _c215lp_h2e(x, r, rmin):
+    a = np.asarray(x)
+    if a.ndim == 2 and a.shape[0] == 1:
+        v = a[0]
+    elif a.ndim == 1:
+        v = a
+    else:
+        return x
+    L = int(v.shape[0])
+    if L < 256 or not bool(np.all(np.isfinite(v))):
+        return x
+    ch = np.flatnonzero(v[1:] != v[:-1]) + 1
+    if ch.size == 0:
+        return x
+    starts = np.r_[0, ch]
+    ends = np.r_[ch, L]
+    lens = ends - starts
+    cand = np.flatnonzero((lens >= rmin) & (ends < L) & (ends >= L // 4) & (ends <= L - 32))
+    if cand.size == 0:
+        return x
+    e = int(ends[cand[int(r.integers(0, cand.size))]])
+    out = np.array(a, dtype=np.float64, copy=True)
+    if out.ndim == 2:
+        out[0, e:] = v[e - 1]
+    else:
+        out[e:] = v[e - 1]
+    return out
+
+
+def _c215lp_points(x):
+    a = np.asarray(x)
+    if a.ndim == 2 and a.shape[0] > 1:
+        return -(-int(a.size) * 100 // 120)
+    return int(a.size)
+
+
+_C215LPParent = Generator
+
+
+class Generator(_C215LPParent):
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        start = int((1.0 - _C215LP_LATE_FRAC) * _C215LP_STREAM_POINTS) if _C215LP_LATE_FRAC > 0.0 else 0
+        pts = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if isinstance(x, np.ndarray):
+                    on = pts >= start
+                    try:
+                        pts += _c215lp_points(x)
+                    except Exception:
+                        pass
+                    if on:
+                        r = np.random.default_rng(np.random.SeedSequence([seed, _C215LP_TAG], spawn_key=(i,)))
+                        try:
+                            x = _c215lp_lp(x, r)
+                            if _C215LP_LATE_H2E > 0:
+                                x = _c215lp_h2e(x, r, _C215LP_LATE_H2E)
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
+
+
+# ═══════════════ c233-MLPX: post-hoc law-periodic / law-linear tails for every channel that bypasses the engine law
+# (partner / teach / insert channels, MV channel 0 rows the engine law saw at another boundary). Runs AFTER LP. Per
+# channel: skip if the record already ends in a law/LP tail (last 256 values one exact hold, terminal exact run >= 16,
+# or an exact repeat of the last 64 values at some lag 2..512); else draw b = L - U[256, 720] and apply the king's own
+# law tests to v[b-512:b] (short lags 7/12/24/48/96, strict-linear test, then _validated_long_cycle /
+# _validated_longer_cycle on 1024 / 2048 points, gated by a cheap autocorrelation >= 0.5 test): periodic -> v[b:] =
+# median-cycle template (only if non-constant); channels whose recent 192 values are repeat-heavy (>= 35% exact ties,
+# the law's quiet test) or constant are skipped;
+# strict-linear -> clipped line (anchor = median of the last 16, slope from the last 64, clip at +-span) with the king's
+# 50% native share; quiet / degenerate / other -> untouched. NEVER writes a hold: the flat lever of RZPPUL is untouched.
+# Own SeedSequence([seed, TAG], spawn_key=(i,)) per record; parent stream untouched. ═══════════════
+_C233MLPC_TAG = 0xC233A1D
