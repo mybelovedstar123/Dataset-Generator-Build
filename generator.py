@@ -20689,3 +20689,80 @@ def _xz_num(v, default: float) -> float:
     return v if np.isfinite(v) and v >= 0.0 else default
 
 _XZParent = Generator
+
+class Generator(_XZParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        cfg: dict = {}
+        try:
+            with open(_xz_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _xz_json.load(fh).get("x_insert", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        mult = min(_xz_num(cfg.get("rate", 1.0), 1.0), 20.0)
+        fams = []
+        for k, (key, fn) in enumerate(_XZ_FAMS):
+            q = min(_xz_num(cfg.get(key, 0.0), 0.0) * mult, _XZ_MAX_SHARE)
+            f = globals().get(fn)
+            if q > 0.0 and callable(f):
+                fams.append((k, q, f))
+        self._xz_fams = tuple(fams)
+
+    @property
+    def name(self) -> str:
+        return "c246"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        fams = self._xz_fams
+        seed = int(self._seed) & ((1 << 64) - 1)
+        slots = len(_XZ_FAMS)
+        out = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if fams:
+                    u = np.random.default_rng(np.random.SeedSequence([seed, _XZ_TAG], spawn_key=(i,))).random(slots)
+                    for k, q, f in fams:
+                        if u[k] >= q:
+                            continue
+                        w = None
+                        try:
+                            with np.errstate(all="ignore"):
+                                w = f(np.random.default_rng(np.random.SeedSequence([seed, _XZ_TAG, k + 1], spawn_key=(i,))), _XZ_L)
+                        except Exception:
+                            w = None
+                        if (isinstance(w, np.ndarray) and w.ndim == 1 and w.size == _XZ_L and w.dtype.kind == "f"
+                                and bool(np.all(np.isfinite(w))) and float(w.max()) > float(w.min())):
+                            yield np.ascontiguousarray(w, dtype=np.float64)
+                            out += 1
+                            if out >= n:
+                                return
+                yield x
+                out += 1
+                if out >= n:
+                    return
+        finally:
+            base.close()
+
+
+# ═══════════════ c-acuh: official air / USDA prices / health / CO2 series ADDED as channel 3 under moving 3-channel rows ═══════════════
+# Every record of the parent (uid220 = king171 + c91/c124 hold layers + c128) is yielded unchanged, in order, except: an exactly
+# THREE-channel float64 record (length >= 256, all finite) whose channel 0 is moving (not constant, not _k87_quiet, not
+# _w86b_intlike — the lineage's own helpers, unchanged) gains ONE extra channel (channel 3). Channels 0-2 are the record itself,
+# byte-identical. No existing function, table or weight is changed; univariate and 2-channel records (held / quiet / integer rows)
+# are never touched.
+# Why: on the real duel windows uid220 (and its init) are miscalibrated exactly where its corpus has no matching builder — official
+# air quality (forecast too low, upper band too narrow: future pollution episodes break above the past range), USDA daily price
+# panels (prices turn down below the band), health surveillance (waves end below the band) and CO2 intensity (band too narrow:
+# multi-day weather regimes). The four builders are calibrated to pool statistics (cadence, history length, level, daily profile,
+# persistence, episode rate/size, turn rate, quantisation); each content series is generated at a real-like length and LEFT-PADDED
+# with its first value, as the validator pads short histories. Statistics only: no real values or sequences are embedded.
+# Record i's draws come only from SeedSequence([seed, _ACUH_TAG], spawn_key=(i,)), so every parent RNG advances exactly as without
+# this block. A 4-channel record is billed at points+mv20 (4 x L x 100/120 instead of 3 x L x 100/120).
+
+_ACUH_TWO_PI = 2.0 * np.pi
