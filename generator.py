@@ -21042,3 +21042,39 @@ def _acuh_keep(w, x):
 
 
 _ACUHParent = Generator
+
+
+class Generator(_ACUHParent):
+    """Parent records unchanged; an exactly three-channel float record whose channel 0 is moving gains ONE extra channel (an air /
+    USDA / health / CO2 series) as channel 3. Channels 0-2 stay byte-identical; univariate and 2-channel records are never touched."""
+
+    @property
+    def name(self) -> str:
+        return 'c246-acuh'
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if _ACUH_Q > 0.0 and _acuh_eligible(x):
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _ACUH_TAG], spawn_key=(i,)))
+                    if r.random() < _ACUH_Q:
+                        k = min(int(np.searchsorted(_ACUH_CUM, r.random(), side="right")), len(_ACUH_FAMS) - 1)
+                        try:
+                            L = int(x.shape[1])
+                            with np.errstate(all="ignore"):
+                                w = np.asarray(_ACUH_FAMS[k][2](r, L), dtype=np.float64).reshape(-1)
+                            if _acuh_keep(w, x):
+                                z = np.empty((_ACUH_HOST_C + 1, L), dtype=np.float64)
+                                z[:_ACUH_HOST_C] = x
+                                z[_ACUH_HOST_C] = w
+                                x = z
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
