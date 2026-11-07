@@ -23450,3 +23450,303 @@ def _ye_counts2(r, L):
 _YG_P = 1440
 _YG_TWO_PI = 2.0 * np.pi
 _YG_MIX = (0.85, 0.15)
+_YG_RATE_KINDS = np.cumsum([0.80, 0.08, 0.07, 0.05])
+
+_YG_TIDE_PER = np.array([745.236072, 720.0, 759.50085, 1436.068182, 1549.160502, 1612.101402,
+                         372.618036, 366.206358, 248.412024, 490.628394])
+
+def _yg_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yg_filt(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yg_ar1(r, n, tau, sd, tail=0.0):
+    n = int(n)
+    phi = float(np.exp(-1.0 / max(float(tau), 0.05)))
+    e = r.standard_normal(n)
+    if tail > 0.0:
+        e = e * np.exp(tail * r.standard_normal(n) - tail * tail)
+    e = e * (sd * np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    e[0] = r.standard_normal() * sd
+    return _yg_filt(e, phi)
+
+def _yg_box(x, m):
+    m = min(int(m), x.size)
+    if m <= 1:
+        return x
+    c = np.cumsum(np.concatenate(([0.0], x)))
+    out = np.empty(x.size, dtype=np.float64)
+    out[m - 1:] = (c[m:] - c[:-m]) / m
+    out[:m - 1] = c[1:m] / np.arange(1, m)
+    return out
+
+def _yg_cbox(p, h):
+    h = int(h)
+    if h <= 0:
+        return p
+    g = p.size
+    c = np.cumsum(np.concatenate(([0.0], p[g - h:], p, p[:h])))
+    return (c[2 * h + 1:2 * h + 1 + g] - c[:g]) / (2 * h + 1)
+
+def _yg_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+def _yg_store(r, x, mode):
+    if mode == 1:
+        return np.round(x)
+    if mode == 2:
+        return np.round(x, int(r.integers(1, 4)))
+    return x.astype(np.float32).astype(np.float64)
+
+def _yg_knots(r):
+    d0 = r.uniform(0.0, 0.04)
+    m1 = d0 + r.uniform(0.10, 0.22)
+    m2 = r.uniform(0.55, 0.72)
+    m3 = m2 + r.uniform(0.03, 0.09)
+    m4 = min(m3 + r.uniform(0.10, 0.22), 1.0 - d0)
+    if r.random() < 0.3:
+        v1 = r.uniform(0.25, 0.5)
+        v2 = r.uniform(max(v1, 0.4), 0.8)
+    else:
+        v1 = r.uniform(0.5, 0.85)
+        v2 = r.uniform(0.55, 0.9)
+    kx = [0.0, d0, m1, m2, m3, m4, 1.0]
+    kv = [0.0, r.uniform(0.0, 0.04), v1, v2, 1.0, r.uniform(0.0, 0.05), 0.0]
+    if r.random() < 0.35:
+        kx.insert(3, m1 + (m2 - m1) * r.uniform(0.3, 0.7))
+        kv.insert(3, 0.5 * (v1 + v2) * r.uniform(0.8, 1.15))
+    return np.array(kx), np.array(kv)
+
+def _yg_shape(kx, kv, h1, h2):
+    p = np.interp(np.arange(_YG_P) / float(_YG_P), kx, kv)
+    p = _yg_cbox(_yg_cbox(p, h1), h2)
+    lo = float(p.min())
+    hi = float(p.max())
+    return (p - lo) / max(hi - lo, 1e-9)
+
+def _yg_cycle(r, n, s_amp, s_lvl, s_warp, blend):
+    kx, kv = _yg_knots(r)
+    h1 = int(r.uniform(0.012, 0.045) * _YG_P)
+    h2 = int(r.uniform(0.004, 0.03) * _YG_P)
+    ta = _yg_shape(kx, kv, h1, h2)
+    jx = kx.copy()
+    jv = kv.copy()
+    jx[2:-1] = np.sort(np.clip(kx[2:-1] + r.normal(0.0, 0.015, kx.size - 3), kx[1] + 0.02, 0.97))
+    jv[2:-2] = np.clip(kv[2:-2] + r.normal(0.0, 0.08, kx.size - 4), 0.15, 1.0)
+    tb = _yg_shape(jx, jv, h1, h2)
+    u = (np.arange(n, dtype=np.float64) + float(r.integers(0, _YG_P))) / float(_YG_P)
+    nd = int(u[-1]) + 2
+    grid = np.arange(nd, dtype=np.float64)
+    half = np.arange(2 * nd, dtype=np.float64) * 0.5
+    warp = np.interp(u, half, r.normal(0.0, s_warp, 2 * nd))
+    g = ((u + warp) % 1.0) * _YG_P
+    i0 = np.minimum(g.astype(np.int64), _YG_P - 1)
+    f = g - i0
+    i1 = (i0 + 1) % _YG_P
+    w = np.interp(u, grid, blend * r.random(nd))
+    pa = ta[i0] * (1.0 - f) + ta[i1] * f
+    pb = tb[i0] * (1.0 - f) + tb[i1] * f
+    prof = (pa + w * (pb - pa)) * np.exp(np.interp(u, grid, r.normal(0.0, s_amp, nd)))
+    return prof, np.interp(u, grid, r.normal(0.0, s_lvl, nd))
+
+def _yg_smooth(r, n, tau, sd):
+    step = max(1, int(tau / 6.0))
+    m = n // step + 3
+    z = np.interp(np.arange(n, dtype=np.float64) / step + r.random(), np.arange(m, dtype=np.float64),
+                  _yg_ar1(r, m, tau / step, sd))
+    return _yg_box(z, step)
+
+def _yg_count(r, p_none, lo, hi):
+    if r.random() < p_none:
+        return 0
+    return int(r.poisson(_yg_lu(r, lo, hi)))
+
+def _yg_steps(r, n, k, w_lo, w_hi, a_lo, a_hi, p_up):
+    if k <= 0:
+        return 0.0
+    i0 = r.integers(0, n, k)
+    w = np.exp(r.uniform(np.log(w_lo), np.log(w_hi), k)).astype(np.int64) + 1
+    a = np.exp(r.uniform(np.log(a_lo), np.log(a_hi), k)) * np.where(r.random(k) < p_up, 1.0, -1.0)
+    d = np.bincount(i0, weights=a, minlength=n + 1) - np.bincount(np.minimum(i0 + w, n), weights=a, minlength=n + 1)
+    return np.cumsum(d)[:n]
+
+def _yg_needles(r, lx, k, d_lo, d_hi):
+    if k <= 0:
+        return lx
+    n = lx.size
+    idx = r.integers(0, n - 3, k)
+    a = np.log1p(-np.exp(r.uniform(np.log(d_lo), np.log(d_hi), k)))
+    lx[idx] += a
+    lx[idx + 1] += a * r.uniform(0.0, 0.8, k)
+    lx[idx + 2] += a * r.uniform(0.0, 0.35, k) * (r.random(k) < 0.5)
+    return lx
+
+def _yg_dips(r, lx, k, size):
+    n = lx.size
+    for _ in range(int(k)):
+        i = int(r.integers(0, n))
+        tau = _yg_lu(r, 1.5, 30.0)
+        w = min(n - i, int(7.0 * tau) + 2)
+        lx[i:i + w] -= size * _yg_lu(r, 0.2, 1.5) * np.exp(-np.arange(w) / tau)
+    return lx
+
+def _yg_rate_std(r, n):
+    base = float(np.clip(np.exp(r.normal(np.log(0.27), 0.42)), 0.07, 0.62))
+    q = float(np.exp(r.normal(0.0, 0.6)))
+    prof, lvl = _yg_cycle(r, n, _yg_lu(r, 0.008, 0.10), _yg_lu(r, 0.003, 0.05), _yg_lu(r, 0.002, 0.02),
+                          r.random() if r.random() < 0.6 else 0.0)
+    lc = np.log(base + (1.0 - base) * prof)
+    z = _yg_smooth(r, n, _yg_lu(r, 200.0, 1000.0), 0.012 * q * _yg_lu(r, 0.5, 2.0))
+    z = z + _yg_smooth(r, n, _yg_lu(r, 30.0, 150.0), 0.015 * q * _yg_lu(r, 0.5, 2.0))
+    fast = _yg_ar1(r, n, _yg_lu(r, 4.0, 30.0), 0.020 * q * _yg_lu(r, 0.6, 1.7), r.uniform(0.0, 0.6))
+    z = z + _yg_box(fast, int(r.integers(3, 8)))
+
+    lx = lc + lvl + z * np.exp(-r.uniform(0.2, 0.7) * (lc - float(_v2_meanm(lc))))
+    size = 0.08 * q ** 0.5 * _yg_lu(r, 0.5, 2.0)
+    lx = lx + _yg_steps(r, n, _yg_count(r, 0.3, 0.5, 5.0), 15.0, 300.0, 0.3 * size, 4.0 * size, 0.8)
+    lx = lx + _yg_steps(r, n, _yg_count(r, 0.2, 1.0, 12.0), 2.0, 14.0, 0.2 * size, 2.5 * size, 0.9)
+    lx = _yg_dips(r, lx, _yg_count(r, 0.5, 0.4, 4.0), 2.0 * size)
+    lx = _yg_needles(r, lx, _yg_count(r, 0.2, 1.0, 10.0), 0.03, 0.85)
+    if r.random() < 0.10:
+        lx[int(r.integers(0, n)):] += r.normal(0.0, 0.06)
+    is_bytes = r.random() < 0.18
+    level = 10.0 ** (r.uniform(8.3, 9.4) if is_bytes else r.uniform(3.0, 5.0))
+    u = r.random()
+    return _yg_store(r, level * np.exp(lx), 1 if (is_bytes or u < 0.12) else (2 if u < 0.35 else 0))
+
+def _yg_pulses(r, n, rate, w_lo, w_hi, h_lo, h_hi):
+    k = int(r.poisson(rate * n))
+    if k <= 0:
+        return np.zeros(n)
+    i0 = r.integers(0, n, k)
+    w = np.exp(r.uniform(np.log(w_lo), np.log(w_hi), k)).astype(np.int64) + 1
+    h = np.exp(r.uniform(np.log(h_lo), np.log(h_hi), k))
+    d = np.bincount(i0, weights=h, minlength=n + 1) - np.bincount(np.minimum(i0 + w, n), weights=h, minlength=n + 1)
+    return np.maximum(np.cumsum(d)[:n], 0.0)
+
+def _yg_rate_burst(r, n):
+    base = float(np.clip(np.exp(r.normal(np.log(0.33), 0.35)), 0.12, 0.7))
+    prof, lvl = _yg_cycle(r, n, _yg_lu(r, 0.02, 0.15), _yg_lu(r, 0.005, 0.05), _yg_lu(r, 0.003, 0.02), r.random())
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _yg_ar1(r, n, _yg_lu(r, 100.0, 800.0), _yg_lu(r, 0.01, 0.06))
+    lx = lx + _yg_box(_yg_ar1(r, n, _yg_lu(r, 2.0, 15.0), _yg_lu(r, 0.01, 0.04), r.uniform(0.0, 0.6)), int(r.integers(2, 6)))
+    x = np.exp(lx) * (1.0 + _yg_pulses(r, n, _yg_lu(r, 0.01, 0.08), 1.0, 14.0, 0.08, 1.2))
+    lx = _yg_events(r, np.log(x), _yg_count(r, 0.5, 0.5, 4.0), 0, 0, _yg_count(r, 0.3, 1.0, 20.0), 0.3)
+    level = 10.0 ** r.uniform(3.5, 5.2)
+    return _yg_store(r, level * np.exp(lx), 2 if r.random() < 0.25 else 0)
+
+def _yg_rate_shallow(r, n):
+    base = float(r.uniform(0.55, 0.88))
+    prof, lvl = _yg_cycle(r, n, _yg_lu(r, 0.03, 0.2), _yg_lu(r, 0.004, 0.03), _yg_lu(r, 0.003, 0.02), r.random())
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _yg_ar1(r, n, _yg_lu(r, 60.0, 600.0), _yg_lu(r, 0.01, 0.05))
+    lx = lx + _yg_ar1(r, n, _yg_lu(r, 6.0, 40.0), _yg_lu(r, 0.006, 0.03))
+    lx = lx + _yg_box(_yg_ar1(r, n, _yg_lu(r, 2.0, 12.0), _yg_lu(r, 0.004, 0.015), r.uniform(0.0, 0.9)), int(r.integers(2, 6)))
+    lx = _yg_events(r, lx, _yg_count(r, 0.1, 2.0, 12.0), _yg_count(r, 0.5, 0.5, 4.0), _yg_count(r, 0.5, 0.5, 6.0),
+                    _yg_count(r, 0.3, 1.0, 12.0), _yg_lu(r, 0.04, 0.2))
+    level = 10.0 ** r.uniform(4.2, 6.1)
+    return _yg_store(r, level * np.exp(lx), 2 if r.random() < 0.4 else 0)
+
+def _yg_rate_error(r, n):
+    base = float(r.uniform(0.35, 0.8))
+    prof, lvl = _yg_cycle(r, n, _yg_lu(r, 0.05, 0.3), _yg_lu(r, 0.01, 0.1), _yg_lu(r, 0.003, 0.02), r.random())
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _yg_ar1(r, n, _yg_lu(r, 30.0, 400.0), _yg_lu(r, 0.03, 0.15))
+    lx = lx + _yg_ar1(r, n, _yg_lu(r, 0.5, 4.0), _yg_lu(r, 0.05, 0.25), r.uniform(0.2, 0.9))
+    x = np.exp(lx) * (1.0 + _yg_pulses(r, n, _yg_lu(r, 0.004, 0.05), 1.0, 30.0, 0.3, 6.0))
+    level = 10.0 ** r.uniform(-0.6, 0.4)
+    return _yg_store(r, level * x, 0)
+
+def _yg_rate(r, L):
+    n = L if (r.random() < 0.7 or L <= 3440) else int(r.integers(3440, L))
+    k = int(np.searchsorted(_YG_RATE_KINDS, r.random() * _YG_RATE_KINDS[-1], side="right"))
+    if k <= 0:
+        x = _yg_rate_std(r, n)
+    elif k == 1:
+        x = _yg_rate_burst(r, n)
+    elif k == 2:
+        x = _yg_rate_shallow(r, n)
+    else:
+        x = _yg_rate_error(r, n)
+    return _yg_pad(np.maximum(x, 0.0), L)
+
+def _yg_tide(r, L):
+    u = r.random()
+    if u < 0.30 or L <= 1024:
+        n = L
+    elif u < 0.72:
+        n = int(_yg_lu(r, 900.0, 1750.0))
+    else:
+        n = int(_yg_lu(r, 400.0, float(L)))
+    n = max(64, min(n, L))
+    t = np.arange(n, dtype=np.float64) + r.uniform(0.0, 5e5)
+    a2 = _yg_lu(r, 0.03, 1.4)
+    form = float(np.clip(np.exp(r.normal(np.log(0.45), 0.9)), 0.03, 6.0))
+    s2 = a2 * 0.46 * float(np.exp(r.normal(0.0, 0.35)))
+    a1 = form * (a2 + s2)
+    k1 = a1 * r.uniform(0.5, 0.66)
+    shallow = r.random() < 0.15
+    r4 = r.uniform(0.07, 0.3) if shallow else float(min(np.exp(r.normal(np.log(0.03), 0.8)), 0.25))
+    amps = np.array([a2, s2, a2 * 0.19 * float(np.exp(r.normal(0.0, 0.3))), k1, a1 - k1,
+                     (a1 - k1) * 0.19 * float(np.exp(r.normal(0.0, 0.3))), a2 * r4, a2 * r4 * r.uniform(0.3, 0.7),
+                     a2 * (r.uniform(0.03, 0.1) if shallow else float(min(np.exp(r.normal(np.log(0.012), 0.8)), 0.08))),
+                     a2 * float(min(np.exp(r.normal(np.log(0.03), 0.8)), 0.2))])
+    ph = r.uniform(0.0, _YG_TWO_PI, amps.size)
+    x = np.zeros(n)
+    for j in range(amps.size):
+        x += amps[j] * np.cos(t * (_YG_TWO_PI / _YG_TIDE_PER[j]) + ph[j])
+    a_tot = float(a2 + s2 + a1)
+
+    x = x + _yg_smooth(r, n, r.uniform(120.0, 1440.0), float(np.clip(a_tot * np.exp(r.normal(np.log(0.1), 0.6)), 0.006, 0.35))
+                       + _yg_lu(r, 0.003, 0.025))
+    if r.random() < 0.6:
+        p_s = _yg_lu(r, 8.0, 90.0)
+        amp_s = _yg_lu(r, 0.0015, 0.035) * (r.uniform(1.5, 4.0) if (a_tot < 0.1 and r.random() < 0.5) else 1.0)
+        env = np.exp(_yg_smooth(r, n, 18.0 * 60.0 / 3.0, 0.45))
+        psi = np.cumsum(r.standard_normal(n)) * float(np.sqrt(_YG_TWO_PI / (p_s * r.uniform(4.0, 25.0))))
+        x = x + amp_s * env * np.cos(t * (_YG_TWO_PI / p_s) + psi)
+    s_w = _yg_lu(r, 0.0005, 0.01) if r.random() < 0.8 else _yg_lu(r, 0.01, 0.05)
+    if r.random() < 0.35:
+        e = r.standard_t(float(r.uniform(2.5, 6.0)), n)
+        e = e / max(float(_v2_stdm(e)), 1e-9)
+    else:
+        e = r.standard_normal(n)
+    x = x + s_w * e
+    if r.random() < 0.12:
+        k = int(r.poisson(max(n * r.uniform(0.0002, 0.001), 0.5))) + 1
+        idx = r.integers(0, n, k)
+        x[idx] += np.where(r.random(k) < 0.5, -1.0, 1.0) * r.uniform(4.0, 30.0, k) * max(s_w, 0.004)
+    if r.random() < 0.04:
+        x[int(r.integers(n // 8, n - n // 8)):] += (1.0 if r.random() < 0.5 else -1.0) * r.uniform(0.02, 0.3)
+    half = 1.1 * float(np.max(np.abs(x)))
+    u = r.random()
+    if u < 0.6:
+        datum = half * r.uniform(0.9, 2.2) + r.uniform(0.0, 1.6)
+    elif u < 0.76:
+        datum = r.uniform(2.5, 7.0)
+    elif u < 0.92:
+        datum = -r.uniform(1.2, 8.5)
+    else:
+        datum = half * r.uniform(-0.8, 0.8)
+    u = r.random()
+    q = 0.001 if u < 0.87 else (0.01 if u < 0.94 else 0.0001)
+    return _yg_pad(np.round((x + datum) / q) * q, L)
