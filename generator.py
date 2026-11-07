@@ -8733,30 +8733,12 @@ def _conditional_stability(
     calm_kind_fixed: int | None = None,
     calm_noise: float = 0.0,
 ) -> np.ndarray:
-    """Alternating calm and dynamic segments, with the calm law selectable.
-
-    ``calm_noise`` is the standard deviation of observation noise added inside a
-    calm segment, in the same units as the segment level. At the default 0.0 the
-    calm modes behave as before: mode 0 is exactly constant for the whole calm
-    span and mode 1 drifts by so little that the integer rounding downstream
-    flattens it back to constant. Measured in isolation those two modes emit mean
-    held-runs of 216 and 62 samples against 9.9 in the eval pool, and the four
-    modes together supply a third of the corpus's excess. A non-zero value breaks
-    the exact-equality runs without changing the segment structure, which is why
-    it is a separate knob from the segment lengths -- it costs one vectorised draw
-    per segment rather than multiplying the number of segments.
-    """
-
 
     if n <= 0:
         return np.empty((0, L), dtype=np.float64)
     if L <= 0:
         return np.empty((n, 0), dtype=np.float64)
 
-    # Build each dynamic ingredient ONLY for the rows that will use it. The original
-    # materialised all four at full (n, L) and then used one per row -- 4x wasted work on
-    # the slowest family in the set. Row content is a different (equally valid) draw, since
-    # the RNG is consumed in a different order.
     kind = rng.integers(0, 4, size=n)
     dyn = np.empty((n, L), dtype=np.float64)
     for _k in range(4):
@@ -8782,26 +8764,16 @@ def _conditional_stability(
     ingredients = None
     calm_kind = rng.integers(0, 4, size=n)
     if calm_kind_fixed is not None:
-        # pin every row's CALM behaviour to one marginal; the dynamic segments stay a
-        # random mix of {seasonal, ar1, smooth, walk} exactly as in the unsplit family
+
         calm_kind = np.full(n, int(calm_kind_fixed), dtype=calm_kind.dtype)
     level = rng.normal(0.0, 2.0, size=n)
-    # Vary calm/dynamic regime durations per generated call, following
-    # gen-4095e1095e74's conditional-stability meta-scale idea.
+
     cs_meta = np.exp(rng.uniform(np.log(0.5), np.log(2.0)))
     scale = np.exp(rng.uniform(np.log(0.4), np.log(12.0), size=n))
     dynamic_amp = rng.uniform(0.6, 2.2, size=n)
     start_calm = rng.random(n) < 0.65
     out = np.empty((n, L), dtype=np.float64)
 
-    # The row calibration below the loop head touches no rng and each row is
-    # independent, so n normalisations collapse into one. Each row still
-    # reduces over a contiguous slice, so numpy's pairwise summation sees the
-    # same element order and mean/std are the same float64 (checked over 240
-    # shapes, constant rows included, and by corpus digest). Dividing the
-    # degenerate rows by exactly 1.0 reproduces the `> 1e-12` guard, since
-    # x / 1.0 == x. The subtraction builds a fresh array rather than a view of
-    # dyn, and `dynamic` is only read below, so the per-row copy is not needed.
     _cal = dyn[:, : min(L, 512)]
     _cal_std = _cal.std(axis=1)
     _dyn_norm = dyn - _cal.mean(axis=1)[:, None]
@@ -8831,7 +8803,6 @@ def _conditional_stability(
                     )
                 )
 
-
             if segment_index == 0 and L >= 2 * _CS_DYNAMIC_LO:
                 seg_len = min(seg_len, L - _CS_DYNAMIC_LO)
             end = min(pos + max(seg_len, 1), L)
@@ -8844,7 +8815,6 @@ def _conditional_stability(
                     if calm_noise > 0.0:
                         values = values + rng.normal(0.0, calm_noise, size=span)
                 elif mode == 1:
-
 
                     drift = rng.normal(0.0, 0.0025, size=span).cumsum()
                     drift += np.linspace(
@@ -8869,7 +8839,6 @@ def _conditional_stability(
                     )
                 else:
 
-
                     events = rng.random(span) < 0.012
                     values = events * rng.gamma(1.5, 0.35, size=span)
             else:
@@ -8884,27 +8853,20 @@ def _conditional_stability(
             calm = not calm
             segment_index += 1
 
-
         row_scale = 1.0 if int(calm_kind[row]) == 2 else float(scale[row])
         out[row] *= row_scale
-
 
         if L > 1 and out[row].max() - out[row].min() < 1e-10:
             out[row, -1] += max(1e-3, 0.01 * row_scale)
     return out
 
-
 def _sanitize(block: np.ndarray) -> np.ndarray:
 
-
     x = np.asarray(block, dtype=np.float64)
-    # nan_to_num walks the array ~6 times (isnan, isinf+signbit twice, copyto)
-    # and is a no-op on finite input, so gate it behind a single finiteness
-    # reduction. Rows carrying a non-finite value take the original path.
+
     if not np.isfinite(x.sum()):
         np.nan_to_num(x, copy=False, nan=0.0, posinf=1e6, neginf=-1e6)
-    # max|x| is max(max x, -min x) exactly, and two reductions beat
-    # materialising a whole |x| just to reduce it.
+
     if x.ndim == 1:
         peak = float(max(x.max(), -x.min()))
         if peak > 1e6:
@@ -8913,13 +8875,11 @@ def _sanitize(block: np.ndarray) -> np.ndarray:
         peak = np.maximum(
             x.max(axis=1, keepdims=True), -x.min(axis=1, keepdims=True)
         )
-        # Nothing over the cap means every scale is 1.0, and multiplying a
-        # finite array by 1.0 leaves it untouched.
+
         if peak.max() > 1e6:
             scale = np.where(peak > 1e6, 1e6 / np.maximum(peak, 1e-12), 1.0)
             x *= scale
     return x
-
 
 def _cs_flat(rng: np.random.Generator, n: int, L: int, *,
              calm_noise: float = 0.0) -> np.ndarray:
@@ -8937,53 +8897,12 @@ def _cs_countwalk(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
 def _cs_pulse(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     return _conditional_stability(rng, n, L, calm_kind_fixed=3)
 
-
-# Recalibrated against the real 08-07 eval pool (1,374 series, domain tags
-# from metadata.json): weighted by the 08-05..08-07 domain mix (transport
-# 33.0%, energy 20.4%, nature 18.4%, healthcare 11.0%, econ_fin 6.5%, sales
-# 6.0%, web_cloudops 4.7%), transport/healthcare/sales/web_cloudops (61.2% of
-# weight) have frac_neg == 0 at the *90th percentile* of their series — i.e.
-# essentially none of their real series ever go negative — yet the previous
-# 0.85 nonneg rate let 15% of every non-exempt-family row go negative
-# regardless of domain, teaching negative excursions that are impossible for
-# most of the weighted eval mix. Measured frac_int medians are ~1.0 for
-# transport/healthcare/sales/web_cloudops vs ~0.02-0.10 for energy/nature/
-# econ_fin, whose signed/continuous character is already carried by the
-# exempt families (grid_flow, spiky_price, price_shock, ou_stochastic_vol,
-# spectral_gp, long_memory) rather than this generic prior, so the generic
-# pool (~86% of total family mass: step_level, ar2, conditional_stability,
-# the four cs_* splits, threshold_ar, etc.) can safely skew further toward
-# the majority-weighted count-like reality without starving the dedicated
-# continuous families of their own signal.
 _NONNEG_FRAC = 0.93
 _NONNEG_INTEGER_FRAC = 0.86
-
 
 def _spread_flat_levels(
     rng: np.random.Generator, rows: np.ndarray, spread: float
 ) -> np.ndarray:
-    """Move exactly-constant rows onto distinct integer levels.
-
-    Rounding leaves a constant row on whichever small integer its level happened
-    to land on, and the corpus makes enough of them that they collide. Measured
-    on an 8192-row corpus at a 0.37 frozen-tail share, *every* duplicate series
-    was a constant row, 42 groups in total, and the largest single group was 266
-    copies of the all-zero series. The trainer rejects a corpus once 5% of its
-    series are exact copies, so those collisions -- not anything about forecast
-    quality -- are what caps the plateau dose, and the plateau dose is what the
-    08-26-1 ladder showed buys transport and sales.
-
-    Offsetting a constant row leaves it exactly as constant as it was, so the
-    structure the heavy domains reward is untouched; only the level moves. It
-    also puts the counts in the hundreds or thousands, which is where the pool's
-    transport counts sit -- the integer-prior docstring makes the same point
-    about rows that round onto two or three levels.
-
-    The draw is uniform rather than log-uniform because the objective here is
-    distinctness: expected collisions among n flat rows go as n^2/(2*spread), so
-    a flat prior over the range is what buys headroom. At spread 0.0 nothing is
-    drawn and the stream is identical to the parent's.
-    """
     if spread <= 0.0 or rows.size == 0:
         return rows
     flat = rows.min(axis=1) == rows.max(axis=1)
@@ -8994,7 +8913,6 @@ def _spread_flat_levels(
     rows[flat] += level
     return rows
 
-
 def _apply_nonneg_integer_prior(
     rng: np.random.Generator, block: np.ndarray, *,
     integer_min_std: float = 0.0,
@@ -9002,39 +8920,6 @@ def _apply_nonneg_integer_prior(
     integer_frac: float = _NONNEG_INTEGER_FRAC,
     flat_level_spread: float = 0.0,
 ) -> np.ndarray:
-    """Shift most rows nonnegative and round most of those to integers.
-
-    ``integer_frac`` is the share of shifted rows that get rounded. Rounding is
-    the corpus's main producer of *exact* repeated values, which is the structure
-    the count-heavy eval domains are built from, so this is the lever for how much
-    exact-repeat content the corpus carries.
-
-    ``integer_min_std_frac`` is the share of those rows the guard is allowed to
-    touch, and it exists because the guard has already been tested at full
-    strength and failed badly. jen7-r set ``integer_min_std`` to 16 and left this
-    at 1.0, which rescaled essentially every row that was about to be rounded: the
-    corpus repeat share fell from 0.60 to 0.10, distinct levels rose from 10 to 75,
-    and it placed 369th of 372 while losing every individual domain. The
-    instructive part is that 75 levels at a 0.098 repeat share is almost exactly
-    web_cloudops' own profile (68 levels, 0.086), so the failure was not a bad
-    target -- it was applying one target to the whole corpus. The pool spans 16
-    levels in transport to 476 in sales, and the corpus needs to cover that range
-    rather than relocate onto a point in it. Below 1.0 the guard reaches a random
-    subset, leaving the low-resolution staircase rows that have been winning
-    intact and adding a high-resolution subpopulation beside them. At 1.0 no draw
-    is taken and the behaviour is exactly as before.
-
-    ``integer_min_std`` guards the resolution of the rounding. A family may emit
-    a row whose amplitude is only a couple of units -- ``step_level`` and
-    ``conditional_stability`` both draw scale from a log-uniform range starting at
-    1 -- and rounding such a row to integers leaves it with two or three distinct
-    levels, so it reads as a frozen staircase rather than a count series. Real
-    count series in the eval pool are integer *and* varied: transport is 96%
-    integer with a mean held-run of 19 samples, because its counts range over
-    hundreds. Above zero this rescales a row up to the given standard deviation
-    before rounding, which keeps the integer character while restoring the
-    resolution. At the default 0.0 the behaviour is exactly as before.
-    """
     n = block.shape[0]
     if n == 0:
         return block
@@ -9042,9 +8927,7 @@ def _apply_nonneg_integer_prior(
     if not nonneg_mask.any():
         return block
     sel = np.nonzero(nonneg_mask)[0]
-    # At n=1 the selection is almost always "every row", where the fancy index
-    # is a full copy of the block; a plain view lets the shift and the rounding
-    # land in place instead of allocating the row four more times.
+
     whole = sel.size == n
     rows = block if whole else block[sel]
     row_min = rows.min(axis=1, keepdims=True)
@@ -9054,13 +8937,10 @@ def _apply_nonneg_integer_prior(
     rows += shift
     int_mask = rng.random(sel.size) < integer_frac
     if integer_min_std > 0.0 and int_mask.any():
-        # Scale up only the rows that are about to be rounded and are too small to
-        # survive it. Applied before the rounding and after the nonneg shift, so
-        # the floor stays proportional to the row.
+
         low = int_mask & (row_scale[:, 0] < integer_min_std)
         if integer_min_std_frac < 1.0:
-            # Drawn only on this branch, so an arm that leaves the fraction at 1.0
-            # consumes the identical stream to the parent body.
+
             low &= rng.random(sel.size) < integer_min_std_frac
         if low.any():
             grow = (integer_min_std / row_scale[low, 0])[:, None]
@@ -9085,24 +8965,9 @@ def _apply_nonneg_integer_prior(
         block[sel] = rows
     return block
 
-
-# Real sparse-count domains spend long stretches at an exact structural zero
-# floor, not just "small positive": measured on the 08-07 eval pool,
-# healthcare's frac_zero reaches 0.40 and energy's 0.37 at the 90th
-# percentile of series (rare-event dispatch/case counts; curtailed/idle grid
-# output), while this generator's own output — even after the nonneg/integer
-# prior above — tops out at frac_zero=0.013 at the 90th percentile, because
-# only the tiny intermittent/epi_decay/seasonal_counts families (2.9%
-# combined weight) ever produce sustained zero runs. Rounding a small
-# positive floor up from a shifted minimum (as the prior above does) almost
-# never lands exactly on zero, so the "flat-zero, occasional nonzero" lesson
-# is essentially untaught outside those three slivers. This adds it directly
-# as a shared post-process on a minority of already-nonnegative rows from
-# the same generic family pool, independent of any family's weight or math.
 _ZERO_INFLATE_ROW_FRAC = 0.14
 _ZERO_INFLATE_FLOOR_FRAC_LO = 0.15
 _ZERO_INFLATE_FLOOR_FRAC_HI = 0.85
-
 
 def _apply_interior_rebase_episode(
     rng: np.random.Generator,
@@ -9114,14 +8979,6 @@ def _apply_interior_rebase_episode(
     preserve_periodic_native: bool = False,
     route_mode: str = "all",
 ) -> np.ndarray:
-    """Insert one finite, context-validated continuation episode.
-
-    V449 teaches its strongest continuation law only near the terminal edge of
-    each 4096-point training row.  This arm reuses the exact same causal
-    classifier on an earlier prefix, then crossfades back to the untouched
-    native path.  The episode ends no later than 2816, leaving a gap before the
-    earliest sample (2864) read by V449's terminal classifier.
-    """
     if rate <= 0.0:
         return block
     values = np.asarray(block, dtype=np.float64)
@@ -9147,7 +9004,6 @@ def _apply_interior_rebase_episode(
     values[:, :end] = episode
     return values
 
-
 def _apply_tail_rebase(
     rng: np.random.Generator,
     block: np.ndarray,
@@ -9157,16 +9013,6 @@ def _apply_tail_rebase(
     preserve_periodic_native: bool = False,
     _route_mode: str = "all",
 ) -> np.ndarray:
-    """Teach only continuations supported by generated pre-boundary context.
-
-    A 512-sample causal prefix reserves its last 96 points for validating a
-    possible 7/12/24/48/96-step cycle or an unusually clear robust linear
-    continuation. A cycle must be non-flat, have small normalized validation
-    error, and beat persistence by at least 25 percent. A line is much stricter:
-    error at most 0.08, at most 30 percent of persistence error, and a projected
-    96-step move between 0.2 and 0.9 robust spans. Other rows retain the
-    context-conditioned persistence law from V152.
-    """
     if rate <= 0.0:
         return block
     n, L = block.shape
@@ -9266,10 +9112,7 @@ def _apply_tail_rebase(
     retain = rng.uniform(0.05, 0.25, size=n)
     periodic_rows = selected & (recurring_nonflat | long_recurring)
     linear_rows = selected & strict_linear & (~recurring_nonflat)
-    # Fixed row parity gives a source-, target- and horizon-independent 50%
-    # mechanism dose without consuming another random draw or perturbing any
-    # downstream RNG stream. Half retain their native generated future; the
-    # other half keep V213's clipped-linear continuation.
+
     native_linear_rows = linear_rows & ((np.arange(n, dtype=np.int64) & 1) == 0)
     if _route_mode not in ("all", "periodic", "quiet"):
         raise ValueError("invalid continuation route mode")
@@ -9281,7 +9124,7 @@ def _apply_tail_rebase(
         periodic_rows = np.zeros(n, dtype=bool)
         linear_rows = np.zeros(n, dtype=bool)
         native_linear_rows = np.zeros(n, dtype=bool)
-    # A jumped, deterministic substream leaves every parent draw intact.
+
     cycle_rng = np.random.Generator(rng.bit_generator.jumped())
     for row in np.nonzero(eligible | periodic_rows | linear_rows)[0]:
         b = int(boundary[row])
@@ -9312,18 +9155,7 @@ def _apply_tail_rebase(
         block[row, b:] = tail
     return block
 
-
 def _apply_zero_inflation(rng: np.random.Generator, block: np.ndarray) -> np.ndarray:
-    """Clip the bottom slice of a minority of nonnegative rows to exact 0.
-
-    For each selected row, values at or below a threshold interpolated
-    between that row's own minimum and median (a random fraction per row,
-    so the zero-run length varies series to series) are set to exactly 0.
-    This creates real sustained zero-floor stretches — the shape rare-event
-    count series (dispatch calls, curtailed output) actually have — rather
-    than the merely-small-positive values the nonneg/integer prior alone
-    produces.
-    """
     n = block.shape[0]
     if n == 0:
         return block
@@ -9342,7 +9174,6 @@ def _apply_zero_inflation(rng: np.random.Generator, block: np.ndarray) -> np.nda
     block[sel] = rows
     return block
 
-
 _SPIKE_PATTERNS_BY_CATEGORY: tuple[tuple[tuple[int, ...], ...], ...] = (
     ((0,), (0, 1)),
     ((0, 1, 2), (0, 0, 1)),
@@ -9353,7 +9184,6 @@ _SPIKE_CATEGORY_PROBS = np.array([0.75, 0.10, 0.10, 0.05])
 _SPIKE_CATEGORY_CDF = _choice_cdf(_SPIKE_CATEGORY_PROBS)
 _DUTY_PERIODS = np.array([4, 8, 12, 16, 24, 48])
 _NO_ROWS = np.empty(0, dtype=np.int64)
-
 
 def _tirex2_marginal_augments(
     rng: np.random.Generator,
@@ -9366,17 +9196,6 @@ def _tirex2_marginal_augments(
     global_dilation_rate: float = 0.0,
     duty_cycle_rate: float = 0.0,
 ) -> np.ndarray:
-    """TiRex-2 §3.4 / App.F stage-1+3 *univariate* portables.
-
-    The TiRex-2 public repo ships inference only; the paper's pretraining
-    pipeline first perturbs each univariate series with piecewise-linear
-    amplitude trends, shaped spike kernels, then applies observational
-    transforms including Brownian-bridge time warping and time-discretisation
-    (freezes / staircases / duty cycles). Multivariate coupling (SCM,
-    cointegration, linear mixing across variates) is intentionally omitted —
-    cascade heat is univariate. Rates are kept modest; an earlier aggressive
-    observation-rate bump (v77) was a net wash/loss.
-    """
     out = np.asarray(block, dtype=np.float64)
     if out.ndim != 2:
         return out
@@ -9385,10 +9204,6 @@ def _tirex2_marginal_augments(
         return out
     t = _time_index(L)[0]
 
-    # Fixed child-stream creation is the core of the ablation harness. Each
-    # stage receives the same seed in every variant, irrespective of whether
-    # another stage is enabled, disabled, or changes how many random draws it
-    # consumes.
     stage_seeds = rng.integers(
         0, np.iinfo(np.int64).max, size=4, dtype=np.int64
     )
@@ -9398,18 +9213,8 @@ def _tirex2_marginal_augments(
     stage_words = _pcg64_seed_words_jit(stage_seeds.astype(np.uint64))
 
     def stage_rng(slot: int) -> np.random.Generator:
-        """Stage `slot`'s stream, built only if that stage runs.
-
-        Each stage draws from its own slot of the single four-way seed draw
-        above, so skipping a disabled stage cannot shift the stream any enabled
-        stage receives -- the ablation guarantee is in the seed derivation, not
-        in eagerly constructing all four. time_warp_rate and
-        periodic_spike_frac are 0 in the shipped configs, and a PCG64 built per
-        row and never drawn from is pure producer-thread overhead.
-        """
         return pool.seeded(slot, *stage_words[slot])
 
-    # --- piecewise-linear amplitude trends ---------------------------------
     if amp_trend_rate > 0.0:
         amp_rng = stage_rng(0)
         amp_rows = np.nonzero(amp_rng.random(n) < amp_trend_rate)[0]
@@ -9424,13 +9229,12 @@ def _tirex2_marginal_augments(
         )
         knot_t[0] = 0.0
         knot_t[-1] = float(L - 1)
-        # envelope centred on 1 so quiet stretches keep original scale
+
         knot_a = np.exp(amp_rng.normal(0.0, 0.45, size=n_knots))
         envelope = np.interp(t, knot_t, knot_a)
         centre = float(centres[k])
         out[i] = centre + (out[i] - centre) * envelope
 
-    # --- shaped spike kernels (gaussian / triangular / rectangular) --------
     if kernel_spike_rate > 0.0:
         spike_rng = stage_rng(1)
         spike_rows = np.nonzero(spike_rng.random(n) < kernel_spike_rate)[0]
@@ -9491,13 +9295,7 @@ def _tirex2_marginal_augments(
                     ) * float(robust[k, 0])
                     sign = float(_CHOICE_PM1[spike_rng.integers(0, 2)])
                 kernel = int(spike_rng.integers(0, 3))
-                # Each kernel is exactly 0.0 outside a bounded radius, so only
-                # that window needs touching: the triangle vanishes at 2*width
-                # and the rectangle at width by construction, and the gaussian's
-                # exponent passes exp's float64 underflow threshold (-745.2) at
-                # 38.6 widths. Adding the tail would add exactly 0.0, so the
-                # windowed update is bit-identical to the full-length one while
-                # the common narrow-spike case stops paying for 4096 samples.
+
                 radius = (38.7 * width if kernel == 0
                           else 2.0 * width if kernel == 1
                           else width)
@@ -9515,8 +9313,6 @@ def _tirex2_marginal_augments(
                         ker = (np.abs(dt) <= width).astype(np.float64)
                     out[i, lo:hi] = out[i, lo:hi] + sign * mag * ker
 
-    # Global clock dilation uses a child seed and no parent or stage draw.
-    # A contiguous legal crop keeps every interpolation index inside the row.
     if global_dilation_rate > 0.0:
         dilation_rng = np.random.default_rng(
             np.random.SeedSequence((int(stage_seeds[2]), 605)))
@@ -9528,19 +9324,18 @@ def _tirex2_marginal_augments(
                 0.0, (L - 1) * (1.0 - factor)))
             out[i] = np.interp(offset + factor * t, t, out[i])
 
-    # --- Brownian-bridge time warping (smooth reindex) ---------------------
     if time_warp_rate > 0.0:
         warp_rng = stage_rng(2)
         warp_rows = np.nonzero(warp_rng.random(n) < time_warp_rate)[0]
     else:
         warp_rows = _NO_ROWS
     for i in warp_rows:
-        # unit Brownian bridge on [0,1], scaled to a few samples of lag
+
         steps = warp_rng.normal(0.0, 1.0, size=L).cumsum()
         bridge = steps - (t / max(L - 1, 1)) * steps[-1]
         bridge = bridge - bridge.mean()
         bstd = float(bridge.std()) or 1.0
-        amp = float(warp_rng.uniform(0.5, 3.0))  # samples of lag
+        amp = float(warp_rng.uniform(0.5, 3.0))
         lag = amp * (bridge / bstd)
         src = np.clip(t + lag, 0.0, float(L - 1))
         lo = np.floor(src).astype(np.int64)
@@ -9548,7 +9343,6 @@ def _tirex2_marginal_augments(
         w = src - lo
         out[i] = (1.0 - w) * out[i, lo] + w * out[i, hi]
 
-    # --- duty-cycle time discretisation (on/off freezes) -------------------
     if duty_cycle_rate > 0.0:
         duty_rng = stage_rng(3)
         duty_rows = np.nonzero(duty_rng.random(n) < duty_cycle_rate)[0]
@@ -9561,29 +9355,16 @@ def _tirex2_marginal_augments(
         on = int(duty_rng.integers(1, max(2, period)))
         phase = int(duty_rng.integers(0, period))
         active = ((t_int + phase) % period) < on
-        # Freeze to the last active value during off phases. The scalar
-        # carry-forward loop is a running maximum over the active indices
-        # (floored at 0, which is where `last` starts), so gathering through
-        # that index is the same copy without 4096 interpreter steps.
+
         source = np.where(active, t_int, 0)
         np.maximum.accumulate(source, out=source)
         out[i] = out[i][source]
 
     return out
 
-
 FLOW_FAMILIES = ('rate_counts', 'seasonal_counts', 'biz_day_counts', 'sparse_admin_counts', 'storm_outage_counts')
 
 def _flow_reporting_total(x, width, mode):
-    """Return k-lag sum or k-times-level control, without mutating x.
-
-    Prior unavailable observations equal the first observation. This affects
-    only the first k-1 samples, never uses future values, and does not imply
-    stationary prehistory. Direct positive-term summation avoids catastrophic
-    cancellation from subtracting cumulative sums on sparse large-scale rows.
-    Integer input retains its lattice while representable in float64. No
-    capacity/stock meaning is asserted: these are totals of flow measurements.
-    """
     if width not in (4, 8, 16) or mode not in ("rolling", "scale"):
         raise ValueError("invalid reporting memory experiment")
     if mode == "scale":
@@ -9599,8 +9380,7 @@ def _flow_reporting_memory(block, family, base_seed, chunk_index, fam, anchor,
                            width, mode, rate):
     if rate == 0.0 or family not in FLOW_FAMILIES:
         return block
-    # Independent new stream; existing native/observation/mixing draws remain
-    # unchanged. Same eligible rows selected in every width/control variant.
+
     rng = np.random.default_rng(np.random.SeedSequence(
         (base_seed, chunk_index, fam, anchor, 91837)))
     selected = np.flatnonzero(rng.random(block.shape[0]) < rate)
@@ -9609,7 +9389,6 @@ def _flow_reporting_memory(block, family, base_seed, chunk_index, fam, anchor,
     result = block.copy()
     result[selected] = _flow_reporting_total(block[selected], width, mode)
     return result
-
 
 def _held_hazard(k, shift, mean_matched):
     if shift not in (0., .5, 1., 2.):
@@ -9623,15 +9402,7 @@ def _held_hazard(k, shift, mean_matched):
 
 _CYCLE_PREDICTIVE_MODE = 'median'
 
-
 def _empirical_cycle_tail(history, lag, length, rng, mode):
-    """Future from at most seven complete observed cycles, aligned at boundary.
-
-    Median picks an observed value at each phase, preserving discrete support.
-    Phase resampling and whole-cycle resampling have the same empirical
-    phase-wise marginals; only their within-cycle dependence differs.
-    All inputs precede the continuation boundary. No native future is read.
-    """
     if mode == "native":
         return np.tile(history[-lag:], (length + lag - 1) // lag)[:length]
     count = min(7, len(history) // lag)
@@ -9656,7 +9427,6 @@ _LONG_CYCLE_ENABLED = True
 _LONG_CYCLE_LAGS = tuple(range(97, 257))
 
 def _long_cycle_predict(history, lag, length):
-    """Preserve phase relative to the next unseen sample, including partial cycles."""
     history = np.asarray(history, dtype=float)
     if history.ndim != 2 or lag < 1 or length < 1 or lag > history.shape[1]:
         raise ValueError('Need a 2-D history, available positive lag and length')
@@ -9699,7 +9469,7 @@ def _cycle_menu_groups(fit_points, validation_points, lag_low, lag_stop):
 
 @njit(cache=False, nogil=True)
 def _pairwise_leaf(a, lo, n):
-    # NumPy's float64 pairwise-summation leaf (n <= 128), so fused means stay bit-identical.
+
     if n < 8:
         res = 0.0
         for i in range(n):
@@ -9731,10 +9501,9 @@ def _pairwise_leaf(a, lo, n):
         i += 1
     return res
 
-
 @njit(cache=False, nogil=True)
 def _pairwise_sum(a, n):
-    # NumPy splits n > 128 at n//2 rounded down to a multiple of 8: 256 -> 128+128, 512 -> 256+256.
+
     if n <= 128:
         return _pairwise_leaf(a, 0, n)
     if n == 256:
@@ -9744,12 +9513,9 @@ def _pairwise_sum(a, n):
                 + (_pairwise_leaf(a, 256, 128) + _pairwise_leaf(a, 384, 128)))
     raise ValueError("unsupported validation length")
 
-
 @njit(cache=False, nogil=True)
 def _cycle_menu_errors(history, observed, span, limit, lags, cols, count, fit_points, errors):
-    # errors[r, lag] is exact whenever it can pass (<= limit[r]); a lag whose
-    # pairwise partial sum already exceeds the limit is stored as +inf, which
-    # cannot change the argmin of a passing row or the pass flags.
+
     rows = history.shape[0]
     points = observed.shape[1]
     leaves = points // 128
@@ -9809,7 +9575,6 @@ def _cycle_menu_errors(history, observed, span, limit, lags, cols, count, fit_po
             if aborted:
                 errors[r, cols[j]] = np.inf
 
-
 def _cycle_menu_first_validation(context, span, fit_points, validation_points, lag_low, lag_stop):
     history = np.ascontiguousarray(context[:, :fit_points])
     observed = np.ascontiguousarray(context[:, fit_points:fit_points + validation_points])
@@ -9851,22 +9616,15 @@ def _validated_cycle_menu(context, fit_points, validation_points, lag_low, lag_s
 def _validated_longer_cycle(context):
     return _validated_cycle_menu(context, 1024, 512, _LONGER_CYCLE_LAGS[0], _LONGER_CYCLE_LAGS[-1] + 1)
 
-
 _TIDAL_NATIVE_PERIODIC_ENABLED = True
-
 
 _HARRY_TIDAL_GAMMA_BYPASS = True
 
-
 _HARRY_I029_GRID_FLOW_GAMMA_BYPASS = True
 
-
-# Native sigmoid sensor support; other sensor modes retain the host treatment.
 _CAS1_BOUNDED_SENSOR_ENABLED = True
 _physical_sensors.with_metadata = partial(_physical_sensors, native_metadata=True)
 
-# Cas1 route-isolation arm: fixed V463 opportunities, periodic only.
-# Station and traffic families keep V444's clock: no time warp or dilation on them.
 _V444_CLOCK_FAMILIES = frozenset({
     "sticky_station", "capacity_counts", "conditional_stability", "cs_flat", "cs_drift",
     "cs_countwalk", "cs_pulse", "transport_flow", "transport_flow_tail", "heavy_traffic_counts",
@@ -9878,24 +9636,13 @@ _CAS1_INTERIOR_REBASE_STAGE = 0xCA5101
 _CAS1_INTERIOR_REBASE_ENDPOINTS = (1536, 2304, 2816)
 _CAS1_INTERIOR_REBASE_ROUTE = 'periodic'
 
-
-# --------------------------------------------------------------------
-# Grafted from the c3 lineage: the families serving the two domains we
-# still beat this king on (healthcare, web_cloudops). Append-only.
-# --------------------------------------------------------------------
-
 _HC_YEAR = 365.0
-
 
 _WC_HARM = np.arange(1, 5, dtype=np.float64)
 
-
-_WC_H = 720          # the validator's longest scored horizon (h720 window)
-
+_WC_H = 720
 
 def _wc_profile(rng: np.random.Generator, n: int, period: int, h1_lo: float, h1_hi: float) -> np.ndarray:
-    """``(n, period)`` zero-mean unit-sd Fourier daily profiles with the first
-    harmonic carrying a share of the power drawn in [h1_lo, h1_hi]."""
     k = _WC_HARM[None, :, None]
     amp = rng.uniform(0.15, 1.0, size=(n, 4, 1)) * (k ** -rng.uniform(0.6, 1.6, size=(n, 1, 1)))
     share = rng.uniform(h1_lo, h1_hi, size=(n, 1, 1))
@@ -9907,9 +9654,7 @@ def _wc_profile(rng: np.random.Generator, n: int, period: int, h1_lo: float, h1_
     p -= p.mean(axis=1, keepdims=True)
     return p / (p.std(axis=1, keepdims=True) + 1e-12)
 
-
 def _wc_ar1(rng: np.random.Generator, n: int, m: int, phi: np.ndarray) -> np.ndarray:
-    """Unit-variance stationary AR(1) rows ``(n, m)`` with per-row ``phi``."""
     e = rng.standard_normal((n, m))
     a = np.empty((n, m), dtype=np.float64)
     a[:, 0] = e[:, 0]
@@ -9918,7 +9663,6 @@ def _wc_ar1(rng: np.random.Generator, n: int, m: int, phi: np.ndarray) -> np.nda
     for k in range(1, m):
         a[:, k] = p * a[:, k - 1] + q * e[:, k]
     return a
-
 
 def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     """Annual epidemic waves on an endemic floor after a decaying pandemic
