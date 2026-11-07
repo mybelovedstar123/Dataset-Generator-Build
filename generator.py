@@ -29367,3 +29367,91 @@ def _c251_c91_runs(v, min_run, cs, ce, ceq):
         ce[nc] = L
         nc += 1
     return nc
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_c91_assemble(v, es, ds, out):
+    pos = 0
+    prev = 0
+    for k in range(es.shape[0]):
+        e = es[k]
+        for t in range(prev, e):
+            out[pos] = v[t]
+            pos += 1
+        val = v[e - 1]
+        for t in range(ds[k]):
+            out[pos] = val
+            pos += 1
+        prev = e
+    for t in range(prev, v.shape[0]):
+        out[pos] = v[t]
+        pos += 1
+
+
+_c251_c124b2_parent = _c124b2_extend
+
+
+def _c251_c124b2_extend(x, r):
+    v = np.asarray(x)
+    if v.ndim != 1 or v.size < 256 or v.dtype.kind != 'f':
+        return None
+    if v.dtype != np.float64:
+        return _c251_c124b2_parent(x, r)
+    L = int(v.size)
+    cs = np.empty(L, dtype=np.int64)
+    ce = np.empty(L, dtype=np.int64)
+    ceq = np.empty(L, dtype=np.int64)
+    nc = int(_c251_c91_runs(v, float(_C91_MIN_RUN), cs, ce, ceq))
+    if nc == 0:
+        return None
+    cand = list(zip(cs[:nc].tolist(), ce[:nc].tolist()))
+    chosen = {}
+    ins = 0
+    for j in r.permutation(len(cand)).tolist():
+        if r.random() >= _C91_P:
+            continue
+        d = int(min(_C91_MIN_D + int(r.geometric(1.0 / _C91_MEAN_D)), _C91_MAX_D))
+        s = cand[j][0]
+        a = max(1, s - _C124B2_W)
+        nd = s - a
+        if nd < _C124B2_MIN_N or int(ceq[s - 1] - ceq[a - 1]) < _C124B2_QMIN * nd:
+            continue
+        if ins + d > _C91_MAX_TOTAL:
+            continue
+        chosen[j] = d
+        ins += d
+    if ins == 0:
+        return None
+    es = []
+    ds = []
+    for j, (s, e) in enumerate(cand):
+        d = chosen.get(j)
+        if d is None:
+            continue
+        es.append(e)
+        ds.append(d)
+    out = np.empty(L + ins, dtype=v.dtype)
+    _c251_c91_assemble(v, np.array(es, dtype=np.int64), np.array(ds, dtype=np.int64), out)
+    w = out[ins:]
+    return w if w.size == L else None
+
+
+if _c91_extend is _c124b2_extend:
+    _c91_extend = _c251_c124b2_extend
+
+
+# ═══════════════ c251-P6: exact _acuh_air (ACUH 4th-channel 'air' family): the pollution-episode loop. ═══════════════
+# uid76 builds every episode with linspace + arange + divide + exp + concatenate + a slice add (~10 us of numpy
+# overhead per episode, ~23 episodes per call). P6 keeps the per-episode RNG calls verbatim and in order
+# (r.integers(0, n, nep) for the starts, then per episode r.normal -> r.integers(1, 4) -> r.uniform(1.0, 4.0)), keeps
+# the per-episode SCALAR np.exp(r.normal(...)) as a scalar ufunc call, and then:
+#  * linspace(0, 1, rise + 1)[1:] for rise in {1, 2, 3} comes from a table built once with the same np.linspace call;
+#  * the decay exponentials of all episodes are ONE np.exp over the concatenated float64(-k) / decay arguments
+#    (k = 1..int(6 * decay) + 1, the same int64 -> float64 conversion and true division as -np.arange(..) / decay):
+#    a 1-D contiguous ufunc call exactly like each original per-episode call, so every element goes through the same
+#    inner loop and gets the same bits;
+#  * ep[s:e] += a * seg[:e - s] is replayed episode by episode in a numba loop: per element ep[t] + (a * seg[t - s])
+#    with the multiply rounded first (fastmath OFF, no FMA contraction), in the same episode order.
+# Everything else in the function is uid76's code verbatim. _ACUH_FAMS is rebuilt with the new function object
+# (same names, weights and order) because the table holds the original function.
+_C251_ACUH_LIN = np.zeros((4, 3), dtype=np.float64)
