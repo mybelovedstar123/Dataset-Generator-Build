@@ -29321,3 +29321,49 @@ def _c251_yqh_station_nb(s, cap):
                 lo2 = a[t]
         med = (0.0 + ((0.0 + lo2) + a[h])) / 2.0
     return med <= 1.0
+
+
+_c251_yqh_station_parent = _yqh_station
+
+
+def _c251_yqh_station(s, cap):
+    if (type(s) is np.ndarray and s.dtype == np.float64 and s.ndim == 1 and type(cap) is float):
+        return bool(_c251_yqh_station_nb(s, cap))
+    return _c251_yqh_station_parent(s, cap)
+
+
+_yqh_station = _c251_yqh_station
+
+
+# ═══════════════ c251-P7: exact _c124b2_extend (C91 univariate hold extension, open regime ~0.54 calls/record). ═══════════════
+# uid76 builds the candidate runs with a Python list comprehension over EVERY change point, a full-length cumsum for
+# ceq and np.full pieces + concatenate for the output. P7 does the three integer/copy jobs in numba:
+#  * runs: maximal constant stretches [s, e) (a new run starts at t when v[t] != v[t-1], NaN != NaN as in numpy),
+#    kept when s > 0 and e - s >= _C91_MIN_RUN, in the same order, as Python ints;
+#  * ceq[t] = #{1 <= t' <= t : v[t'] == v[t'-1]} (= concatenate([0], cumsum(v[1:] == v[:-1])), same int64 values);
+#  * output: the same concatenation (v[prev:e], d copies of v[e-1], ..., v[prev:]) written into one (L + ins) array
+#    whose [ins:] view is returned, exactly like np.concatenate(pieces)[ins:] (copies only; bits preserved).
+# Everything that touches r (r.permutation(len(cand)), then per candidate r.random() and, when it passes,
+# r.geometric(1 / _C91_MEAN_D)) and every test in the selection loop is uid76's code verbatim.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_c91_runs(v, min_run, cs, ce, ceq):
+    L = v.shape[0]
+    ceq[0] = 0
+    c = 0
+    start = 0
+    nc = 0
+    for t in range(1, L):
+        if v[t] == v[t - 1]:
+            c += 1
+        else:
+            if start > 0 and t - start >= min_run:
+                cs[nc] = start
+                ce[nc] = t
+                nc += 1
+            start = t
+        ceq[t] = c
+    if start > 0 and L - start >= min_run:
+        cs[nc] = start
+        ce[nc] = L
+        nc += 1
+    return nc
