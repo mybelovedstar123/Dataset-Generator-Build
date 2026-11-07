@@ -25088,3 +25088,299 @@ def _ym_base(r, times, slot, w, band, unit, p0, cap):
         stp[m] = s
         m += 1
     return idx[:m], stp[:m]
+
+def _ym_station(r, n, madrid, typ):
+    Pd = r.uniform(94.0, 95.0)
+    nd = int((n + 2) / Pd) + 3
+    m = int(nd * Pd)
+    off = r.uniform(0.0, Pd)
+    dow = (np.arange(nd) + int(r.integers(0, 7))) % 7
+    dayf = np.where(dow == 5, r.uniform(0.6, 1.0), np.where(dow == 6, r.uniform(0.3, 0.75), 1.0))
+    level = r.normal(1.80, 0.10) if madrid else r.normal(1.92, 0.10)
+    p0 = float(np.round(min(max(level, 1.40), 2.30) / 0.001))
+    u = r.random()
+    if u < 0.72:
+        p0 += 9.0 - p0 % 10.0
+    elif u < 0.80:
+        p0 += 5.0 - p0 % 10.0
+    unit = _ym_pick(r, _YM_UNIT_CUM_M if madrid else _YM_UNIT_CUM_P)
+    ph = r.uniform(0.0, Pd)
+    phases = (ph, (ph + Pd * r.uniform(0.45, 0.55)) % Pd) if r.random() < 0.25 else (ph,)
+    K, cap, jr, jlo, jhi, bern = 1, _YM_MAX_STEP, 0.0, 1.0, 1.0, False
+    sched = typ == 0 or (typ == 1 and not madrid and r.random() < 0.6)
+    if sched:
+        sig, dsd = (_ym_lu(r, 8.0, 18.0), r.uniform(2.0, 8.0)) if madrid else (_ym_lu(r, 4.0, 11.0), r.uniform(3.0, 9.0))
+        rate, band, jit, phases, bern = r.uniform(0.85, 1.0), r.uniform(2.5, 5.0), r.uniform(0.0, 0.6), (ph,), True
+    else:
+
+        if madrid and typ in (1, 3):
+            S, T, K, rate, jit = _ym_lu(r, 6.0, 20.0), _ym_lu(r, 0.3, 0.8), 4, _ym_lu(r, 1.5, 5.0), None
+            jr, jlo, jhi, cap = r.uniform(0.0, 0.3), 20.0, 120.0, _ym_lu(r, 20.0, 70.0)
+        elif madrid:
+            S, T, K, rate = _ym_lu(r, 20.0, 60.0), _ym_lu(r, 0.5, 2.0), 4, _ym_lu(r, 2.0, 6.0)
+            jit = None if r.random() < 0.85 else r.uniform(10.0, 30.0)
+            jr, jlo, jhi, cap = _ym_lu(r, 0.1, 0.6), 30.0, 150.0, _ym_lu(r, 40.0, 120.0)
+        elif typ == 1:
+            S, T, rate, jit = _ym_lu(r, 8.0, 30.0), _ym_lu(r, 1.0, 4.0), _ym_lu(r, 1.0, 3.0), _ym_lu(r, 1.5, 25.0)
+        else:
+            S, T, rate, jit = _ym_lu(r, 8.0, 40.0), _ym_lu(r, 1.0, 6.0), _ym_lu(r, 1.0, 3.0), _ym_lu(r, 1.5, 25.0)
+        sig = min(0.75 * S / np.sqrt(T), 30.0 if madrid else 16.0)
+        dsd = min((r.uniform(0.0, 0.3) if madrid else r.uniform(0.4, 1.2)) * S / T, 10.0 if madrid else 7.0)
+        band = r.uniform(0.6, 0.9) * S
+    w = _ym_target(r, nd, K, sig, dsd, jr, jlo, jhi, 0.15 if madrid else 0.1)
+    times = _ym_times(r, nd, Pd, phases, jit, rate, dayf, bern) - off
+    times = times[(times >= 1.0) & (times < m)]
+    idx, stp = _ym_base(r, times + off, Pd / K, w, band, unit, p0, cap)
+    idx = idx - int(off)
+    inc = np.zeros(m + 64)
+    ok = (idx >= 1) & (idx < m)
+    np.add.at(inc, idx[ok], stp[ok])
+    if typ == 1 and not madrid:
+        amp = (10.0, 10.0, 10.0, 10.0, 10.0, 20.0, 20.0, 5.0)[int(r.integers(0, 8))] * (1.0 if r.random() < 0.5 else -1.0)
+        D0 = 12.0 if r.random() < 0.35 else _ym_lu(r, 8.0, 45.0)
+        px = r.uniform(0.6, 1.0)
+        p1 = r.uniform(0.0, Pd)
+        slots = [(p1, px)]
+        if r.random() < 0.45:
+            slots.append(((p1 + r.uniform(0.3, 0.7) * Pd) % Pd, px * r.uniform(0.3, 1.0)))
+        xj = r.uniform(2.0, 20.0)
+        for pk_ph, pk in slots:
+            st = _ym_times(r, nd, Pd, (pk_ph,), xj, pk, dayf, True) - off
+            st = st[(st >= 1.0) & (st < m)].astype(np.int64)
+            if st.size == 0:
+                continue
+            dur = np.maximum(np.round(D0 + r.normal(0.0, 1.0, st.size)), 2.0).astype(np.int64)
+            sg = np.where(r.random(st.size) < 0.1, -amp, amp)
+            np.add.at(inc, st, sg)
+            np.add.at(inc, np.minimum(st + dur, m + 63), -sg)
+    elif typ == 3:
+        amp = (5.0, 10.0, 10.0, 10.0, 10.0, 20.0)[int(r.integers(0, 6))] * (1.0 if r.random() < 0.5 else -1.0)
+        cyc = _ym_lu(r, 30.0, 80.0)
+        h = cyc * r.uniform(0.1, 0.5)
+        k = int(2 * m / cyc) + 8
+        g = np.empty(2 * k)
+        g[0::2] = r.geometric(1.0 / (cyc - h), k)
+        g[1::2] = r.geometric(1.0 / h, k)
+        sw = np.cumsum(g).astype(np.int64)
+        sw = sw[sw < m]
+        np.add.at(inc, sw, np.where(np.arange(sw.size) % 2 == 0, amp, -amp))
+    x = p0 + np.cumsum(inc[:m])
+    return np.maximum(x[m - n:], 400.0)
+
+def _ym_draw(r, L):
+    madrid = r.random() < _YM_MADRID
+    if madrid:
+        typ = _ym_pick(r, _YM_TYPE_CUM_M)
+        n = 828 if r.random() < 0.9 else L
+    else:
+        typ = _ym_pick(r, _YM_TYPE_CUM_P)
+        n = int(r.uniform(560.0, 1300.0)) if r.random() < 0.7 else int(r.uniform(1300.0, max(L, 1301)))
+    n = max(min(n, L), min(_YM_MIN_N, L))
+    y = np.round(_ym_station(r, n, madrid, typ))
+    if float(np.ptp(y)) == 0.0:
+        y[int(r.integers(1, n)):] += 10.0 * (1.0 if r.random() < 0.5 else -1.0)
+    return y, madrid
+
+def _ym_fuel(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    y, _ = _ym_draw(r, L)
+    n = y.size
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    return out * 0.001
+
+_YN_KIND_CUM = np.cumsum([0.62, 0.16, 0.22])
+_YN_MIN_N = 320
+_YN_TWO_PI = 2.0 * np.pi
+
+def _yn_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yn_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yn_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yn_ar1(e, phi)
+
+def _yn_t(r, n, df):
+    return r.standard_t(df, n) * np.sqrt((df - 2.0) / df)
+
+def _yn_ffill(r, x, p):
+    if p <= 0.0:
+        return x
+    keep = r.random(x.size) >= p
+    keep[0] = True
+    idx = np.maximum.accumulate(np.where(keep, np.arange(x.size), 0))
+    return x[idx]
+
+def _yn_tick(r, lvl, lo, hi):
+    d = int(np.round(r.uniform(lo, hi) - np.log10(lvl)))
+    u = r.random()
+    return (1.0 if u < 0.92 else (2.0 if u < 0.96 else 5.0)) * 10.0 ** (-d)
+
+def _yn_token(r, n, small):
+    u = r.random()
+    P, dt = (24, 1.0) if u < 0.8 else ((96, 0.25) if u < 0.9 else (60, 1.0 / 60.0))
+    if small:
+        lvl = 10.0 ** r.uniform(-3.3, -1.9)
+        sig = _yn_lu(r, 0.0055, 0.03) * np.sqrt(dt)
+    else:
+        lvl = 10.0 ** (r.uniform(-6.3, -4.6) if r.random() < 0.75 else r.uniform(-4.6, -3.3))
+        sig = _yn_lu(r, 0.0055, 0.0125) * np.sqrt(dt)
+    t = np.arange(n, dtype=np.float64)
+
+    if small:
+        h = _yn_ou(r, n, _yn_lu(r, 3.0, 20.0), r.uniform(0.35, 0.7))
+    else:
+        h = _yn_ou(r, n, _yn_lu(r, 2.0, 10.0), r.uniform(0.25, 0.5))
+    h += _yn_ou(r, n, _yn_lu(r, 50.0, 500.0), r.uniform(0.03, 0.2))
+    h += r.uniform(0.2, 0.6) * np.cos(_YN_TWO_PI * (t + r.uniform(0.0, P)) / P)
+    k = int(min(r.poisson(n * _yn_lu(r, 0.0003, 0.002)), 40))
+    if k > 0:
+        imp = np.zeros(n)
+        np.add.at(imp, r.integers(0, n, k), r.uniform(0.4, 1.2, k))
+        h += _yn_ar1(imp, float(np.exp(-1.0 / _yn_lu(r, 2.0, 24.0))))
+    if r.random() < 0.2:
+        h[int(r.integers(n // 8, n)):] += r.uniform(-0.5, 0.5)
+    vol = sig * np.exp(h - np.log(_v2_mean(np.exp(h))))
+    e = vol * _yn_t(r, n, r.uniform(3.0, 8.0) if small else r.uniform(5.0, 15.0))
+    k = int(min(r.poisson(n * (_yn_lu(r, 0.0003, 0.006) if small else _yn_lu(r, 0.0001, 0.0015))), 40))
+    if k > 0:
+        np.add.at(e, r.integers(0, n, k), np.where(r.random(k) < 0.5, -1.0, 1.0) * sig * r.uniform(4.0, 9.0, k))
+    if r.random() < (0.15 if small else 0.7):
+        y = _yn_ar1(e, float(np.exp(-1.0 / (n * _yn_lu(r, 0.12, 2.0)))))
+    else:
+        y = np.cumsum(e)
+    y += np.linspace(0.0, r.normal(0.0, 0.5 if small else 0.3) * sig * np.sqrt(n), n)
+    if r.random() < (0.4 if small else 0.3):
+        for _ in range(int(r.integers(1, 3))):
+            t0 = int(r.integers(0, n))
+            a = (1.0 if r.random() < 0.5 else -1.0) * _yn_lu(r, 0.03, 0.4 if small else 0.2)
+            seg = t[t0:] - t0
+            y[t0:] += a * -np.expm1(-seg / _yn_lu(r, 0.7, 6.0)) * np.exp(-seg / _yn_lu(r, 6.0, 200.0))
+            vol[t0:] *= 1.0 + 1.5 * np.exp(-seg / 12.0)
+    kap = 0.0 if r.random() < 0.3 else r.uniform(0.05, 0.45)
+    lp = y + kap * vol * r.standard_normal(n)
+    x = lvl * np.exp(lp - np.median(lp))
+    p_st = (_yn_lu(r, 0.005, 0.45) if r.random() < 0.5 else 0.0) if small else (_yn_lu(r, 0.003, 0.06) if r.random() < 0.4 else 0.0)
+    x = _yn_ffill(r, x, p_st)
+    tick = _yn_tick(r, lvl, 2.8, 3.6) if small else _yn_tick(r, lvl, 3.0, 3.7)
+    return np.maximum(np.round(x / tick), 1.0) * tick
+
+def _yn_fx(r, n):
+    lvl = 10.0 ** r.uniform(-4.3, -1.7)
+    sig = _yn_lu(r, 0.0027, 0.006)
+    h = _yn_ou(r, n, _yn_lu(r, 2.0, 15.0), r.uniform(0.2, 0.45)) + _yn_ou(r, n, _yn_lu(r, 50.0, 400.0), r.uniform(0.03, 0.15))
+    vol = sig * np.exp(h - np.log(_v2_mean(np.exp(h))))
+    e = vol * _yn_t(r, n, r.uniform(6.0, 20.0))
+    k = int(min(r.poisson(n * _yn_lu(r, 0.00005, 0.001)), 10))
+    if k > 0:
+        np.add.at(e, r.integers(0, n, k), np.where(r.random(k) < 0.5, -1.0, 1.0) * sig * r.uniform(3.0, 7.0, k))
+    w = r.uniform(0.4, 0.95)
+    y = np.sqrt(w) * np.cumsum(e) + np.sqrt(1.0 - w) * _yn_ar1(e, float(np.exp(-1.0 / _yn_lu(r, 60.0, 800.0))))
+    y += np.linspace(0.0, r.normal(0.0, 0.3) * sig * np.sqrt(n), n)
+    x = lvl * np.exp(y - np.median(y))
+    x = _yn_ffill(r, x, r.uniform(0.0, 0.03))
+    tick = _yn_tick(r, lvl, 1.8, 2.2) if r.random() < 0.33 else _yn_tick(r, lvl, 2.9, 3.9)
+    return np.maximum(np.round(x / tick), 1.0) * tick
+
+def _yn_micro(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    kind = min(int(np.searchsorted(_YN_KIND_CUM, r.random() * _YN_KIND_CUM[-1], side="right")), 2)
+    lo = min(_YN_MIN_N, L)
+    if kind < 2:
+        u = r.random()
+        n = int(_yn_lu(r, lo, max(lo, min(700.0, L)))) if u < 0.12 else (
+            int(_yn_lu(r, min(700.0, L), min(1500.0, L))) if u < 0.9 else int(r.uniform(min(1500.0, L), L + 1)))
+        y = _yn_token(r, max(n, 2), kind == 1)
+    else:
+        n = int(r.uniform(min(500.0, L), min(900.0, L))) if r.random() < 0.25 else int(r.uniform(min(2300.0, L), min(2800.0, L)))
+        y = _yn_fx(r, max(n, 2))
+    n = min(max(n, 2), L, y.size)
+    y = y[y.size - n:]
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if float(np.ptp(out)) == 0.0:
+        tk = float(np.min(np.abs(out))) * 1e-3
+        out[L - 1] += tk if tk > 0 else 1e-9
+    return out
+
+_YO_TWO_PI = 2.0 * np.pi
+_YO_KIND_CUM = np.cumsum([0.40, 0.20, 0.40])
+_YO_CAD_CUM = np.cumsum([0.85, 0.10, 0.05])
+_YO_CAD_HP = (24, 12, 6)
+_YO_MIN_N = 320
+_YO_SAT = 999.9
+
+def _yo_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yo_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yo_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yo_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yo_ar1(e, phi)
+
+def _yo_smooth(r, n, tau, sd):
+    phi = float(np.exp(-2.0 / max(tau, 0.4)))
+    nb = int(3.0 * tau) + 8
+    y = _yo_ar1(_yo_ar1(r.standard_normal(n + nb), phi), phi)[nb:]
+    s = float(_v2_std(y))
+    return y * (sd / s) if s > 0 else y
+
+def _yo_window(a, b, soft):
+    hh = np.arange(24, dtype=np.float64) + 0.5
+    w = (((hh - a) % 24.0) < ((b - a) % 24.0)).astype(np.float64)
+    k = max(int(round(soft)), 1)
+    for _ in range(k):
+        w = 0.5 * w + 0.25 * (np.roll(w, 1) + np.roll(w, -1))
+    return w
+
+def _yo_bump(lo, rise):
+    x = (np.arange(24, dtype=np.float64) + 0.5 - lo) % 24.0
+    return np.where(x < rise, -np.cos(np.pi * x / rise), np.cos(np.pi * (x - rise) / (24.0 - rise)))
+
+def _yo_quant(r, x, q, p_odd):
+    y = np.round(x / q) * q
+    if p_odd > 0.0:
+        m = r.random(x.size) < p_odd
+        d = 2.0 if r.random() < 0.5 else 3.0
+        y[m] = np.round(np.round(x[m] * d / q) * q / d, 2)
+    return y
