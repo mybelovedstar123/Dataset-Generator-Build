@@ -1,4 +1,3 @@
-# cascade era 2594 entry
 from __future__ import annotations
 
 from collections.abc import Iterator
