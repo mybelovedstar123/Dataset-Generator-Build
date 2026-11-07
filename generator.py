@@ -31436,3 +31436,36 @@ class Generator(_C259NameParent):
 # -44..-21 (king 6-10 %, real 10-18 energy_charts 0 %); with it: 0 %, row-min p10 -0.07 * level (real -0.02..-0.04). Same draws,
 # same trended rows, trough / peak / level profile of the last 14 days unchanged.
 _C261_YB_PRICE_KING = _yb_price
+
+
+def _c261_yb_price(r, n, a, sod, day, dow0):
+    x = np.asarray(_C261_YB_PRICE_KING(r, n, a, sod, day, dow0), dtype=np.float64)
+    u = r.random(3)
+    if u[0] >= 0.90 or x.size < 192:
+        return x
+    d = (np.asarray(day, dtype=np.int64) - int(day[0]))
+    nd = int(d[-1]) + 1
+    cnt = np.bincount(d, minlength=nd).astype(np.float64)
+    dm = np.bincount(d, weights=x, minlength=nd) / np.maximum(cnt, 1.0)
+    back = (nd - 1 - np.arange(nd, dtype=np.float64))
+    g = np.minimum((0.50 + 0.25 * u[1]) * np.exp((0.010 + 0.012 * u[2]) * back), 1.25)
+    lref = float(np.median(np.abs(dm))) + 1e-9
+    v = r.random(2)
+    delta = (0.05 + 0.30 * float(v[0])) if float(v[1]) < 0.80 else 0.0
+    lvl = dm - delta * lref * back / 35.0
+    y = lvl[d] + g[d] * (x - dm[d])
+    neg = y < 0.0
+    if bool(np.any(neg)):
+        f = 0.02 * lref
+        y[neg] = -f * np.log1p(-y[neg] / f)
+    if not bool(np.all(np.isfinite(y))) or float(np.ptp(y)) <= 0.0:
+        return x
+    return np.round(y, 2)
+
+
+_YB_BUILD = (_yb_co2, _yb_solar, _yb_wind, _c261_yb_price, _yb_load)
+
+
+# ═══════════════ c234-SALT: corpus re-draw. The stream seed is mixed with a constant salt before any layer
+# sees it, so the whole corpus is re-drawn from the SAME distribution (sibling of c268-k76-BIG1-P40U). ═══════════════
+_C234S_SALT = 0x5a1c0322
