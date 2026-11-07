@@ -30217,3 +30217,24 @@ class Generator(_MG2_BASE):
 # variate blocks. ~88 % of scored eval windows are univariate (C = 1: the model sees only that channel), so this arm makes
 # every channel a singleton: the values are byte-identical to K0-32G, only the labels change (np.arange(32) is canonical).
 _SG_BASE = Generator
+
+
+class Generator(_SG_BASE):
+    def generate(self, n_series):
+        inner = super().generate(n_series)
+        try:
+            for y in inner:
+                out = dict(y)
+                out["groups"] = np.arange(out["values"].shape[0], dtype=np.uint8)
+                yield out
+        finally:
+            inner.close()
+
+
+
+# ═══════════════ MVKEEP (append-only, last; label-only): a fraction of multichannel records keep their K0 group ═════════════════
+# SING never trains the variate blocks' query/key (a singleton softmax has no gradient: the live SING final holds init Q/K in blocks
+# 4 and 9), so on multichannel eval windows (no groups at inference) each channel's variate output is a near-uniform channel average.
+# Here every packed record of width >= 2 keeps its K0 record label with probability _MVK_P (else SING's singletons), so the variate
+# attention is trained on a small share of rows while the rest stay univariate. Values are byte-identical to SING; only labels change.
+_MVK_P = 0.1
