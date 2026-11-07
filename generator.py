@@ -25962,3 +25962,301 @@ def _yr_lu(r, lo, hi):
 
 def _yr_pick(r, cum):
     return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yr_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yr_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yr_ar1(e, phi)
+
+def _yr_level(r, m, unit, tau_lo, tau_hi, sd_lo, sd_hi, drift_sd, p_step, step_lo, step_hi):
+    nd = int(m / unit) + 2
+    d = _yr_ou(r, nd, _yr_lu(r, tau_lo, tau_hi), _yr_lu(r, sd_lo, sd_hi))
+    x = np.interp(np.arange(m, dtype=np.float64) / unit, np.arange(nd, dtype=np.float64), d)
+    x += np.linspace(0.0, r.normal(0.0, drift_sd), m)
+    if r.random() < p_step:
+        x[int(r.uniform(0.15, 0.95) * m):] += (1.0 if r.random() < 0.5 else -1.0) * r.uniform(step_lo, step_hi)
+    return x
+
+def _yr_gamma(r, m, cv):
+    if cv < 0.02:
+        return np.ones(m)
+    k = 1.0 / (cv * cv)
+    return r.gamma(k, 1.0 / k, m)
+
+def _yr_bursts(r, m, rate, lo, hi):
+    out = np.zeros(m)
+    k = int(min(r.poisson(rate * m), 200))
+    if k > 0:
+        out[r.integers(0, m, k)] = np.log(r.uniform(lo, hi, k))
+    return out
+
+def _yr_count(r, lam, keep_zero):
+    lam = np.minimum(np.maximum(lam, 1e-9), 1e6)
+    if keep_zero:
+        return r.poisson(lam).astype(np.float64)
+    p1 = -np.expm1(-lam)
+    listed = r.random(lam.size) < p1
+    la, pa = lam[listed], p1[listed]
+    t1 = -np.log1p(-r.random(la.size) * pa) / la
+    return 1.0 + r.poisson(la * np.maximum(1.0 - t1, 0.0)).astype(np.float64)
+
+def _yr_round(r, v, p_nice, p_units):
+    a = np.maximum(np.abs(v), 1e-9)
+    nice = r.random(v.size) < p_nice
+    q = np.where(nice, 10.0 ** (np.floor(np.log10(a)) - r.integers(1, 3, v.size)), 1.0 if r.random() < p_units else 0.01)
+    q = np.maximum(q, 0.01)
+    return np.round(v / q) * q
+
+def _yr_cnt_daily(r, n):
+    z = float(r.standard_normal())
+    base = float(np.exp(min(max(np.log(8.0) + (1.5 if z < 0.0 else 2.2) * z, np.log(0.5)), np.log(1500.0))))
+    keep_zero = r.random() < 0.06
+    p_est = max(1.0 - float(np.exp(-0.6 * base)), 0.05)
+    m = int(min(n / p_est * 1.25 + 16, 12000))
+    x = _yr_level(r, m, 1.0, 10.0, 250.0, 0.03, 0.2, 0.1, 0.12, 0.25, 1.0)
+    if r.random() < 0.35:
+        wk = r.normal(0.0, 0.05, 7)
+        wk[5] += np.log(r.uniform(0.01, 0.15))
+        wk[6] = wk[5] + np.log(r.uniform(0.3, 1.2))
+        x += wk[(np.arange(m) + int(r.integers(0, 7))) % 7]
+        hd = r.integers(0, m, int(r.poisson(m / 365.0 * r.uniform(6.0, 11.0))))
+        x[hd] += np.log(r.uniform(0.005, 0.05, hd.size))
+    elif r.random() < 0.3:
+        P = 5 if r.random() < 0.5 else 7
+        x += r.normal(0.0, _yr_lu(r, 0.02, 0.12), P)[(np.arange(m) + int(r.integers(0, P))) % P]
+    if r.random() < 0.6:
+        thin = r.random(m) < _yr_lu(r, 0.02, 0.2)
+        x[thin] += np.log(r.uniform(0.05, 0.6, int(thin.sum())))
+    if r.random() < 0.15:
+        x += _yr_bursts(r, m, _yr_lu(r, 0.002, 0.02), 2.0, 15.0)
+    cv = _yr_lu(r, 0.2, 0.9) * (1.0 if base < 30.0 else 0.6)
+    lam = base * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 8.0)) * _yr_gamma(r, m, cv)
+    c = r.poisson(np.minimum(lam, 50000.0)).astype(np.int64)
+    if r.random() < 0.5:
+        cr = r.binomial(c, r.uniform(0.03, 0.2))
+        c = c - cr
+        c[1:] += cr[:-1]
+    c = c.astype(np.float64)
+    return c if keep_zero else c[c > 0]
+
+def _yr_val(r, m, unit, single, lvl, s, p_units):
+    df = r.uniform(2.5, 8.0)
+    mu = np.log(lvl) + _yr_level(r, m, unit, 15.0, 400.0, 0.04 * s, 0.35 * s, 0.25 * s, 0.12, 0.3 * s + 0.1, 1.2 * s + 0.3)
+    if single:
+        k = np.ones(m, dtype=np.int64)
+        agg = 0
+    else:
+        k = 1 + r.poisson(_yr_lu(r, 0.2, 8.0), m)
+        agg = 0 if r.random() < 0.8 else 1
+    tot = int(k.sum())
+    t = r.standard_t(df, tot) * np.sqrt((df - 2.0) / df)
+    day = np.repeat(np.arange(m), k)
+    lv = mu[day] + np.clip(s * t, -9.0, 8.0)
+    if r.random() < 0.6:
+        low = r.random(tot) < _yr_lu(r, 0.01, 0.25)
+        lv[low] -= r.uniform(1.0, 8.0, int(low.sum()))
+    if r.random() < 0.3:
+        lv += _yr_bursts(r, tot, _yr_lu(r, 0.002, 0.03), 5.0, 200.0)
+    p_nice = r.uniform(0.3, 0.95) if r.random() < 0.8 * p_units else 0.0
+    v = _yr_round(r, np.exp(np.minimum(lv, np.log(5.0e9))), p_nice, p_units)
+    if single:
+        out = v
+    elif agg == 0:
+        out = np.bincount(day, weights=v, minlength=m) / k
+    else:
+        o = np.argsort(day * 4.0 + (v / (v.max() + 1.0)), kind="stable")
+        st = np.r_[0, np.cumsum(k)[:-1]]
+        out = 0.5 * (v[o][st + (k - 1) // 2] + v[o][st + k // 2])
+    if not single and r.random() < 0.6:
+        out = np.round(out, 2 if r.random() < 0.5 else 0)
+    if r.random() < 0.35:
+        out[r.random(m) < _yr_lu(r, 0.005, 0.2)] = 0.0
+    return out
+
+def _yr_val_daily(r, n):
+    single = r.random() < 0.3
+    lvl = float(np.exp(min(max(r.normal(np.log(2.5e5), 1.3), np.log(2.0e3)), np.log(8.0e6))))
+    return _yr_val(r, n, 1.0, single, lvl, _yr_lu(r, 0.5, 2.2) if single else _yr_lu(r, 0.3, 1.2), 0.8)
+
+def _yr_cnt_sub(r, n):
+    P = _YR_SUB_P[_yr_pick(r, _YR_SUB_CUM)]
+    z = float(r.standard_normal())
+    base = float(np.exp(min(max(np.log(0.9) + (0.9 if z < 0.0 else 1.2) * z, np.log(0.12)), np.log(30.0))))
+    keep_zero = r.random() < 0.3
+    p_est = 1.0 if keep_zero else max(1.0 - float(np.exp(-0.85 * base)), 0.05)
+    m = int(min(n / p_est * 1.15 + 2 * min(P, 288), _YR_MAX_CAL))
+    x = _yr_level(r, m, float(P), 1.0, 30.0, 0.01, 0.1, 0.06, 0.05, 0.3, 1.0)
+    if r.random() < 0.6:
+        h = (np.arange(m) % P) * (_YR_TWO_PI / P)
+        x += r.uniform(0.0, 0.8) * np.cos(h - r.uniform(0.0, _YR_TWO_PI))
+    if r.random() < 0.35:
+        x += _yr_bursts(r, m, _yr_lu(r, 0.0005, 0.02), 3.0, 150.0)
+    lam = base * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 8.0)) * _yr_gamma(r, m, _yr_lu(r, 0.05, 0.8))
+    return _yr_count(r, np.minimum(lam, 5000.0), keep_zero)
+
+def _yr_val_sub(r, n):
+    if r.random() < 0.6:
+        unit = float(_YR_SUB_P[_yr_pick(r, _YR_SUB_CUM)])
+        return _yr_val(r, n, unit, True, _yr_lu(r, 3.0, 3.0e4), _yr_lu(r, 0.3, 2.5), 0.3)
+    c0 = _yr_lu(r, 1.0, 1.0e7) * (-1.0 if r.random() < 0.2 else 1.0)
+    kc = int(r.integers(1, 7))
+    sp = _yr_lu(r, 1e-4, 0.15) * abs(c0)
+    cen = c0 + r.normal(0.0, 3.0, kc) * sp
+    w = r.dirichlet(np.ones(kc))
+    g = np.minimum(np.searchsorted(np.cumsum(w), r.random(n)), kc - 1)
+    v = cen[g] + r.normal(0.0, 1.0, n) * sp * r.uniform(0.2, 1.0, kc)[g]
+    q = min(10.0 ** np.floor(np.log10(max(sp, 1e-12)) - r.uniform(1.0, 4.0)), 1.0)
+    return np.round(v / q) * q
+
+def _yr_sales(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    kind = _yr_pick(r, _YR_KIND_CUM)
+    if kind == 0:
+        n = int(min(max(np.exp(r.normal(np.log(640.0), 0.36)), _YR_MIN_N), 1500.0))
+        y = _yr_cnt_daily(r, n)
+    elif kind == 1:
+        n = int(min(max(np.exp(r.normal(np.log(480.0), 0.36)), _YR_MIN_N), 1400.0))
+        y = _yr_val_daily(r, n)
+    elif kind == 2:
+        n = L if r.random() < 0.22 else int(min(max(np.exp(r.normal(np.log(700.0), 0.55)), _YR_MIN_N), L))
+        y = _yr_cnt_sub(r, n)
+    else:
+        n = int(min(max(np.exp(r.normal(np.log(450.0), 0.4)), _YR_MIN_N), 1800.0))
+        y = _yr_val_sub(r, n)
+    n = min(n, L, y.size)
+    y = y[y.size - n:]
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0] if n > 0 else 1.0
+    out[L - n:] = y
+    if not np.all(np.isfinite(out)):
+        out = np.where(np.isfinite(out), out, 0.0)
+    if float(np.ptp(out)) == 0.0:
+        out[L - 1 - int(r.integers(0, max(n, 1)))] += 1.0
+    return out
+
+_YS_TWO_PI = 2.0 * np.pi
+
+_YS_CELLS = (("demand", 5, 0.12), ("demand", 15, 0.035), ("demand", 30, 0.05), ("demand", 60, 0.035),
+             ("gen", 5, 0.10), ("gen", 10, 0.02), ("gen", 15, 0.13), ("gen", 30, 0.13), ("gen", 60, 0.02),
+             ("flow", 5, 0.05), ("flow", 15, 0.06), ("flow", 60, 0.01),
+             ("price", 5, 0.035), ("price", 15, 0.02), ("price", 30, 0.075), ("price", 60, 0.05),
+             ("co2", 5, 0.02), ("co2", 30, 0.03))
+_YS_CELL_CUM = np.cumsum([c[2] for c in _YS_CELLS])
+
+_YS_NQ = np.array([0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.0])
+_YS_NKNOT = {5: (300.0, 1396.0, 3440.0, 3904.0, 4096.0, 4096.0, 4096.0),
+             10: (300.0, 700.0, 758.0, 900.0, 1600.0, 3000.0, 4096.0),
+             15: (300.0, 804.0, 1956.0, 3440.0, 3904.0, 4096.0, 4096.0),
+             30: (300.0, 623.0, 1087.0, 2456.0, 3440.0, 3904.0, 4096.0),
+             60: (300.0, 676.0, 1164.0, 1593.0, 1833.0, 2175.0, 4096.0)}
+
+_YS_GEN = ("thermal", "coal", "nuclear", "ror", "peak", "pumped", "inter", "other", "unit", "solar", "wind", "total")
+_YS_GEN_W = {5: (0.12, 0.04, 0.08, 0.05, 0.02, 0.03, 0.18, 0.10, 0.20, 0.04, 0.14, 0.0),
+             10: (0.20, 0.05, 0.05, 0.0, 0.05, 0.0, 0.0, 0.05, 0.60, 0.0, 0.0, 0.0),
+             15: (0.10, 0.03, 0.03, 0.07, 0.10, 0.22, 0.14, 0.03, 0.12, 0.05, 0.06, 0.05),
+             30: (0.20, 0.05, 0.10, 0.06, 0.05, 0.06, 0.12, 0.06, 0.02, 0.12, 0.12, 0.04),
+             60: (0.30, 0.05, 0.05, 0.10, 0.10, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.10)}
+_YS_PSCALE = {5: (20.0, 60.0), 15: (40.0, 250.0), 30: (10.0, 90.0), 60: (200.0, 1200.0)}
+
+def _ys_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _ys_pick(r, w):
+    c = np.cumsum(w)
+    return min(int(np.searchsorted(c, r.random() * c[-1], side="right")), len(w) - 1)
+
+def _ys_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _ys_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _ys_ar1(e, phi)
+
+def _ys_ou2(r, n, tau1, tau2, sd):
+    b = int(3.0 * max(tau1, tau2)) + 4
+    y = _ys_ar1(_ys_ar1(r.standard_normal(n + b), float(np.exp(-1.0 / max(tau1, 0.2)))), float(np.exp(-1.0 / max(tau2, 0.2))))[b:]
+    s = float(_v2_stdm(y))
+    return y * (sd / s) if s > 0 else y
+
+def _ys_sig(z):
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -40.0, 40.0)))
+
+def _ys_bump(h, c, w):
+    d = (h - c + 12.0) % 24.0 - 12.0
+    return np.exp(-0.5 * (d / w) ** 2)
+
+def _ys_daily(v, day, frac):
+    return np.interp(day + frac, np.arange(v.size, dtype=np.float64), v)
+
+def _ys_daymean(x, day, nd):
+    s = np.bincount(day, weights=x, minlength=nd)
+    c = np.maximum(np.bincount(day, minlength=nd), 1)
+    return (s / c)[day]
+
+def _ys_cal(r, n, P):
+    pos = np.arange(n) + int(r.integers(0, P))
+    day = pos // P
+    nd = int(day[-1]) + 1
+    frac = (pos % P + 0.5) / P
+    dow = (np.arange(nd) + int(r.integers(0, 7))) % 7
+    dt = np.where(dow == 5, 1, np.where(dow == 6, 2, 0))
+    hol = (r.random(nd) < r.uniform(0.005, 0.03)) & (dt == 0)
+    dt[hol] = 2
+    doy = r.uniform(0.0, 365.0) + np.arange(nd + 1, dtype=np.float64)
+    return {"n": n, "P": P, "day": day, "nd": nd, "frac": frac, "hour": 24.0 * frac, "dt": dt, "doy": doy,
+            "slot": np.minimum((frac * P).astype(np.int64), P - 1)}
+
+def _ys_sun(r, cal):
+    lat = np.radians(r.uniform(20.0, 62.0))
+    dec = np.radians(23.44) * np.sin(_YS_TWO_PI * (cal["doy"][cal["day"]] - 81.0) / 365.0)
+    ha = np.radians(15.0) * (cal["hour"] - 12.0 - r.uniform(-1.5, 1.5))
+    se = np.sin(lat) * np.sin(dec) + np.cos(lat) * np.cos(dec) * np.cos(ha)
+    return np.maximum(se, 0.0) ** r.uniform(1.0, 1.5)
+
+def _ys_cloud(r, cal):
+    nd, P = cal["nd"], cal["P"]
+    kd = 0.12 + 0.88 * _ys_sig(r.uniform(-0.3, 2.2) + _ys_ou(r, nd + 1, r.uniform(0.7, 3.0), r.uniform(0.8, 1.8)))
+    k = _ys_daily(kd, cal["day"], cal["frac"])
+    k = k * np.exp(_ys_ou2(r, cal["n"], r.uniform(0.2, 1.0) * P / 24.0, r.uniform(0.3, 2.0) * P / 24.0, r.uniform(0.03, 0.2)))
+    return np.minimum(k, 1.08)
+
+def _ys_wind(r, cal, offshore=False):
+    nd, P = cal["nd"], cal["P"]
+    z = _ys_daily(_ys_ou(r, nd + 1, r.uniform(1.2, 4.0), r.uniform(0.6, 1.1)), cal["day"], cal["frac"])
+    z = z + _ys_ou2(r, cal["n"], r.uniform(1.0, 4.0) * P / 24.0, r.uniform(2.0, 10.0) * P / 24.0, r.uniform(0.3, 0.7))
+    if not offshore:
+        z = z + r.uniform(0.0, 0.35) * np.cos(_YS_TWO_PI * (cal["hour"] - r.uniform(12.0, 17.0)) / 24.0)
+    cf = _ys_sig(r.uniform(1.6, 2.6) * z + r.uniform(-1.4, 0.6))
+    if r.random() < 0.15:
+        cf = np.minimum(cf, r.uniform(0.6, 0.9))
+    return cf
