@@ -30320,3 +30320,71 @@ def _k0_record(x):
 # draws or skips a random number). Record-level hooks act on every c268 record pulled after the switch (records the packer already
 # carried keep the base behaviour). Built by mk_late.py on generator md5 646e77e1ffb2dcce930a3c55213cef37 (base package md5 646e77e1ffb2dcce930a3c55213cef37).
 _LCP_K0 = 10837
+_LCP_TEST = False
+_LCP_SPEC = 'pknback:1536+set:_YM_MIN_N=2560+set:_C128_HYDRO_CUM=(0.12,0.44,0.74,0.79,0.84,0.88,0.92,0.95,1.0)+set:_XA_N_CUM=(0.0,0.0,1.0)+set:_XA_N_FWD=(1700,4064)+set:_XA_P_SHIFT=0.1+set:_MVK_TAG=0x4D564B51'
+_LCP_SRC_MD5 = '646e77e1ffb2dcce930a3c55213cef37'
+_LCP_BASE_MD5 = '646e77e1ffb2dcce930a3c55213cef37'
+_LCP_PARENT = Generator
+
+_LCP_SWITCH = {  # module global: (base value for k < _LCP_K0, late value for k >= _LCP_K0)
+    '_PKN_BACK': (_PKN_BACK, 1536),
+    '_YM_MIN_N': (_YM_MIN_N, 2560),
+    '_C128_HYDRO_CUM': (_C128_HYDRO_CUM, (0.12, 0.44, 0.74, 0.79, 0.84, 0.88, 0.92, 0.95, 1.0)),
+    '_XA_N_CUM': (_XA_N_CUM, (0.0, 0.0, 1.0)),
+    '_XA_N_FWD': (_XA_N_FWD, (1700, 4064)),
+    '_XA_P_SHIFT': (_XA_P_SHIFT, 0.1),
+    '_MVK_TAG': (_MVK_TAG, 1297501009),
+}
+
+
+def _lcp_switch(late):
+    g = globals()
+    for name, (base, after) in _LCP_SWITCH.items():
+        g[name] = after if late else base
+
+
+def _lcp_check(y, k):
+    if isinstance(y, dict):
+        extra = set(y) - {"values", "groups"}
+        if extra:
+            raise RuntimeError(f"LCP assert-before-yield failed (fields {sorted(extra)}) at yield {k}")
+        v, g = y.get("values"), y.get("groups")
+    else:
+        v, g = y, None
+    if not (isinstance(v, np.ndarray) and v.dtype == np.float64 and v.shape == (_K32G_C, _K0_L) and v.flags.c_contiguous
+            and bool(np.isfinite(v).all()) and float(np.abs(v).max()) <= _K0_F32_MAX):
+        raise RuntimeError(f"LCP assert-before-yield failed (values) at yield {k}: "
+                           f"{getattr(v, 'dtype', None)} {getattr(v, 'shape', None)}")
+    if g is not None:
+        if not (isinstance(g, np.ndarray) and g.dtype == np.uint8 and g.shape == (v.shape[0],)):
+            raise RuntimeError(f"LCP assert-before-yield failed (groups dtype/shape) at yield {k}")
+        nxt = 0
+        for lab in g.tolist():
+            if lab == nxt:
+                nxt += 1
+            elif lab > nxt:
+                raise RuntimeError(f"LCP assert-before-yield failed (groups not canonical) at yield {k}: {g.tolist()}")
+
+
+class Generator(_LCP_PARENT):
+    def generate(self, n_series):
+        _lcp_switch(False)
+        inner = super().generate(n_series)
+        k = 0
+        try:
+            while True:
+                if k == _LCP_K0:
+                    _lcp_switch(True)
+                try:
+                    y = next(inner)
+                except StopIteration:
+                    return
+                _lcp_check(y, k)
+                yield y
+                k += 1
+        finally:
+            inner.close()
+            _lcp_switch(False)
+
+
+_lcp_switch(False)
