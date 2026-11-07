@@ -30597,3 +30597,264 @@ def _c259_aqw(r, L):
 # Record i's draws come only from SeedSequence([seed, _C201O_TAG], spawn_key=(i,)), so every parent RNG advances exactly as
 # without this block. The stream stops at n_series records in total (inserts count), like the c246 insert layer.
 _C201O_TAG = 0xC2010E5A
+_C201O_Q = 0.012
+_C201O_L = 4096
+_C201O_TWO_PI = 2.0 * np.pi
+_C201O_LVL_EDGES = (0.7, 1.6, 2.5, 4.0, 6.3, 10.0, 32.0, 150.0, 700.0)
+_C201O_LVL_CUM = np.cumsum((0.10, 0.10, 0.16, 0.35, 0.11, 0.12, 0.05, 0.01))
+
+
+def _c201o_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+
+def _c201o_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(float(tau), 1.0)))
+    e = r.standard_normal(n) * (sd * np.sqrt(1.0 - phi * phi))
+    e[0] = r.standard_normal() * sd
+    return lfilter([1.0], [1.0, -phi], e)
+
+
+def _c201o_smooth(r, n, tau1, tau2, sd):
+    """stationary OU (time constant tau1) passed through a second AR(1) (tau2): smooth at lags << tau2, scaled to sd"""
+    p1 = float(np.exp(-1.0 / max(float(tau1), 1.0)))
+    p2 = float(np.exp(-1.0 / max(float(tau2), 1.0)))
+    nb = int(min(5.0 * max(float(tau1), float(tau2)), 2000.0)) + 8
+    e = r.standard_normal(n + nb)
+    y = lfilter([1.0], [1.0, -p2], lfilter([1.0], [1.0, -p1], e) * np.sqrt(1.0 - p1 * p1))[nb:]
+    v = (1.0 + p1 * p2) / ((1.0 - p1 * p2) * (1.0 - p2 * p2))
+    return y * (sd / float(np.sqrt(v)))
+
+
+def _c201o_logpath(r, n, P, end_peak):
+    """log concentration: slow + medium smooth components, modulated daily cycle, episodes, sharp steps, rare fog bumps"""
+    sph = P / 24.0
+    t = np.arange(n, dtype=np.float64)
+    z = _c201o_smooth(r, n, _c201o_lu(r, 5.0, 40.0) * sph, _c201o_lu(r, 0.8, 3.0) * sph, r.uniform(0.28, 0.82))
+    z += _c201o_smooth(r, n, _c201o_lu(r, 0.7, 4.0) * sph, _c201o_lu(r, 6.0, 30.0), r.uniform(0.03, 0.15))
+    if r.random() < 0.85:
+        a1 = r.uniform(0.05, 0.72)
+        a2 = a1 * r.uniform(0.1, 0.9)
+        hrs = (t - (n - 1)) / sph
+        prof = (a1 * np.cos(_C201O_TWO_PI * (hrs - end_peak) / 24.0)
+                + a2 * np.cos(2.0 * _C201O_TWO_PI * (hrs - end_peak - r.uniform(1.4, 5.4)) / 24.0))
+        nd = int(n // P) + 3
+        dayf = np.clip(1.0 + r.uniform(0.15, 0.55) * r.standard_normal(nd), 0.1, 2.2)
+        z += prof * np.interp(t, (np.arange(nd, dtype=np.float64) - 0.5) * P + r.uniform(0.0, P), dayf)
+    ne = int(r.poisson(n / P * _c201o_lu(r, 0.5, 3.0)))
+    for _ in range(ne):
+        c = r.uniform(0.0, n)
+        up = _c201o_lu(r, 0.5, 8.0) * sph
+        dn = _c201o_lu(r, 0.5, 24.0) * P / 576.0
+        amp = _c201o_lu(r, 0.2, 1.0) * (1.0 if r.random() < 0.85 else -0.6)
+        dt = t - c
+        z += amp * np.where(dt < 0.0, np.exp(np.clip(dt, -60.0 * up, 0.0) / up), np.exp(-np.clip(dt, 0.0, 60.0 * dn) / dn))
+    nj = int(r.poisson(n / P * _c201o_lu(r, 0.05, 0.6)))
+    for _ in range(nj):
+        c = r.uniform(0.0, n)
+        w = _c201o_lu(r, 0.3, 8.0) if r.random() < 0.6 else _c201o_lu(r, 0.1, 2.0) * sph
+        z += r.normal(0.0, 0.5) / (1.0 + np.exp(np.clip((c - t) / w, -40.0, 40.0)))
+    if r.random() < 0.03:
+        c = r.uniform(0.1, 1.0) * n
+        w = _c201o_lu(r, 2.0, 16.0) * sph
+        z += _c201o_lu(r, 1.2, 3.5) * np.exp(-0.5 * ((t - c) / w) ** 2)
+    return z
+
+
+def _c201o_level(r):
+    k = min(int(np.searchsorted(_C201O_LVL_CUM, r.random(), side="right")), len(_C201O_LVL_EDGES) - 2)
+    return _c201o_lu(r, _C201O_LVL_EDGES[k], _C201O_LVL_EDGES[k + 1])
+
+
+def _c201o_measure(r, x):
+    """sensor readout of the concentration x: level-dependent noise, bursts, decaying emission spikes, dips, error codes"""
+    n = x.size
+    c = _c201o_lu(r, 0.13, 0.25)
+    ex = r.uniform(0.42, 0.68)
+    sd = c * np.maximum(x, 0.05) ** ex
+    eps = r.standard_normal(n)
+    if r.random() < 0.35:
+        df = r.uniform(4.0, 9.0)
+        eps = r.standard_t(df, n) * np.sqrt((df - 2.0) / df)
+    ph = r.uniform(0.05, 0.40)
+    eps = lfilter([1.0], [1.0, -ph], eps) * np.sqrt(1.0 - ph * ph)
+    y = x + sd * eps
+    nb = int(r.poisson(n * _c201o_lu(r, 0.006, 0.05)))
+    if nb > 0:
+        at = r.integers(0, n, nb)
+        amp = x[at] * np.exp(r.uniform(np.log(0.1), np.log(1.0), nb))
+        y[at] += amp
+        y[np.minimum(at + 1, n - 1)] += amp * (r.random(nb) < 0.35) * r.uniform(0.2, 0.7, nb)
+    ns = int(r.poisson(n * _c201o_lu(r, 3e-4, 4e-3)))
+    if ns > 0:
+        at = r.integers(0, n, ns)
+        amp = x[at] * np.exp(r.uniform(np.log(0.4), np.log(15.0), ns))
+        tk = np.exp(r.uniform(np.log(0.3), np.log(3.0), ns))
+        for k in range(8):
+            idx = at + k
+            ok = idx < n
+            y[idx[ok]] += amp[ok] * np.exp(-k / tk[ok])
+    nd = int(r.poisson(n * _c201o_lu(r, 1e-4, 1.5e-3)))
+    if nd > 0:
+        at = r.integers(0, n, nd)
+        y[at] = x[at] * r.uniform(0.05, 0.6, nd)
+    if r.random() < 0.03:
+        y[r.integers(0, n, int(r.poisson(n * _c201o_lu(r, 1e-4, 1.5e-3))) + 1)] = 999.9
+    return y
+
+
+def _c201o_quantize(r, y, low):
+    """150-s bin mean of k readings on a 0.1 grid (k per bin), 2 decimals, sensor floor"""
+    n = y.size
+    u = r.random() * (0.55 if low else 1.0) + (0.45 if low else 0.0)
+    if u < 0.66:
+        k = np.where(r.random(n) < r.uniform(0.55, 0.9), 3.0, 1.0)
+    elif u < 0.90:
+        w = np.cumsum(r.dirichlet(np.full(4, 2.0)))
+        k = np.array([1.0, 2.0, 3.0, 4.0])[np.minimum(np.searchsorted(w, r.random(n), side="right"), 3)]
+    else:
+        k = np.ones(n)
+    v = np.round(np.maximum(y, 0.0) * 10.0 * k) / (10.0 * k)
+    fl = (0.0, 0.1, 0.2)[min(int(np.searchsorted(np.cumsum((0.15, 0.55, 0.30)), r.random(), side="right")), 2)]
+    return np.round(np.maximum(v, fl), 2)
+
+
+def _c201o_pair(r, n, P, end_peak):
+    """two co-located sensors landing in one 150-s stream: alternating bins, slips, shared (averaged) bins"""
+    lvl = _c201o_level(r)
+    zc = _c201o_logpath(r, n, P, end_peak)
+    za = zc + _c201o_ou(r, n, _c201o_lu(r, 2.0, 20.0) * P / 24.0, r.uniform(0.05, 0.3))
+    zb = zc + _c201o_ou(r, n, _c201o_lu(r, 2.0, 20.0) * P / 24.0, r.uniform(0.05, 0.3)) + np.log(_c201o_lu(r, 1.5, 12.0))
+    m = float(np.median(za))
+    ya = _c201o_measure(r, lvl * np.exp(za - m))
+    yb = _c201o_measure(r, lvl * np.exp(zb - m))
+    s = (np.cumsum(r.random(n) >= _c201o_lu(r, 0.01, 0.35)) + int(r.integers(0, 2))) % 2
+    y = np.where(s == 0, ya, yb)
+    y = np.where(r.random(n) < _c201o_lu(r, 0.005, 0.3), 0.5 * (ya + yb), y)
+    if r.random() < 0.4:
+        cut = int(r.uniform(0.1, 0.9) * n)
+        if r.random() < 0.5:
+            y[:cut] = ya[:cut]
+        else:
+            y[cut:] = ya[cut:]
+    return y
+
+
+def _c201o_series(r, n):
+    P = 576 if r.random() < 0.93 else 288
+    end_peak = r.uniform(-1.0, 6.0) if r.random() < 0.7 else r.uniform(0.0, 24.0)
+    if r.random() < 0.04:
+        y = _c201o_pair(r, n, P, end_peak)
+    else:
+        z = _c201o_logpath(r, n, P, end_peak)
+        y = _c201o_measure(r, _c201o_level(r) * np.exp(z - float(np.median(z))))
+    return _c201o_quantize(r, y, float(np.median(y)) < 1.6)
+
+
+def _c201o_draw(r, L):
+    """one PM2.5 sensor feed, real segment at the end and left-padded with its first value, or None"""
+    u = r.random()
+    if u < 0.55:
+        n = L
+    elif u < 0.80:
+        n = int(r.integers(2400, L))
+    elif u < 0.90:
+        n = int(r.integers(700, 2400))
+    else:
+        n = int(r.integers(300, 700))
+    n = min(n, L)
+    try:
+        with np.errstate(all="ignore"):
+            x = _c201o_series(r, n)
+    except Exception:
+        return None
+    if x.shape != (n,) or not bool(np.all(np.isfinite(x))) or float(np.mean(x > 999.9)) > 0.002:
+        return None
+    x = np.minimum(x, 999.9)
+    if float(x.max()) <= float(x.min()):
+        return None
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    return out
+
+
+
+# ═══════════════ c259 AQR: recalibrated hourly air quality (replaces AQW in the -R recipes; calrev 10-20 ~15:25 JST) ═══════════════
+# AQW's episodes (18-96 h build-up, 2-14 h washout, slow OU base) put 70 % of the variance at > 2-day periods and made an ELEVATED
+# end keep rising for ~18 h (path +0.08 at 1-12 h) where the eval falls at once (-0.11 1 h / -0.21 6 h / -0.35 24 h): it taught the
+# king's own over-persistence. AQR keeps AQW's layout, length mix, type table and level ranges and re-fits the dynamics to the newest
+# public pools (9286200 / 9293400 / 9300600, 351 luchtmeetnet / irceline NO2 NO PM2.5 PM10 BC CO series): a moderate slow base
+# (OU tau 60-250 h + the autumn ramp), SHORT-memory bursts (AR(1) tau 4-16 h, Student-t df 2.2-4, light 1-2 h smoothing, 35 % of
+# the 36-h EMA removed), short near-symmetric episodes, a weaker / less regular diurnal profile, no integer grid (eval: 0 % integer
+# series). Fit (eval | AQR, 1500 draws): elevated-end path 1/6/24/96 h -0.11/-0.21/-0.35/-0.45 | -0.09/-0.22/-0.46/-0.50; low-end
+# path +0.16/+0.37/+0.63/+0.91 | +0.14/+0.33/+0.64/+0.86; ACF 1 h .87|.89, 24 h .28|.24; diurnal amp .91|.92; day-to-day profile
+# corr .13|.13; band shares >7d/2-7d/1-2d/lines/6-26h .21/.22/.11/.10/.23 | .20/.29/.12/.09/.19; RF family classifier: 97 % of AQR
+# draws -> the target family (AQW 55 %, 33 % -> osem 150-s, integer AQW draws -> 5-min micromobility).
+# Plain numpy + lfilter; reuses _c259_lu / _c259_ar1 / _c259_pad / _c259_bump / _C259_AQ_TYPES / _C259_AQ_CUM from the kinds above.
+def _c259r_aqr_series(r, n):
+    k = min(int(np.searchsorted(_C259_AQ_CUM, r.random() * _C259_AQ_CUM[-1], side="right")), len(_C259_AQ_TYPES) - 1)
+    name, _w, lo, hi, traffic, sig = _C259_AQ_TYPES[k]
+    t = np.arange(n, dtype=np.int64) + int(r.integers(0, 168))
+    hod = (t % 24).astype(np.int64)
+    day = t // 24
+    nd = int(day[-1]) + 1
+    dow = day % 7
+    sig = sig * r.uniform(0.7, 1.3)
+    # moderate slow base: OU (tau 60-250 h) + seasonal ramp (autumn build-up 75 %, decline 15 %, flat 10 %)
+    z = _c259_ar1(r, n, float(np.exp(-1.0 / _c259_lu(r, 60.0, 250.0))), sig * r.uniform(0.3, 0.5))
+    uu = r.random()
+    ramp = (r.uniform(0.5, 1.4) if uu < 0.75 else (-r.uniform(0.2, 0.6) if uu < 0.90 else 0.0)) * sig
+    z = z + ramp * np.linspace(-1.0, 0.0, n) * (n / 1100.0) ** 0.5
+    # short-memory bursts: AR(1) tau 4-16 h, Student-t innovations, 1-2 h smoothing, 35 % of the 36-h EMA removed
+    phi = float(np.exp(-1.0 / _c259_lu(r, 4.0, 16.0)))
+    df = r.uniform(2.2, 4.0)
+    e = np.clip(r.standard_t(df, n), -10.0, 10.0) * np.sqrt((df - 2.0) / df)
+    mb = lfilter([1.0], [1.0, -phi], e) * np.sqrt(1.0 - phi * phi)
+    w = int(r.integers(1, 3))
+    if w > 1:
+        mb = np.convolve(mb, np.ones(w) / np.sqrt(w), mode="same")
+    a = 1.0 / 36.0
+    mb = mb - 0.35 * lfilter([a], [1.0, -(1.0 - a)], mb)
+    z = z + mb * sig * r.uniform(0.45, 0.75)
+    # short near-symmetric episodes: one per 2.5-6 days, build 6-30 h, plateau 0-6 h, washout e-folding 6-24 h
+    ne = int(r.poisson(n / 24.0 / r.uniform(2.5, 6.0)))
+    ep = np.zeros(n)
+    tt = np.arange(n, dtype=np.float64)
+    for _ in range(ne):
+        c = r.uniform(-24.0, n + 12.0)
+        up = r.uniform(6.0, 30.0)
+        pl = r.uniform(0.0, 6.0)
+        dn = r.uniform(6.0, 24.0)
+        A = sig * _c259_lu(r, 0.5, 1.8)
+        s = tt - c
+        rise = np.clip(1.0 + s / up, 0.0, 1.0) ** r.uniform(1.0, 2.0)
+        fall = np.exp(-np.clip(s - pl, 0.0, None) / dn)
+        ep += A * np.where(s <= 0.0, rise, np.where(s <= pl, 1.0, fall))
+    hh = np.arange(24, dtype=np.float64)
+    if traffic:
+        prof = (r.uniform(0.6, 1.0) * _c259_bump(hh, r.uniform(7.0, 9.0), r.uniform(1.2, 2.2))
+                + r.uniform(0.5, 1.0) * _c259_bump(hh, r.uniform(18.0, 21.5), r.uniform(1.8, 3.5))
+                - r.uniform(0.2, 0.5) * _c259_bump(hh, r.uniform(13.0, 16.0), r.uniform(2.0, 3.5)))
+    else:
+        prof = (r.uniform(0.6, 1.0) * _c259_bump(hh, r.uniform(20.0, 24.5), r.uniform(2.5, 4.5))
+                + r.uniform(0.0, 0.5) * _c259_bump(hh, r.uniform(7.5, 10.0), r.uniform(1.5, 2.5)))
+    prof = prof - prof.mean()
+    prof = prof * (sig * r.uniform(0.15, 0.32) / (float(np.std(prof)) + 1e-9))
+    dmod = np.exp(r.normal(0.0, r.uniform(0.35, 0.7), nd))
+    z = z + prof[hod] * dmod[day]
+    if traffic:
+        wk = np.zeros(7)
+        wk[5] = np.log(r.uniform(0.7, 0.92))
+        wk[6] = np.log(r.uniform(0.55, 0.85))
+        z = z + wk[dow]
+    z = z + ep
+    e2 = np.clip(r.standard_t(r.uniform(4.0, 12.0), n), -8.0, 8.0)
+    z = z + lfilter([1.0], [1.0, -r.uniform(0.0, 0.4)], e2) * sig * r.uniform(0.12, 0.3) * 0.8
+    lev = _c259_lu(r, lo, hi)
+    x = lev * np.exp(z - float(np.median(z)))
+    # measurement grid: 0.1 (60 %) or 0.01 (40 %, and always below level 2); floor = one quantum; never an integer grid
+    uq = r.random()
+    q = 0.01 if (uq < 0.40 or lev < 2.0) else 0.1
+    x = np.maximum(np.round(x / q) * q, q)
+    return np.round(x, 2)
