@@ -31469,3 +31469,14 @@ _YB_BUILD = (_yb_co2, _yb_solar, _yb_wind, _c261_yb_price, _yb_load)
 # ═══════════════ c234-SALT: corpus re-draw. The stream seed is mixed with a constant salt before any layer
 # sees it, so the whole corpus is re-drawn from the SAME distribution (sibling of c268-k76-BIG1-P40U). ═══════════════
 _C234S_SALT = 0x5a1c0322
+_C234SParent = Generator
+
+
+class Generator(_C234SParent):
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        s = np.random.SeedSequence([int(seed) & ((1 << 64) - 1), _C234S_SALT]).generate_state(2, dtype=np.uint32)
+        super().__init__(config_dir, seed=(int(s[0]) | (int(s[1]) << 32)) & ((1 << 63) - 1))
+
+    @property
+    def name(self) -> str:
+        return 'c268-k76-BIG1-P40U-S2'
