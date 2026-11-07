@@ -30895,3 +30895,88 @@ def _c259r_abump(h, c, w, kl, kr):
     """asymmetric circular bump on the 24-h clock: width w * kl before the centre (the ramp up), w * kr after it (the decline)"""
     d = (h - c + 12.0) % 24.0 - 12.0
     return np.exp(-0.5 * (d / (w * np.where(d < 0.0, kl, kr))) ** 2)
+
+
+def _c259r_dapr_series(r, n):
+    u = r.random(24)
+    P = 96
+    s0 = int(P * u[0])
+    t = np.arange(n, dtype=np.int64) + s0
+    slot = t % P
+    day = t // P
+    nd = int(day[-1]) + 1
+    dow = (np.arange(nd) + int(7.0 * u[1])) % 7
+    h = (np.arange(P, dtype=np.float64) + 0.5) * (24.0 / P)
+    nordic = u[2] < 0.15
+    lev = _c259_lu(r, 15.0, 70.0) if nordic else _c259_lu(r, 110.0, 240.0)
+    # day-level log path: AR(1) over days (phi 0.25-0.6: the eval's day levels revert within 2-3 days) + autumn drift (70 % up,
+    # <= 0.3) + rare regime steps (half DAP's rate)
+    lv = _c259_ar1(r, nd, r.uniform(0.25, 0.6), r.uniform(0.35, 0.8) if nordic else r.uniform(0.12, 0.28))
+    drift = r.uniform(0.0, 0.3) * (1.0 if u[3] < 0.7 else -0.6)
+    lv = lv + drift * np.linspace(-1.0, 0.0, nd)
+    for _ in range(int(r.poisson(nd / 80.0 * r.uniform(0.0, 1.5)))):
+        lv[int(r.integers(1, nd)):] += r.normal(0.0, 0.25)
+    lv = lv + np.where(dow == 5, np.log(r.uniform(0.82, 0.97)), 0.0) + np.where(dow == 6, np.log(r.uniform(0.68, 0.92)), 0.0)
+    # autumn daily shape (fractions of the day level): morning + evening peaks, solar trough, night trough
+    tr_c = r.uniform(12.3, 14.0)
+    mor = r.uniform(0.18, 0.45) * _c259r_abump(h, tr_c - r.uniform(5.5, 7.0), r.uniform(1.0, 1.8), r.uniform(0.4, 0.7), r.uniform(1.2, 1.7))
+    eve = r.uniform(0.35, 0.75) * _c259r_abump(h, tr_c + r.uniform(5.5, 7.0), r.uniform(1.3, 2.4), r.uniform(0.4, 0.7), r.uniform(1.2, 1.7))
+    sol = _c259_bump(h, tr_c, r.uniform(1.8, 3.0))
+    nig = r.uniform(0.0, 0.12) * _c259_bump(h, r.uniform(2.0, 4.5), r.uniform(1.5, 3.0))
+    sun = np.clip(r.beta(1.6 + 2.0 * u[4], 1.0 + 1.0 * u[5], nd) * (1.0 + 0.25 * (dow >= 5)), 0.0, 1.3)
+    sdep = r.uniform(0.25, 0.75) if not nordic else r.uniform(0.0, 0.25)
+    amp_d = np.exp(r.normal(0.0, r.uniform(0.1, 0.25), nd))
+    # scarcity days: the morning / evening peaks blow up (heavy right tail of the day-over-day and the 1-3 h ramps)
+    amp_d = amp_d * (1.0 + (r.random(nd) < r.uniform(0.08, 0.25)) * np.exp(r.uniform(np.log(0.4), np.log(2.0), nd)))
+    shape = (mor[slot] + eve[slot] - nig[slot]) * amp_d[day] - sdep * sol[slot] * sun[day]
+    p = lev * np.exp(lv[day]) * (1.0 + shape)
+    # oversupply: windy+sunny days push middays / nights toward zero or below (negatives ~1 % of points)
+    if u[6] < 0.75:
+        ov = (r.random(nd) < r.uniform(0.03, 0.14)) * r.uniform(0.6, 1.6, nd)
+        p = p - lev * ov[day] * np.maximum(sol[slot], 0.6 * nig[slot] / max(float(nig.max()), 1e-9))
+    # quarter-hour structure: hour mean + kappa * (within-hour ramp) + 15-min noise
+    hm = np.add.reduceat(p, np.r_[0, np.flatnonzero(np.diff(t // 4) != 0) + 1])
+    cnt = np.diff(np.r_[0, np.flatnonzero(np.diff(t // 4) != 0) + 1, n])
+    hid = np.cumsum(np.r_[0, (np.diff(t // 4) != 0).astype(np.int64)])
+    hmean = (hm / cnt)[hid]
+    kap = r.uniform(0.8, 2.2)
+    x = hmean + kap * (p - hmean)
+    x = x + lev * r.uniform(0.01, 0.045) * _c259_ar1(r, n, r.uniform(0.0, 0.5), 1.0)
+    qtr = (t % 4).astype(np.int64)
+    saw = r.normal(0.0, r.uniform(0.01, 0.045), 4)
+    x = x + lev * (saw - saw.mean())[qtr]
+    # spikes: more frequent, smaller (DAP's diff kurtosis was 31 vs the eval's 16)
+    ns = int(r.poisson(n * _c259_lu(r, 0.005, 0.035)))
+    for _ in range(ns):
+        a = int(r.integers(0, n))
+        m = int(r.integers(1, 5))
+        x[a:a + m] += lev * (_c259_lu(r, 0.1, 0.7) if r.random() < 0.75 else -_c259_lu(r, 0.1, 0.5))
+    # floor: soft negative tail (prices rarely below -0.3 * level), 2 decimals
+    if u[7] < 0.10:
+        x = np.maximum(x, 0.0)
+    else:
+        F = lev * r.uniform(0.05, 0.2)
+        neg = x < 0.0
+        x[neg] = -F * np.log1p(-x[neg] / F)
+    return np.round(x, 2)
+
+
+def _c259r_dapr(r, L):
+    L = int(L)
+    if L < 1024:
+        return None
+    n = L if r.random() < 0.9 else int(r.uniform(2000.0, L))
+    x = _c259r_dapr_series(r, n)
+    if x.shape != (n,) or not bool(np.all(np.isfinite(x))) or float(np.ptp(x)) <= 0.0 or float(np.mean(x == 0.0)) > 0.02:
+        return None
+    return _c259_pad(x, L)
+
+
+# ═══════════════ c259 BUNDLE layer: eval-layout univariate inserts of DAP15 / AQW / OSM, AFTER the parent record ═══════════════
+# Every parent record is yielded unchanged and in order; AFTER parent record i, kind k fires on its own fast coin
+# (_fcx_coins(seed, _C259B_TAG, i, 3)[k] < q_k) and its record is drawn ONLY from
+# np.random.default_rng(np.random.SeedSequence([seed, _C259B_TAG, k + 1], spawn_key=(i,))): the parent RNGs and the
+# king's own stream are untouched. Inserts count toward n_series. Sits BELOW TLP10 / MLPX (their late gates count the
+# inserts' billed points: a (4096,) univariate record bills 4096). Hygiene gate per insert: shape (4096,), float64,
+# finite, non-constant, >= 20 distinct values, <= 2 % exact zeros (RULEBOOK D3).
+_C259B_TAG = 0xC259B001
