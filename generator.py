@@ -22025,3 +22025,299 @@ def _yb_solar(r, n, a, sod, day, dow0):
         fl = cap * _yb_lu(u[14], 0.002, 0.04)
         x = np.maximum(x, fl * (1.0 + (0.01 + 0.1 * u[15]) * _yb_ou(r, n, 6.0 + 30.0 * u[16])))
     return np.round(x, 1 if (u[17] < 0.8 or cap < 600.0) else 0)
+
+def _yb_wind(r, n, a, sod, day, dow0):
+    u = r.random(24)
+    cap = _yb_lu(u[0], 150.0, 25000.0)
+    nk = n // 48 + 3
+    vol = np.exp((0.15 + 1.0 * u[1] ** 1.5) * np.interp(a - a[0], np.arange(nk, dtype=np.float64) * 48.0, _yb_ou(r, nk, 3.0)))
+    g = _yb_ou2(r, n, _yb_lu(u[2], 36.0, 115.0), 1.0 + 5.5 * u[3], tail=0.3 * u[4], vol=vol)
+    g = _yb_unit(g)
+    z = g + _yb_lu(u[5], 0.02, 0.12) * _yb_ou(r, n, 1.5 + 8.0 * u[6])
+    if u[7] < 0.95:
+        z = z + (0.2 + 1.2 * u[8] ** 2) * (_yb_bump(96.0 * u[9], 14.0 + 10.0 * u[10]) - 0.3)[sod]
+    x = cap / (1.0 + np.exp(-((0.9 + 1.0 * u[11]) * z + (-1.9 + 1.5 * u[12]))))
+    if u[13] < 0.25:
+        x = np.maximum(x - cap * _yb_lu(u[14], 0.003, 0.04), 0.0)
+    else:
+        x = x + cap * _yb_lu(u[14], 0.002, 0.01) * np.exp(0.5 * _yb_ou(r, n, 4.0))
+    return np.round(x, 1 if (u[15] < 0.78 or cap < 400.0) else 0)
+
+def _yb_price(r, n, a, sod, day, dow0):
+    u = r.random(48)
+    nd = int(day[-1]) + 1
+    lev = 60.0 + 130.0 * u[0] if u[1] < 0.8 else _yb_lu(u[0], 25.0, 60.0)
+    nordic = u[2] < 0.25
+    dow = (np.arange(nd) + dow0) % 7
+    we = (dow >= 5).astype(np.float64)
+    lv = _yb_days(r, nd, 0.5 + 0.4 * u[3], (0.2 + 0.3 * u[4]) if nordic else (0.06 + 0.12 * u[4]))
+    lv = lv + np.where(dow == 5, np.log(0.8 + 0.17 * u[5]), 0.0) + np.where(dow == 6, np.log(0.65 + 0.28 * u[6]), 0.0)
+    dv = np.exp((0.25 + 0.4 * u[43]) * r.standard_normal(nd))
+    an = (0.3 + 0.4 * u[7]) if nordic else (0.5 + 0.6 * u[7])
+
+    am = (0.1 + 0.25 * u[8]) * float(u[47] < 0.6) * _yb_plateau(30.0 + 6.0 * u[9], 5.0 + 5.0 * u[10], 2.0 + 2.5 * u[38])
+    ev = (0.3 + 0.6 * u[11]) * _yb_plateau(70.0 + 8.0 * u[12], 8.0 + 8.0 * u[13], 2.0 + 2.5 * u[39])
+    ng = (0.1 + 0.3 * u[14]) * _yb_bump(10.0 + 8.0 * u[15], 10.0 + 6.0 * u[16])
+    sol = _yb_plateau(48.0 + 6.0 * u[17], 10.0 + 8.0 * u[18], 2.0 + 3.0 * u[40])
+    sd_ = np.exp((0.1 + 0.25 * u[19]) * r.standard_normal(nd))
+    scar = np.exp((0.1 + 0.3 * u[20]) * np.abs(r.standard_normal(nd)) * (r.random(nd) < 0.15))
+    sunny = r.beta(2.0 + 2.0 * u[21], 0.7 + 0.7 * u[22], nd) * (1.0 + 0.4 * we)
+    S = (0.3 + 0.7 * u[23]) if (not nordic or u[24] < 0.35) else 0.25 * u[23]
+    shape = (am[sod] - ng[sod]) * sd_[day] + ev[sod] * (sd_ * scar)[day]
+
+    st = np.flatnonzero((a % 4) == 0)
+    if st.size == 0 or st[0] != 0:
+        st = np.concatenate(([0], st))
+    hr = (a // 4) - int(a[0] // 4)
+    hn = (0.03 + 0.10 * u[29]) * _yb_ou(r, st.size, _yb_lu(u[27], 2.0, 12.0), tail=0.3 + 0.4 * u[28])
+    hn = hn + (0.02 + 0.07 * u[44]) * _yb_ou(r, st.size, _yb_lu(u[45], 0.3, 1.5), tail=0.6 + 0.4 * u[46])
+    y = np.clip(_yb_dayline(a, lv) + (an * shape + (2.0 if nordic else 1.0) * hn[hr]) * dv[day], -6.0, 6.0)
+    lam = -0.3 + 0.75 * u[36]
+    p = lev * (1.0 + ((np.exp(lam * y) - 1.0) / lam if abs(lam) > 0.02 else y)) - lev * S * sunny[day] * sol[sod]
+
+    cnt = np.diff(np.concatenate((st, [n])))
+    m = np.add.reduceat(p, st) / cnt
+    kap = 0.0 if u[25] < 0.03 else 1.2 + 2.0 * u[26]
+    x = m[hr] + kap * (p - m[hr])
+    if kap > 0.0:
+        x = x + lev * (0.01 + 0.05 * u[34]) * _yb_ou2(r, n, _yb_lu(u[35], 8.0, 48.0), 1.0 + 2.0 * u[42], tail=0.2 + 0.3 * u[37])
+        e = r.standard_normal(n) * np.exp(0.7 * r.standard_normal(n) - 0.49)
+        x = x + lev * _yb_lu(u[30], 0.004, 0.03) * e
+
+        idx = np.where(r.random(n) < _yb_lu(u[41], 0.003, 0.06), 0, np.arange(n))
+        x = x[np.maximum.accumulate(idx)]
+    if u[31] < 0.3:
+        x = np.maximum(x, 0.0)
+    else:
+        F = lev * (0.02 + 0.1 * u[32])
+        neg = x < 0.0
+        x[neg] = -F * np.log1p(-x[neg] / F)
+        zz = lev * (0.004 + 0.026 * u[33])
+        x = np.where((np.abs(x) < zz) & (r.random(n) < 0.75), 0.0, x)
+    return np.round(x, 2)
+
+def _yb_load(r, n, a, sod, day, dow0):
+    u = r.random(44)
+    nd = int(day[-1]) + 1
+    lev = _yb_lu(u[0], 900.0, 45000.0)
+    dow = (np.arange(nd) + dow0) % 7
+    sat = (dow == 5).astype(np.float64)
+    sun = (dow == 6).astype(np.float64)
+    if u[1] < 0.3:
+        wd = _yb_plateau(52.0 + 16.0 * u[2], 14.0 + 10.0 * u[3], 2.5 + 3.0 * u[41]) - (0.1 + 0.3 * u[4]) * _yb_bump(12.0 + 8.0 * u[5], 8.0 + 4.0 * u[6])
+        we = wd
+    else:
+        ng = (0.3 + 0.5 * u[4]) * _yb_bump(10.0 + 10.0 * u[5], 8.0 + 6.0 * u[6])
+        md = (0.2 + 0.6 * u[7]) * _yb_bump(46.0 + 10.0 * u[8], 8.0 + 6.0 * u[9])
+        evb = (0.5 + 0.5 * u[10]) * _yb_bump(70.0 + 12.0 * u[11], 6.0 + 6.0 * u[12])
+        wd = (0.5 + 0.5 * u[2]) * _yb_bump(28.0 + 10.0 * u[3], 6.0 + 6.0 * u[13]) + md + evb - ng
+        we = (0.2 + 0.4 * u[2]) * _yb_bump(34.0 + 10.0 * u[3], 8.0 + 6.0 * u[13]) + md + evb - ng
+    sc = max(float(_v2_stdm(wd)), 1e-9)
+    wd = (wd - float(_v2_meanm(wd))) / sc
+    we = (we - float(_v2_meanm(we))) / sc
+    depth = 0.05 + 0.12 * u[14]
+    wkmix = sat * (0.5 + 0.5 * u[15]) + sun
+    amp = (1.0 - wkmix * (0.1 + 0.4 * u[16])) * np.exp(_yb_lu(u[35], 0.03, 0.15) * r.standard_normal(nd))
+    lv = _yb_days(r, nd, 0.6 + 0.35 * u[17], 0.015 + 0.045 * u[18]) + sat * np.log(0.88 + 0.09 * u[19]) + sun * np.log(0.84 + 0.11 * u[20])
+    lv = lv + (-0.08 + 0.16 * u[26]) * np.linspace(-0.5, 0.5, nd)
+    shape = wd[sod] * (1.0 - wkmix[day]) + we[sod] * wkmix[day]
+    x = lev * np.exp(_yb_dayline(a, lv)) * (1.0 + depth * amp[day] * shape)
+    x = x * (1.0 + _yb_lu(u[21], 0.003, 0.06) * _yb_ou2(r, n, _yb_lu(u[22], 4.0, 40.0), 0.7 + 2.0 * u[23]))
+    if u[28] < 0.3:
+        hr = (a // 4) - int(a[0] // 4)
+        x = x * (1.0 + _yb_lu(u[29], 0.002, 0.012) * _yb_ou(r, int(hr[-1]) + 1, _yb_lu(u[30], 1.0, 4.0))[hr])
+    x = x + lev * _yb_lu(u[24], 0.001, 0.004) * _yb_rough(r, n, 0.2 + 0.4 * u[27])
+    if u[36] < 0.15:
+        x = x + lev * _yb_lu(u[37], 0.05, 0.13) * _yb_ou2(r, n, _yb_lu(u[38], 2.0, 8.0), 0.6 + 1.6 * u[39], tail=0.3)
+    elif u[36] < 0.4:
+        x = x + lev * _yb_lu(u[37], 0.006, 0.04) * _yb_ou(r, n, _yb_lu(u[38], 3.0, 10.0), tail=0.2 + 0.4 * u[39])
+    if u[31] < 0.22:
+        sp = np.cumsum((r.random(n) < _yb_lu(u[32], 0.0003, 0.003)) * r.standard_normal(n))
+        k = 2 + int(6.0 * u[40])
+        sp[k:] = sp[k:] - sp[:-k].copy()
+        x = x * np.maximum(1.0 + _yb_lu(u[33], 0.15, 0.6) * sp, 0.05)
+    x = np.maximum(x, 0.02 * lev)
+    if u[34] < 0.04:
+        st = np.flatnonzero((a % 4) == 0)
+        if st.size == 0 or st[0] != 0:
+            st = np.concatenate(([0], st))
+        x = (np.add.reduceat(x, st) / np.diff(np.concatenate((st, [n]))))[(a // 4) - int(a[0] // 4)]
+        return np.round(x, 1)
+    return np.round(x, 0 if u[25] < 0.78 else 1)
+
+_YB_BUILD = (_yb_co2, _yb_solar, _yb_wind, _yb_price, _yb_load)
+
+def _yb_tail_len(r):
+    v = r.random(2)
+    if v[0] < 0.85:
+        return int(min(max(round(83.5 + 6.0 * float(r.standard_normal())), 69), 103))
+    if v[0] < 0.93:
+        return 50 + int(13 * v[1])
+    if v[0] < 0.97:
+        return 100 + int(13 * v[1])
+    return 126 + int(11 * v[1]) if v[1] < 0.6 else 190 + int(32.5 * (v[1] - 0.6))
+
+def _yb_draw(r, L):
+    L = int(L)
+    u = r.random(12)
+    kind = min(int(np.searchsorted(_YB_KIND_CUM, u[0], side="right")), len(_YB_KINDS) - 1)
+    hv = (64, 256, 720)[min(int(3.0 * u[1]), 2)]
+    feed = L + 64 if u[2] < _YB_P_FULL else int(1100.0 + (L + 64 - 1100.0) * u[3])
+    n = int(max(min(L, feed - hv), min(L, 384)))
+    s_end = 86 + int(13.0 * u[4])
+    if hv == 720:
+        s_end -= 48
+    a = np.arange(n, dtype=np.int64) + int((s_end - (n - 1)) % 96)
+    x = np.asarray(_YB_BUILD[kind](r, n, a, a % 96, a // 96, int(7.0 * u[5])), dtype=np.float64)
+    end = n
+    if u[6] < _YB_P_TAIL[kind]:
+        T = _yb_tail_len(r)
+        if n - T >= 256:
+            x[n - T:] = x[n - T - 1]
+            end = n - T
+    if u[7] < _YB_P_BLIP[kind]:
+        nc = (end - 96) // 64
+        if nc >= 4:
+            nb = 1 + int(3.0 * u[8])
+            cells = r.choice(nc, size=min(nb, nc), replace=False)
+            v = r.random((cells.size, 3))
+            for j in range(cells.size):
+                m = min(2 + int(6.0 * v[j, 0]) if v[j, 1] < 0.7 else 8 + int(8.0 * v[j, 0] ** 2), _YB_BLIP_MAX[kind])
+                s = 64 + 64 * int(cells[j]) + int(32.0 * v[j, 2])
+                x[s:s + m] = x[s - 1]
+    return x, kind
+
+def _yb_grid15(r, L):
+    L = int(L)
+    if L < 512:
+        return None
+    x, _ = _yb_draw(r, L)
+    n = x.size
+    if n > L:
+        x = x[n - L:]
+        n = L
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+_YC_P = 1440
+_YC_TWO_PI = 2.0 * np.pi
+_YC_MIX = (0.85, 0.15)
+_YC_RATE_KINDS = np.cumsum([0.84, 0.07, 0.05, 0.04])
+
+_YC_HMED = np.array([0.452, 0.099, 0.115, 0.041, 0.028])
+_YC_HLSD = np.array([0.19, 0.34, 0.60, 0.66, 0.67])
+_YC_HPSI = np.array([3.57, 2.16, 0.99, 5.93, 5.26])
+_YC_HPSD = np.array([0.20, 0.57, 1.04, 1.08, 1.28])
+_YC_HDA = np.array([0.15, 0.35, 0.45, 0.5, 0.5])
+_YC_HDP = np.array([0.15, 0.5, 0.8, 1.0, 1.0])
+_YC_HCOS = np.cos(np.arange(1.0, 7.0)[:, None] * np.arange(_YC_P, dtype=np.float64)[None, :] * (_YC_TWO_PI / _YC_P))
+_YC_HSIN = np.sin(np.arange(1.0, 7.0)[:, None] * np.arange(_YC_P, dtype=np.float64)[None, :] * (_YC_TWO_PI / _YC_P))
+_YC_WIN = np.cumsum([0.05, 0.20, 0.55, 0.20])
+
+_YC_TIDE_PER = np.array([745.236072, 720.0, 759.50085, 1436.068182, 1549.160502, 1612.101402,
+                         372.618036, 366.206358, 248.412024, 490.628394])
+
+def _yc_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yc_filt(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yc_ar1(r, n, tau, sd, tail=0.0):
+    n = int(n)
+    phi = float(np.exp(-1.0 / max(float(tau), 0.05)))
+    e = r.standard_normal(n)
+    if tail > 0.0:
+        e = e * np.exp(tail * r.standard_normal(n) - tail * tail)
+    e = e * (sd * np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    e[0] = r.standard_normal() * sd
+    return _yc_filt(e, phi)
+
+def _yc_box(x, m):
+    m = min(int(m), x.size)
+    if m <= 1:
+        return x
+    c = np.cumsum(np.concatenate(([0.0], x)))
+    out = np.empty(x.size, dtype=np.float64)
+    out[m - 1:] = (c[m:] - c[:-m]) / m
+    out[:m - 1] = c[1:m] / np.arange(1, m)
+    return out
+
+def _yc_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+def _yc_store(r, x, p_dec):
+    if r.random() < p_dec:
+        return np.round(x, int(r.integers(2, 4)))
+    return x.astype(np.float32).astype(np.float64)
+
+def _yc_smooth(r, n, tau, sd):
+    step = max(1, int(tau / 6.0))
+    m = n // step + 3
+    z = np.interp(np.arange(n, dtype=np.float64) / step + r.random(), np.arange(m, dtype=np.float64),
+                  _yc_ar1(r, m, tau / step, sd))
+    return _yc_box(z, step)
+
+def _yc_hshape(a, psi):
+    amp = np.concatenate(([1.0], a))
+    ph = np.concatenate(([0.0], psi))
+    p = ((amp * np.cos(ph))[:, None] * _YC_HCOS - (amp * np.sin(ph))[:, None] * _YC_HSIN).sum(0)
+    lo = float(p.min())
+    return (p - lo) / max(float(p.max()) - lo, 1e-9)
+
+def _yc_cycle(r, n, s_amp, s_lvl, s_warp, blend, h_scale):
+
+    a = _YC_HMED * h_scale * np.exp(_YC_HLSD * r.standard_normal(5))
+    psi = _YC_HPSI + _YC_HPSD * r.standard_normal(5)
+    ta = _yc_hshape(a, psi)
+    tb = _yc_hshape(a * np.exp(_YC_HDA * r.standard_normal(5)), psi + _YC_HDP * r.standard_normal(5))
+    u = (np.arange(n, dtype=np.float64) + float(r.integers(0, _YC_P))) / float(_YC_P)
+    nd = int(u[-1]) + 2
+    grid = np.arange(nd, dtype=np.float64)
+    half = np.arange(2 * nd, dtype=np.float64) * 0.5
+    warp = np.interp(u, half, r.normal(0.0, s_warp, 2 * nd))
+    g = ((u + warp) % 1.0) * _YC_P
+    i0 = np.minimum(g.astype(np.int64), _YC_P - 1)
+    f = g - i0
+    i1 = (i0 + 1) % _YC_P
+    w = np.interp(u, grid, blend * r.random(nd))
+    pa = ta[i0] * (1.0 - f) + ta[i1] * f
+    pb = tb[i0] * (1.0 - f) + tb[i1] * f
+    prof = (pa + w * (pb - pa)) * np.exp(np.interp(u, grid, r.normal(0.0, s_amp, nd)))
+    return prof, np.interp(u, grid, r.normal(0.0, s_lvl, nd))
+
+def _yc_count(r, p_none, lo, hi):
+    if r.random() < p_none:
+        return 0
+    return int(r.poisson(_yc_lu(r, lo, hi)))
+
+def _yc_steps(r, n, k, w_lo, w_hi, a_lo, a_hi, p_up):
+    if k <= 0:
+        return 0.0
+    i0 = r.integers(0, n, k)
+    w = np.exp(r.uniform(np.log(w_lo), np.log(w_hi), k)).astype(np.int64) + 1
+    a = np.exp(r.uniform(np.log(a_lo), np.log(a_hi), k)) * np.where(r.random(k) < p_up, 1.0, -1.0)
+    d = np.bincount(i0, weights=a, minlength=n + 1) - np.bincount(np.minimum(i0 + w, n), weights=a, minlength=n + 1)
+    return np.cumsum(d)[:n]
