@@ -24042,3 +24042,283 @@ def _yi_slow(r, n, sd_trend, sd_ou):
 
 def _yi_noise(r, n, sd_lo, sd_hi, phi_lo, phi_hi):
     return _yi_ou(r, n, -1.0 / np.log(r.uniform(phi_lo, phi_hi) + 1e-9), r.uniform(sd_lo, sd_hi))
+
+def _yi_share(r, n, path, national):
+    s0 = r.uniform(0.0, 365.0)
+    (b_lo, b_hi), (c_lo, c_hi), c_mu, (o_lo, o_hi) = _YI_BASE[path]
+    t = np.arange(n, dtype=np.float64)
+    base = _yi_lu(r, b_lo, b_hi)
+    lx = r.uniform(c_lo, c_hi) * np.cos(_YI_TWO_PI * (t + s0 - c_mu) / 365.0)
+    lx += _yi_slow(r, n, 0.10, 0.12)
+    if national:
+        lx += _yi_weekday(r, n, 0.05, 0.10)
+        g = _yi_season(r, n, s0, path, r.uniform(1.1, 1.4), 0.6)
+        N = _yi_lu(r, 1.0e5, 6.0e5)
+        lx += _yi_noise(r, n, 0.006, 0.02, 0.3, 0.7)
+    else:
+        lx += _yi_weekday(r, n, 0.02, 0.09)
+        g = _yi_season(r, n, s0, path)
+        N = _yi_lu(r, 1200.0, 25000.0)
+        lx += _yi_noise(r, n, o_lo, o_hi, 0.01, 0.4)
+    p = np.minimum(base * np.exp(lx) * (1.0 + g), 60.0)
+    k = r.poisson(N * p / 100.0).astype(np.float64)
+    return np.round(k * (100.0 / N), 2)
+
+def _yi_covid_long(r, n, e_lo, e_hi, size):
+    t = np.arange(n, dtype=np.float64)
+    t_mid = r.uniform(450.0, 1000.0)
+    env = r.uniform(e_lo, e_hi) / (1.0 + np.exp((t - t_mid) / r.uniform(60.0, 200.0)))
+    g = _yi_season(r, n, r.uniform(0.0, 365.0), "covid", 1.0, 1.0, size)
+    c = r.uniform(20.0, 120.0)
+    while c < t_mid + 100.0 and c < n + 60.0:
+        _yi_wave(t, c, size * float(np.exp(r.normal(np.log(8.0), 0.6))), r.uniform(8.0, 22.0), r.uniform(10.0, 28.0),
+                 r.uniform(1.0, 1.4), r.uniform(0.9, 1.2), g, r.uniform(3.0, 12.0))
+        c += r.uniform(180.0, 300.0)
+    start = 1.0 / (1.0 + np.exp(-(t - r.uniform(10.0, 60.0)) / r.uniform(4.0, 15.0)))
+    return np.exp(env + _yi_slow(r, n, 0.05, 0.15)) * (1.0 + g) * start
+
+def _yi_roll7(c):
+    s = np.cumsum(c)
+    s[7:] = s[7:] - s[:-7]
+    return s
+
+def _yi_hosp7(r, n):
+    lam = _yi_lu(r, 0.01, 1.0) * _yi_covid_long(r, n, 0.8, 2.0, r.uniform(3.0, 7.0))
+    c = r.poisson(lam * np.exp(_yi_noise(r, n, 0.05, 0.2, 0.01, 0.3))).astype(np.float64)
+    return _yi_roll7(c)
+
+def _yi_uk(r, L):
+    u = r.random()
+    if u < 0.20:
+        n = min(L, int(r.integers(880, 1021)))
+        s0 = r.uniform(0.0, 365.0)
+        t = np.arange(n + 6, dtype=np.float64)
+        c_lo, c_hi = _YI_BASE["ari"][1]
+        c_mu = _YI_BASE["ari"][2]
+        lx = r.uniform(c_lo, c_hi) * np.cos(_YI_TWO_PI * (t + s0 - c_mu) / 365.0) + _yi_slow(r, n + 6, 0.08, 0.10)
+        lx += _yi_weekday(r, n + 6, 0.05, 0.15) + _yi_noise(r, n + 6, 0.05, 0.12, 0.1, 0.5)
+        lam = _yi_lu(r, 700.0, 3000.0) * np.exp(lx) * (1.0 + _yi_season(r, n + 6, s0, "ari"))
+        return np.round(_yi_roll7(r.poisson(lam).astype(np.float64))[6:] / 7.0, 2), "ari_ed"
+    n = min(L, int(r.integers(2150, 2471)))
+    if u < 0.55:
+        lam = _yi_lu(r, 30.0, 500.0) * _yi_covid_long(r, n, 3.0, 6.0, r.uniform(0.3, 1.0))
+        lam *= np.exp(_yi_weekday(r, n, 0.10, 0.30) + _yi_noise(r, n, 0.05, 0.12, 0.2, 0.6))
+        return r.poisson(lam).astype(np.float64), "cases"
+    lam = _yi_lu(r, 15.0, 200.0) * _yi_covid_long(r, n, 1.0, 2.5, r.uniform(0.3, 1.0))
+    if u < 0.80:
+        lam = lam * np.exp(_yi_weekday(r, n, 0.06, 0.16) + _yi_noise(r, n, 0.08, 0.16, 0.4, 0.8))
+        return r.poisson(lam).astype(np.float64), "admissions"
+    los = r.uniform(6.0, 14.0)
+    b = _yi_ar1(lam, float(np.exp(-1.0 / los))) * (1.0 - float(np.exp(-1.0 / los)))
+    b = b * los * np.exp(_yi_ou(r, n, r.uniform(2.0, 8.0), r.uniform(0.01, 0.035)) + _yi_weekday(r, n, 0.005, 0.02))
+    return np.round(b), "beds"
+
+def _yi_rkinat(r, n):
+    path = "flu" if r.random() < 0.6 else "rsv"
+    s0 = r.uniform(0.0, 365.0)
+    t = np.arange(n + 6, dtype=np.float64)
+    (c_lo, c_hi), c_mu = _YI_BASE[path][1:3]
+    lx = r.uniform(c_lo, c_hi) * np.cos(_YI_TWO_PI * (t + s0 - c_mu) / 365.0) + _yi_slow(r, n + 6, 0.10, 0.12)
+    g = 1.0 + _yi_season(r, n + 6, s0, path, r.uniform(1.2, 2.0), 0.6)
+    if r.random() < 0.5:
+        lam = _yi_lu(r, 4.0, 80.0) * np.exp(lx[6:] + _yi_noise(r, n, 0.15, 0.35, 0.1, 0.5)) * g[6:]
+        wk = np.exp(r.uniform(-0.25, 0.25, 7))
+        we = int(r.integers(0, 7))
+        wk[we] *= r.uniform(0.0, 0.08)
+        wk[(we + 1) % 7] *= r.uniform(0.0, 0.08)
+        lam = lam * wk[(np.arange(n) + int(r.integers(0, 7))) % 7]
+        if r.random() < 0.6:
+            z = int(r.integers(15, 50))
+            s = int(r.integers(20, 70))
+            wf = np.where(r.random(s // 7 + 1) < 0.4, 0.0, r.uniform(0.05, 1.0, s // 7 + 1))
+            lam[:z] = 0.0
+            lam[z:z + s] *= wf[np.arange(lam[z:z + s].size) // 7]
+        return r.poisson(lam).astype(np.float64), "cases"
+    lam = _yi_lu(r, 0.005, 0.05) * np.exp(lx + _yi_noise(r, n + 6, 0.12, 0.3, 0.1, 0.4)) * g
+    return np.round(_yi_roll7(lam)[6:], 2), "incidence"
+
+def _yi_series(r, L):
+    kind = min(int(np.searchsorted(_YI_KIND_CUM, r.random() * _YI_KIND_CUM[-1], side="right")), 4)
+    if kind == 0:
+        n = int(r.integers(505, 536)) if r.random() < 0.85 else int(r.integers(300, 1101))
+        path = _YI_PATHS[int(r.integers(0, 4))]
+        return _yi_share(r, min(n, L), path, False), "state/" + path
+    if kind == 1:
+        path = _YI_PATHS[int(r.integers(0, 4))]
+        return _yi_share(r, min(int(r.integers(1380, 1561)), L), path, True), "national/" + path
+    if kind == 2:
+        n = int(r.integers(2340, 2441)) if r.random() < 0.85 else int(r.integers(700, 2341))
+        return _yi_hosp7(r, min(n, L)), "hosp7/covid_hosp_7d"
+    if kind == 3:
+        x, sub = _yi_uk(r, L)
+        return x, "uk/" + sub
+    x, sub = _yi_rkinat(r, min(int(r.integers(430, 481)), L))
+    return x, "rkinat/" + sub
+
+def _yi_health(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    x, _ = _yi_series(r, L)
+    x = np.asarray(x, dtype=np.float64)[-L:]
+    if float(x.max()) <= float(x.min()):
+        x = x + (r.random(x.size) < 0.05)
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    return out
+
+_YJ_TWO_PI = 2.0 * np.pi
+_YJ_KIND_CUM = np.cumsum([0.28, 0.32, 0.04, 0.36])
+_YJ_MIN_N = 320
+_YJ_LAM_CAP = 5000.0
+_YJ_MAX_CAL = 40960
+
+_YJ_SHAPE_CUM_S = np.cumsum([0.20, 0.50, 0.05, 0.25])
+_YJ_SHAPE_CUM_D = np.cumsum([0.25, 0.45, 0.10, 0.20])
+_YJ_AMP = ((1.2, 3.2), (0.4, 1.5), (0.8, 2.0), (0.0, 0.3))
+
+def _yj_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yj_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yj_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yj_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yj_ar1(e, phi)
+
+def _yj_slow(r, nd, per, tau_d, sd):
+    d = _yj_ou(r, nd + 1, tau_d, sd)
+    return np.interp(np.arange(nd * per, dtype=np.float64) / per, np.arange(nd + 1, dtype=np.float64), d)
+
+def _yj_episodes(r, m, rate, a_lo, a_hi, tau):
+    k = int(min(r.poisson(rate * m), 400))
+    if k <= 0:
+        return None
+    imp = np.zeros(m, dtype=np.float64)
+    np.add.at(imp, r.integers(0, m, k), r.uniform(a_lo, a_hi, k))
+    return _yj_ar1(imp, float(np.exp(-1.0 / tau)))
+
+def _yj_dayshape(r, shape, P):
+    h = (np.arange(P, dtype=np.float64) + 0.5) * (24.0 / P)
+    if shape == 0:
+        a, b, w = r.uniform(6.0, 9.0), r.uniform(15.5, 20.5), r.uniform(0.5, 1.8)
+        s = 1.0 / (1.0 + np.exp(-(h - a) / w)) - 1.0 / (1.0 + np.exp(-(h - b) / w))
+        s = s + r.uniform(0.0, 0.3) * np.exp(-0.5 * ((h - r.uniform(9.0, 12.0)) / 1.5) ** 2)
+    elif shape == 1:
+        pk = r.uniform(12.0, 19.0)
+        s = np.cos(_YJ_TWO_PI * (h - pk) / 24.0) + r.uniform(0.0, 0.4) * np.cos(2.0 * _YJ_TWO_PI * (h - pk - r.uniform(-3.0, 3.0)) / 24.0)
+    elif shape == 2:
+        d = (h - r.uniform(20.0, 24.5) + 12.0) % 24.0 - 12.0
+        s = np.exp(-0.5 * (d / r.uniform(2.0, 4.5)) ** 2) + r.uniform(0.0, 0.3) * np.cos(_YJ_TWO_PI * (h - 15.0) / 24.0)
+    else:
+        s = r.normal(0.0, 1.0) * np.cos(_YJ_TWO_PI * (h - r.uniform(0.0, 24.0)) / 24.0) + 0.3 * r.standard_normal(P)
+    s = s - _v2_meanm(s)
+    pp = float(np.ptp(s))
+    return s / pp if pp > 0 else s
+
+def _yj_gaps(r, keep, rate, len_hi):
+    m = keep.size
+    k = int(min(r.poisson(rate * m), 60))
+    for _ in range(k):
+        i = int(r.integers(0, m))
+        keep[i:i + int(_yj_lu(r, 1.0, len_hi))] = False
+
+def _yj_gamma(r, m, cv):
+    if cv < 0.02:
+        return 1.0
+    k = 1.0 / (cv * cv)
+    return r.gamma(k, 1.0 / k, m)
+
+def _yj_count(r, lam, keep_zero):
+    lam = np.minimum(np.maximum(lam, 1e-9), 1e6)
+    if keep_zero:
+        return np.ones(lam.size, dtype=bool), r.poisson(lam).astype(np.float64)
+    p1 = -np.expm1(-lam)
+    listed = r.random(lam.size) < p1
+    la, pa = lam[listed], p1[listed]
+    t1 = -np.log1p(-r.random(la.size) * pa) / la
+    return listed, 1.0 + r.poisson(la * np.maximum(1.0 - t1, 0.0)).astype(np.float64)
+
+def _yj_subdaily(r, n, P, dense):
+    hh = P == 48
+    if dense:
+        z = float(r.standard_normal())
+        if hh:
+            base = float(np.exp(min(max(np.log(7.0) + 0.45 * z, np.log(2.4)), np.log(60.0))))
+            shape = 1
+        else:
+            base = float(np.exp(min(max(np.log(10.0) + (0.65 if z < 0.0 else 1.2) * z, np.log(2.4)), np.log(400.0))))
+            shape = _yj_pick(r, _YJ_SHAPE_CUM_D)
+    else:
+        base = float(np.exp(min(max(r.normal(np.log(0.55), 0.7), np.log(0.08)), np.log(2.4))))
+        shape = _yj_pick(r, _YJ_SHAPE_CUM_S)
+    p_est = max(1.0 - float(np.exp(-0.75 * base)), 0.04)
+    nd = int(min(n / p_est * 1.2 + 2 * P, _YJ_MAX_CAL) // P) + 2
+    m = nd * P
+    h0, d0 = int(r.integers(0, P)), int(r.integers(0, 7))
+    slot = (np.arange(m) + h0) % P
+    day = (np.arange(m) + h0) // P
+    dow = (day + d0) % 7
+
+    s = _yj_dayshape(r, shape, P) * (r.uniform(0.8, 1.2) if hh else r.uniform(*_YJ_AMP[shape]))
+    if shape in (1, 3) and r.random() < (0.2 if dense else 0.15):
+        s[0 if r.random() < 0.7 else P // 2] += np.log(r.uniform(1.4, 3.0))
+    wk = r.normal(0.0, 0.04, 7)
+    amp_w = np.ones(7)
+    if shape == 0:
+        wk[5] += np.log(r.uniform(0.3, 0.8))
+        wk[6] = wk[5] + np.log(r.uniform(0.7, 1.05))
+        wk[0] += r.uniform(0.0, 0.15)
+        amp_w[5:] = r.uniform(0.3, 0.8)
+    elif shape == 2:
+        wk[4:6] += r.uniform(0.1, 0.45)
+    else:
+        wk[5:] += r.normal(0.0, 0.08)
+    amp_d = np.exp(r.normal(0.0, r.uniform(0.03, 0.2), nd + 1))
+    lday = _yj_ou(r, nd + 1, _yj_lu(r, 0.5, 6.0), r.uniform(0.01, 0.06) if hh else _yj_lu(r, 0.02, 0.25))
+    x = s[slot] * amp_w[dow] * amp_d[day] + wk[dow] + lday[day]
+    x += _yj_slow(r, nd, P, _yj_lu(r, 6.0, 120.0), r.uniform(0.01, 0.05) if hh else _yj_lu(r, 0.01, 0.45))
+    if r.random() < (0.85 if dense else 0.7):
+        x += _yj_ou(r, m, _yj_lu(r, 2.0, 48.0) * P / 24.0, r.uniform(0.0, 0.1) if hh else
+                    (r.uniform(0.03, 0.25) if shape == 0 else r.uniform(0.05, 0.45) if dense else r.uniform(0.0, 0.35)))
+    if r.random() < (0.3 if shape == 0 else 0.6):
+        ep = _yj_episodes(r, m, _yj_lu(r, 0.0002, 0.003) * 24.0 / P, 0.3, 1.2, _yj_lu(r, 1.0, 24.0) * P / 24.0)
+        if ep is not None:
+            x += ep
+    if not dense:
+        if r.random() < 0.3:
+            ep = _yj_episodes(r, m, _yj_lu(r, 0.0002, 0.002), 1.0, 3.0, _yj_lu(r, 6.0, 96.0))
+            if ep is not None:
+                x += ep
+        if r.random() < 0.25:
+            x += (r.random(m) < _yj_lu(r, 0.002, 0.02)) * r.uniform(1.0, 3.0, m)
+    if r.random() < (0.03 if hh else 0.15):
+        x[int(r.integers(m // 8, m)):] += r.normal(0.0, 0.5 if dense else 0.8)
+    lam = base * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 12.0))
+    cv = r.uniform(0.05, 0.3) if hh else (r.uniform(0.03, 0.25) if shape == 0 else r.uniform(0.03, 0.4) if dense else r.uniform(0.0, 0.5))
+    lam = lam * _yj_gamma(r, m, cv)
+    listed, c = _yj_count(r, np.minimum(lam, _YJ_LAM_CAP), False)
+    if not hh and r.random() < 0.35:
+        keep = np.ones(m, dtype=bool)
+        _yj_gaps(r, keep, _yj_lu(r, 0.0003, 0.003) * 24.0 / P, 72.0 * P / 24.0)
+        c = c[keep[listed]]
+    return c
