@@ -24322,3 +24322,291 @@ def _yj_subdaily(r, n, P, dense):
         _yj_gaps(r, keep, _yj_lu(r, 0.0003, 0.003) * 24.0 / P, 72.0 * P / 24.0)
         c = c[keep[listed]]
     return c
+
+def _yj_daily(r, n):
+    office = r.random() < 0.5
+    base = float(np.exp(min(max(r.normal(np.log(18.0), 1.9), np.log(0.15)), np.log(4000.0))))
+    keep_zero = r.random() < 0.03
+    wk = r.normal(0.0, 0.05 if office else _yj_lu(r, 0.015, 0.1), 7)
+    if office:
+        wk[5] = np.log(_yj_lu(r, 0.001, 0.6))
+        wk[6] = wk[5] + np.log(r.uniform(0.2, 1.0))
+        wk[0] += r.uniform(0.0, 0.15)
+        wk[4] -= r.uniform(0.0, 0.2)
+    p_est = max(1.0 - float(np.exp(-0.7 * base)), 0.05) * (5.0 / 7.0 if office else 1.0)
+    m = int(min(n / p_est * 1.25 + 14, 8192))
+    t = np.arange(m, dtype=np.float64)
+    dow = (np.arange(m) + int(r.integers(0, 7))) % 7
+    x = wk[dow]
+    nh = int(r.poisson(m / 365.0 * (r.uniform(6.0, 12.0) if office else r.uniform(0.0, 6.0))))
+    if nh > 0:
+        hd = r.integers(0, m, nh)
+        if office:
+            x[hd] += r.uniform(np.log(0.002), np.log(0.05), nh) if r.random() < 0.5 else r.uniform(np.log(0.1), np.log(0.5), nh)
+            if r.random() < 0.5:
+                x[np.minimum(hd + 1, m - 1)] += np.log(r.uniform(1.1, 1.6))
+        else:
+            x[hd] += np.log(r.uniform(0.6, 1.3, nh))
+    if r.random() < 0.5:
+        x += r.uniform(0.0, 0.25) * np.cos(_YJ_TWO_PI * t / 365.25 + r.uniform(0.0, _YJ_TWO_PI))
+    x += _yj_ou(r, m, _yj_lu(r, 15.0, 400.0), r.uniform(0.05, 0.35))
+    x += np.linspace(0.0, r.normal(0.0, 0.25), m)
+    if r.random() < 0.6:
+        x += _yj_ou(r, m, _yj_lu(r, 1.0, 6.0), r.uniform(0.0, 0.2))
+    if r.random() < 0.2:
+        ep = _yj_episodes(r, m, _yj_lu(r, 0.003, 0.03), 0.7, 2.3, 0.3)
+        if ep is not None:
+            x += ep
+    if r.random() < 0.15:
+        x[int(r.uniform(0.2, 0.95) * m):] += (1.0 if r.random() < 0.5 else -1.0) * r.uniform(1.5, 5.0)
+    lam = base * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 12.0)) * _yj_gamma(r, m, _yj_lu(r, 0.03, 0.6))
+    listed, c = _yj_count(r, np.minimum(lam, 4.0 * _YJ_LAM_CAP), keep_zero)
+    if r.random() < 0.35:
+        keep = np.ones(m, dtype=bool)
+        _yj_gaps(r, keep, _yj_lu(r, 0.0005, 0.004), 20.0)
+        c = c[keep[listed]]
+    return c
+
+def _yj_civic(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    kind = _yj_pick(r, _YJ_KIND_CUM)
+    if kind == 0:
+        u = r.random()
+        n = L if u < 0.30 else (int(_yj_lu(r, _YJ_MIN_N, 700.0)) if u < 0.475 else int(r.uniform(min(700.0, L), L)))
+        y = _yj_subdaily(r, n, 24, False)
+    elif kind == 1:
+        n = L if r.random() < 0.32 else int(_yj_lu(r, min(600.0, L), L))
+        y = _yj_subdaily(r, n, 24, True)
+    elif kind == 2:
+        n = int(_yj_lu(r, _YJ_MIN_N, 420.0)) if r.random() < 0.35 else int(r.uniform(min(3500.0, L), L))
+        y = _yj_subdaily(r, n, 48, r.random() < 0.8)
+    else:
+        n = int(min(max(np.exp(r.normal(np.log(820.0), 0.55)), _YJ_MIN_N), 2600.0))
+        y = _yj_daily(r, n)
+    n = min(n, L, y.size)
+    y = y[y.size - n:]
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0] if n > 0 else 1.0
+    out[L - n:] = y
+    if float(np.ptp(out)) == 0.0:
+        out[L - 1 - int(r.integers(0, max(n, 1)))] += 1.0
+    return out
+
+_YK_TWO_PI = 2.0 * np.pi
+_YK_MIN_L = 256
+_YK_KIND_CUM = np.cumsum([0.48, 0.24, 0.17, 0.11])
+_YK_PADS = (0, 192, 656)
+_YK_PAD_CUM = np.cumsum([0.40, 0.30, 0.30])
+_YK_P_FULL = (0.80, 0.82, 0.92, 0.12)
+_YK_N_SHORT = (320.0, 3600.0)
+_YK_N_REG = (500.0, 2100.0)
+_YK_CAD = ((96, 288, 144, 48), (96, 48), (96, 288), (24, 96))
+_YK_CAD_CUM = (np.cumsum([0.77, 0.12, 0.05, 0.06]), np.cumsum([0.88, 0.12]), np.cumsum([0.94, 0.06]),
+               np.cumsum([0.85, 0.15]))
+
+_YK_ST_STYLE = ((0.515, 0.001, (0.03, 3.0), (12.0, 500.0)),
+                (0.11, 0.001, (3.0, 150.0), (20.0, 600.0)),
+                (0.005, 0.001, (-1.2, 0.2), (30.0, 600.0)),
+                (0.21, 1.0, (15.0, 900.0), (6.0, 120.0)),
+                (0.01, 1.0, (-60.0, 20.0), (6.0, 80.0)),
+                (0.12, 0.01, (1.0, 30.0), (30.0, 700.0)),
+                (0.03, 0.005, (0.2, 10.0), (20.0, 400.0)))
+_YK_ST_CUM = np.cumsum([s[0] for s in _YK_ST_STYLE])
+
+_YK_FL_STYLE = ((0.33, 0.001, (0.005, 0.6)), (0.12, 0.01, (0.05, 4.0)), (0.55, 0.0, (0.3, 3.0e5)))
+_YK_FL_CUM = np.cumsum([s[0] for s in _YK_FL_STYLE])
+_YK_P_BIG = 0.25
+_YK_TP = (0.4, 30.0)
+_YK_TP_BIG = (24.0, 120.0)
+_YK_STORM_H = (0.5, 6.0)
+_YK_DRIFT_SD = 0.8
+_YK_WANDER = (0.05, 0.6)
+_YK_BASE_ST = (0.2, 6.0)
+_YK_BASE_FL = (0.5, 20.0)
+_YK_BASE_FL3 = (1.5, 25.0)
+_YK_P_BIG_FL = 0.40
+_YK_P_NOISY_FL = 0.12
+_YK_P_SLUICE = 0.15
+_YK_ST_NOISE = (0.08, 1.0)
+_YK_RAIN_TICK = np.array([0.01, 0.2, 0.1, 0.5, 0.254])
+_YK_RAIN_TICK_CUM = np.cumsum([0.80, 0.09, 0.05, 0.03, 0.03])
+_YK_REG_TICK = np.array([0.01, 0.001, 0.003048, 0.0032808, 0.005])
+_YK_REG_TICK_CUM = np.cumsum([0.55, 0.15, 0.10, 0.10, 0.10])
+
+def _yk_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yk_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yk_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+def _yk_len(r, L, kind):
+    if r.random() < _YK_P_FULL[kind]:
+        n = L - _YK_PADS[_yk_pick(r, _YK_PAD_CUM)]
+    elif kind == 3:
+        n = int(_yk_lu(r, *_YK_N_REG))
+    else:
+        n = int(_yk_lu(r, *_YK_N_SHORT))
+    return int(min(max(n, 128), L))
+
+def _yk_ar1(e, phi):
+    x = e.copy()
+    a = phi
+    k = 1
+    n = x.size
+    while k < n:
+        x[k:] += a * x[:-k]
+        a = a * a
+        k *= 2
+    return x
+
+def _yk_slow(r, m, tau):
+    step = max(1.0, tau / 8.0)
+    k = int(m / step) + 43
+    phi = float(np.exp(-step / max(tau, 1.0)))
+    z = _yk_ar1(_yk_ar1(r.standard_normal(k) * np.sqrt(1.0 - phi * phi), phi) * (1.0 - phi), phi)[40:]
+    z = z - _v2_meanm(z)
+    sd = float(_v2_stdm(z))
+    z = z / sd if sd > 0 else z
+    return np.interp(np.arange(m, dtype=np.float64) / step, np.arange(z.size, dtype=np.float64), z)
+
+def _yk_spells(r, m, P, wet_d, dry_d):
+    k = int(3.0 * m / (P * (wet_d + dry_d))) + 6
+    d = np.maximum(dry_d * P * np.exp(0.8 * r.standard_normal(k)), 1.0)
+    w = np.maximum(wet_d * P * np.exp(0.7 * r.standard_normal(k)), 1.0)
+    seg = np.empty(2 * k)
+    seg[0::2] = d
+    seg[1::2] = w
+    edges = np.cumsum(seg) - r.uniform(0.0, seg[0] + seg[1])
+    idx = np.searchsorted(edges, np.arange(m, dtype=np.float64), side="right")
+    return (idx % 2) == 1
+
+def _yk_storms(r, m, P, wet, rate_w, rate_d, dur_h, depth_sd, cap=8.0):
+    lam_max = max(rate_w, rate_d, 1e-9)
+    N = int(r.poisson(lam_max * m / P))
+    t0 = r.integers(0, m, N)
+    lam = np.where(wet[t0], rate_w, rate_d)
+    keep = r.random(N) * lam_max < lam
+    t0 = t0[keep]
+    N = t0.size
+    D = np.maximum(np.rint(dur_h * P / 24.0 * np.exp(0.7 * r.standard_normal(N))), 1.0).astype(np.int64)
+    depth = np.minimum(np.exp(depth_sd * r.standard_normal(N)), cap)
+    du = np.zeros(m + 1)
+    np.add.at(du, t0, depth / D)
+    np.add.at(du, np.minimum(t0 + D, m), -depth / D)
+    return np.maximum(np.cumsum(du[:m]), 0.0)
+
+def _yk_river(r, n, P, base, p_big, drift_sd=_YK_DRIFT_SD, wander=_YK_WANDER, p_mid=0.28, p_strong=0.07, dsd=(0.7, 1.3),
+              cap=8.0):
+    M = 1024 * (-(-(n + 1024) // 1024))
+    big = r.random() < p_big
+    wet = _yk_spells(r, M, P, _yk_lu(r, 1.0, 6.0), _yk_lu(r, 2.0, 14.0))
+    rate_w = _yk_lu(r, 0.4, 3.0)
+    u0 = _yk_storms(r, M, P, wet, rate_w, rate_w * r.uniform(0.0, 0.12), _yk_lu(r, *_YK_STORM_H), r.uniform(*dsd), cap)
+    ub0 = float(_v2_meanm(u0))
+    if ub0 <= 0:
+        u0 = u0 + 1.0
+        ub0 = 1.0
+    w = np.exp(np.arange(M // 2 + 1) * (-_YK_TWO_PI * 1j / M))
+
+    phs = float(np.exp(-1.0 / (_yk_lu(r, 2.0, 20.0) * P)))
+    S = np.fft.irfft(np.fft.rfft(u0 - ub0) * ((1.0 - phs) / (1.0 - phs * w)), M) / ub0 + 1.0
+    u = u0 * (r.uniform(0.15, 1.0) + np.maximum(S, 0.0) ** r.uniform(0.3, 1.0))
+    ub = float(_v2_meanm(u))
+
+    a = r.uniform(1.2, 4.0)
+    tp = _yk_lu(r, *(_YK_TP_BIG if big else _YK_TP)) * P / 24.0
+    tt = (np.arange(M, dtype=np.float64) + 0.5) * ((a - 1.0) / tp)
+    g = np.exp((a - 1.0) * np.log(tt) - tt)
+    phi_i = float(np.exp(-1.0 / (_yk_lu(r, 0.5, 6.0) * P)))
+    phi_b = float(np.exp(-1.0 / (_yk_lu(r, 10.0, 80.0) * P)))
+    wf = r.uniform(0.45, 0.9) * (0.5 if big else 1.0)
+    wi = r.uniform(0.1, 0.7) * (1.0 - wf)
+    wb = 1.0 - wf - wi
+    H = wf * np.fft.rfft(g / g.sum()) + wi * (1.0 - phi_i) / (1.0 - phi_i * w) + wb * (1.0 - phi_b) / (1.0 - phi_b * w)
+    q = np.fft.irfft(np.fft.rfft(u - ub) * H, M)[:n] + ub
+    q = np.maximum(q, 0.0) / ub
+
+    t = np.arange(n, dtype=np.float64)
+    lin = 1.0 + np.clip(r.normal(0.0, drift_sd), -1.8, 1.8) * (t / n - 0.5)
+    q = _yk_lu(r, *base) * lin * np.exp(r.uniform(*wander) * _yk_slow(r, n, P * _yk_lu(r, 3.0, 20.0))) + q
+
+    u_amp = r.random()
+    amp = _yk_lu(r, 0.001, 0.02) if u_amp < 1.0 - p_mid - p_strong else \
+        (_yk_lu(r, 0.02, 0.1) if u_amp < 1.0 - p_strong else _yk_lu(r, 0.1, 0.3))
+    ph = r.uniform(0.0, _YK_TWO_PI)
+    cyc = np.cos(_YK_TWO_PI * t / P + ph) + r.uniform(0.0, 0.5) * np.cos(2.0 * _YK_TWO_PI * t / P + r.uniform(0.0, _YK_TWO_PI))
+    q = q * (1.0 + amp * cyc / 1.5)
+    return q
+
+def _yk_gapfill(r, x, rate):
+    n = x.size
+    k = int(r.poisson(rate * n / 1000.0))
+    if k == 0 or n < 80:
+        return x
+    s = r.integers(1, n - 40, k)
+    ln = np.minimum(np.rint(np.exp(r.uniform(np.log(2.0), np.log(30.0), k))).astype(np.int64), n - 4 - s)
+    for a, w in zip(s.tolist(), ln.tolist()):
+        if w < 1:
+            continue
+        b = a + w
+        x[a:b] = x[a - 1] + (x[b] - x[a - 1]) * (np.arange(1, w + 1) / (w + 1.0))
+    return x
+
+def _yk_stuck(r, x):
+    n = x.size
+    w = int(_yk_lu(r, 16.0, 400.0))
+    if n < w + 160:
+        return x
+    a = int(r.integers(1, n - w - 64))
+    x[a:a + w] = x[a - 1]
+    return x
+
+def _yk_glitch(r, x, scale):
+    n = x.size
+    k = int(r.integers(1, 4))
+    at = r.integers(1, n - 1, k)
+    x[at] = x[at] + scale * r.choice(np.array([-1.0, 1.0]), k) * np.exp(r.uniform(np.log(0.5), np.log(2.5), k))
+    return x
+
+def _yk_quant(x, tick):
+    y = np.round(x / tick) * tick
+    if tick >= 1.0:
+        return y
+    dec = int(round(-np.log10(tick)))
+    return np.round(y, dec) if abs(10.0 ** -dec - tick) < 1e-12 else y
+
+def _yk_sig3(x):
+    ax = np.abs(x)
+    e = np.where(ax > 0, 10.0 ** (np.floor(np.log10(np.maximum(ax, 1e-300))) - 2.0), 1.0)
+    return np.round(x / e) * e
+
+def _yk_artefacts(r, x, tick, span):
+    x = _yk_gapfill(r, x, _yk_lu(r, 0.05, 3.0))
+    if r.random() < 0.10:
+        x = _yk_stuck(r, x)
+    if r.random() < 0.06:
+        x = _yk_glitch(r, x, span)
+    return x
+
+def _yk_sluice(r, n):
+    k = int(r.integers(1, 7))
+    at = r.integers(0, n, k)
+    size = r.choice(np.array([-1.0, 1.0]), k) * np.exp(r.uniform(np.log(0.03), np.log(0.4), k))
+    dur = np.exp(r.uniform(np.log(8.0), np.log(2000.0), k)).astype(np.int64)
+    rev = r.random(k) < 0.6
+    d = np.zeros(n + 1)
+    np.add.at(d, at, size)
+    np.add.at(d, np.where(rev, np.minimum(at + dur, n), n), np.where(rev, -size, 0.0))
+    return np.cumsum(d[:n])
