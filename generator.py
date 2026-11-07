@@ -22321,3 +22321,290 @@ def _yc_steps(r, n, k, w_lo, w_hi, a_lo, a_hi, p_up):
     a = np.exp(r.uniform(np.log(a_lo), np.log(a_hi), k)) * np.where(r.random(k) < p_up, 1.0, -1.0)
     d = np.bincount(i0, weights=a, minlength=n + 1) - np.bincount(np.minimum(i0 + w, n), weights=a, minlength=n + 1)
     return np.cumsum(d)[:n]
+
+def _yc_needles(r, lx, k, d_lo, d_hi):
+    if k <= 0:
+        return lx
+    idx = r.integers(0, lx.size, k)
+    lx[idx] += np.log1p(-np.exp(r.uniform(np.log(d_lo), np.log(d_hi), k)))
+    return lx
+
+def _yc_events(r, lx, k_plat, k_bump, k_needle, size):
+    n = lx.size
+    lx = lx + _yc_steps(r, n, k_plat, 15.0, 300.0, 0.3 * size, 3.0 * size, 0.75)
+    lx = lx + _yc_steps(r, n, k_bump, 1.0, 14.0, 0.3 * size, 4.0 * size, 0.85)
+    return _yc_needles(r, lx, k_needle, 0.05, 0.9)
+
+def _yc_window(r, x):
+    k = int(np.searchsorted(_YC_WIN, r.random(), side="right"))
+    x = _yc_box(x, min(k, 3) + 2)
+    return _yc_box(x, 2) if r.random() < 0.25 else x
+
+def _yc_rate_std(r, n):
+    base = float(np.clip(np.exp(r.normal(np.log(0.27), 0.42)), 0.07, 0.62))
+    q = float(np.exp(r.normal(0.0, 0.4)))
+    prof, lvl = _yc_cycle(r, n, _yc_lu(r, 0.01, 0.12), _yc_lu(r, 0.005, 0.06), _yc_lu(r, 0.003, 0.025),
+                          r.uniform(0.5, 1.0), 1.0)
+    lc = np.log(base + (1.0 - base) * prof)
+    z = _yc_smooth(r, n, _yc_lu(r, 200.0, 1000.0), 0.015 * q * _yc_lu(r, 0.5, 2.0))
+    z = z + _yc_smooth(r, n, _yc_lu(r, 30.0, 150.0), 0.03 * q * _yc_lu(r, 0.5, 2.0))
+    z = z + _yc_ar1(r, n, _yc_lu(r, 0.3, 3.0), 0.022 * q * _yc_lu(r, 0.5, 2.0), r.uniform(0.0, 0.5))
+
+    lx = lc + lvl + z * np.exp(-r.uniform(0.2, 0.7) * (lc - float(_v2_meanm(lc))))
+    lx = _yc_events(r, lx, _yc_count(r, 0.25, 1.0, 6.0), _yc_count(r, 0.1, 3.0, 25.0), _yc_count(r, 0.3, 1.0, 10.0),
+                    0.08 * q ** 0.5 * _yc_lu(r, 0.5, 2.0))
+    if r.random() < 0.15:
+        lx = lx + _yc_steps(r, n, int(r.integers(1, 3)), 60.0, 600.0, 0.08, 0.4, 0.7)
+    if r.random() < 0.10:
+        lx[int(r.integers(0, n)):] += r.normal(0.0, 0.06)
+    level = 10.0 ** (r.uniform(8.3, 9.4) if r.random() < 0.18 else r.uniform(3.0, 5.0))
+    return _yc_store(r, _yc_window(r, level * np.exp(lx)), 0.25)
+
+def _yc_pulses(r, n, rate, w_lo, w_hi, h_lo, h_hi):
+    k = int(r.poisson(rate * n))
+    if k <= 0:
+        return np.zeros(n)
+    i0 = r.integers(0, n, k)
+    w = np.exp(r.uniform(np.log(w_lo), np.log(w_hi), k)).astype(np.int64) + 1
+    h = np.exp(r.uniform(np.log(h_lo), np.log(h_hi), k))
+    d = np.bincount(i0, weights=h, minlength=n + 1) - np.bincount(np.minimum(i0 + w, n), weights=h, minlength=n + 1)
+    return np.maximum(np.cumsum(d)[:n], 0.0)
+
+def _yc_rate_burst(r, n):
+    base = float(np.clip(np.exp(r.normal(np.log(0.55), 0.3)), 0.2, 0.85))
+    prof, lvl = _yc_cycle(r, n, _yc_lu(r, 0.05, 0.25), _yc_lu(r, 0.02, 0.1), _yc_lu(r, 0.005, 0.03), 1.0, 1.3)
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _yc_smooth(r, n, _yc_lu(r, 150.0, 800.0), _yc_lu(r, 0.04, 0.12))
+    lx = lx + _yc_smooth(r, n, _yc_lu(r, 20.0, 100.0), _yc_lu(r, 0.08, 0.22))
+    lx = lx + _yc_ar1(r, n, _yc_lu(r, 0.3, 3.0), _yc_lu(r, 0.03, 0.1), r.uniform(0.0, 0.5))
+    lx = _yc_events(r, lx, _yc_count(r, 0.1, 2.0, 10.0), 0, _yc_count(r, 0.5, 0.5, 4.0), 0.2)
+    x = np.exp(lx) * (1.0 + _yc_pulses(r, n, _yc_lu(r, 0.02, 0.12), 1.0, 14.0, 0.1, 0.8))
+    level = 10.0 ** r.uniform(4.0, 5.0)
+    x = _yc_window(r, level * x)
+    return _yc_store(r, _yc_box(x, 2) if r.random() < 0.5 else x, 0.25)
+
+def _yc_rate_shallow(r, n):
+    base = float(r.uniform(0.68, 0.9))
+    prof, lvl = _yc_cycle(r, n, _yc_lu(r, 0.05, 0.25), _yc_lu(r, 0.01, 0.05), _yc_lu(r, 0.005, 0.03), 1.0, 1.3)
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    if r.random() < 0.8:
+        k = float(r.choice(np.array([3.0, 4.0, 4.0, 4.0, 6.0])))
+        amp = -np.log(base) * 0.5 * _yc_lu(r, 0.4, 1.4)
+        lx = lx + amp * np.cos(np.arange(n) * (_YC_TWO_PI * k / _YC_P) + r.uniform(0.0, _YC_TWO_PI))
+    sw = float(_v2_std(lx))
+    lx = lx + _yc_smooth(r, n, _yc_lu(r, 150.0, 800.0), sw * _yc_lu(r, 0.15, 0.5))
+    lx = lx + _yc_smooth(r, n, _yc_lu(r, 15.0, 90.0), sw * _yc_lu(r, 0.5, 1.2))
+    lx = lx + _yc_ar1(r, n, _yc_lu(r, 0.5, 4.0), sw * _yc_lu(r, 0.25, 0.6), r.uniform(0.3, 0.8))
+    lx = _yc_events(r, lx, _yc_count(r, 0.1, 2.0, 10.0), _yc_count(r, 0.2, 2.0, 15.0), 0, sw * _yc_lu(r, 0.5, 1.5))
+    level = 10.0 ** r.uniform(4.3, 6.1)
+    x = _yc_window(r, level * np.exp(lx))
+    return _yc_store(r, _yc_box(x, 2) if r.random() < 0.5 else x, 0.4)
+
+def _yc_rate_error(r, n):
+    base = float(r.uniform(0.15, 0.7))
+    prof, lvl = _yc_cycle(r, n, _yc_lu(r, 0.05, 0.3), _yc_lu(r, 0.01, 0.1), _yc_lu(r, 0.003, 0.02), 1.0, 1.3)
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _yc_smooth(r, n, _yc_lu(r, 30.0, 300.0), _yc_lu(r, 0.1, 0.3))
+    lx = lx + _yc_ar1(r, n, _yc_lu(r, 0.3, 2.0), _yc_lu(r, 0.05, 0.22), r.uniform(0.2, 0.9))
+    x = np.exp(lx) * (1.0 + _yc_pulses(r, n, _yc_lu(r, 0.002, 0.03), 1.0, 8.0, 0.4, 6.0))
+    if r.random() < 0.3:
+        x = _yc_window(r, x)
+    level = 10.0 ** r.uniform(-0.6, 0.4)
+    return _yc_store(r, level * x, 0.0)
+
+def _yc_rate(r, L):
+    u = r.random()
+    n = L if (u < 0.72 or L <= 3440) else (int(r.integers(3440, L)) if u < 0.9 else int(r.integers(2900, 3440)))
+    k = int(np.searchsorted(_YC_RATE_KINDS, r.random() * _YC_RATE_KINDS[-1], side="right"))
+    if k <= 0:
+        x = _yc_rate_std(r, n)
+    elif k == 1:
+        x = _yc_rate_burst(r, n)
+    elif k == 2:
+        x = _yc_rate_shallow(r, n)
+    else:
+        x = _yc_rate_error(r, n)
+    return _yc_pad(np.maximum(x, 0.0), L)
+
+def _yc_tide(r, L):
+    n = L if (r.random() < 0.33 or L <= 1024) else int(_yc_lu(r, 400.0, float(L)))
+    n = max(64, min(n, L))
+    t = np.arange(n, dtype=np.float64) + r.uniform(0.0, 5e5)
+    a2 = _yc_lu(r, 0.03, 1.4)
+    form = float(np.clip(np.exp(r.normal(np.log(0.52), 0.95)), 0.03, 8.0))
+    s2 = a2 * 0.46 * float(np.exp(r.normal(0.0, 0.35)))
+    a1 = form * (a2 + s2)
+    k1 = a1 * r.uniform(0.5, 0.66)
+    shallow = r.random() < 0.15
+    r4 = r.uniform(0.07, 0.3) if shallow else float(min(np.exp(r.normal(np.log(0.03), 0.8)), 0.25))
+    amps = np.array([a2, s2, a2 * 0.19 * float(np.exp(r.normal(0.0, 0.3))), k1, a1 - k1,
+                     (a1 - k1) * 0.19 * float(np.exp(r.normal(0.0, 0.3))), a2 * r4, a2 * r4 * r.uniform(0.3, 0.7),
+                     a2 * (r.uniform(0.03, 0.1) if shallow else float(min(np.exp(r.normal(np.log(0.012), 0.8)), 0.08))),
+                     a2 * float(min(np.exp(r.normal(np.log(0.03), 0.8)), 0.2))])
+    ph = r.uniform(0.0, _YC_TWO_PI, amps.size)
+    x = np.zeros(n)
+    for j in range(amps.size):
+        x += amps[j] * np.cos(t * (_YC_TWO_PI / _YC_TIDE_PER[j]) + ph[j])
+    a_tot = float(a2 + s2 + a1)
+
+    s_surge = float(np.clip(a_tot * np.exp(r.normal(np.log(0.1), 0.6)), 0.006, 0.35)) + _yc_lu(r, 0.003, 0.025)
+    x = x + _yc_smooth(r, n, r.uniform(120.0, 1440.0), s_surge)
+    if r.random() < 0.65:
+        p_s = _yc_lu(r, 8.0, 90.0)
+        amp_s = _yc_lu(r, 0.0015, 0.035) * (r.uniform(1.5, 4.0) if (a_tot < 0.1 and r.random() < 0.5) else 1.0)
+        env = np.exp(_yc_smooth(r, n, 18.0 * 60.0 / 3.0, 0.45))
+        psi = np.cumsum(r.standard_normal(n)) * float(np.sqrt(_YC_TWO_PI / (p_s * r.uniform(4.0, 25.0))))
+        x = x + amp_s * env * np.cos(t * (_YC_TWO_PI / p_s) + psi)
+
+    noisy = r.random() < 0.15
+    s_w = a_tot * float(np.exp(r.normal(np.log(0.18), 0.5) if noisy else r.normal(np.log(0.008), 1.5)))
+    s_w = min(max(s_w, 0.0003), 0.25)
+    if noisy or r.random() < 0.35:
+        e = r.standard_t(float(r.uniform(2.1, 3.5) if noisy else r.uniform(2.5, 6.0)), n)
+        e = e / max(float(_v2_stdm(e)), 1e-9)
+    else:
+        e = r.standard_normal(n)
+    fw = r.uniform(0.5, 1.0) if noisy else r.uniform(0.0, 0.75)
+    x = x + s_w * (fw * e + np.sqrt(1.0 - fw * fw) * _yc_ar1(r, n, _yc_lu(r, 1.5, 8.0), 1.0))
+    if r.random() < 0.12:
+        k = int(r.poisson(max(n * r.uniform(0.0002, 0.001), 0.5))) + 1
+        idx = r.integers(0, n, k)
+        x[idx] += np.where(r.random(k) < 0.5, -1.0, 1.0) * r.uniform(4.0, 30.0, k) * max(s_w, 0.004)
+    if r.random() < 0.04:
+        x[int(r.integers(n // 8, n - n // 8)):] += (1.0 if r.random() < 0.5 else -1.0) * r.uniform(0.02, 0.3)
+    half = 1.1 * float(np.max(np.abs(x)))
+    u = r.random()
+    if u < 0.66:
+        datum = half * r.uniform(0.9, 2.0) + r.uniform(0.0, 0.6)
+    elif u < 0.72:
+        datum = r.uniform(2.0, 4.5)
+    elif u < 0.93:
+        datum = -r.uniform(1.2, 8.5)
+    else:
+        datum = half * r.uniform(-0.8, 0.8)
+    u = r.random()
+    q = 0.001 if u < 0.9 else 0.0001
+    return _yc_pad(np.round((x + datum) / q) * q, L)
+
+def _yc_min1440(r, L):
+    try:
+        L = int(L)
+        if L < 256:
+            return None
+        with np.errstate(all="ignore"):
+            w = _yc_rate(r, L) if r.random() < _YC_MIX[0] else _yc_tide(r, L)
+        if (isinstance(w, np.ndarray) and w.shape == (L,) and bool(np.all(np.isfinite(w)))
+                and float(w.max()) > float(w.min()) and float(np.max(np.abs(w))) < 1e12):
+            return np.ascontiguousarray(w, dtype=np.float64)
+    except Exception:
+        pass
+    return None
+
+_YD_KIND_CUM = (0.45, 0.905)
+_YD_POST = 0.95
+
+_YD_LEN_CUM = ((0.69, 0.74, 0.81, 1.00), (0.53, 0.545, 0.56, 1.00), (0.28, 0.28, 0.40, 0.93))
+_YD_LEN_LO = (2380, 2720, 800, 380)
+_YD_LEN_HI = (2720, 3100, 2380, 800)
+_YD_SHORT_HI = (640, 800, 640)
+_YD_MKT_CUM = (0.57, 0.72)
+_YD_MIRROR = 0.04
+_YD_GRID = (0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.125, 0.5, 0.1, 0.05)
+
+def _yd_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yd_len(r, L, kind):
+    c = _YD_LEN_CUM[kind]
+    u = r.random()
+    j = 0
+    while j < 4 and u >= c[j]:
+        j += 1
+    if j >= 4:
+        return int(L)
+    n = int(r.integers(_YD_LEN_LO[j], (_YD_SHORT_HI[kind] if j == 3 else _YD_LEN_HI[j]) + 1))
+    return int(max(64, min(n, L)))
+
+def _yd_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+def _yd_ou(z, tau, x0):
+    n = z.size
+    tau = max(float(tau), 8.0, n / 600.0)
+    g = np.exp(np.arange(n, dtype=np.float64) / tau)
+    return (x0 + np.cumsum(z * g)) / g
+
+def _yd_volreg(r, n, mean_len, s):
+    k = int(n / mean_len * 1.6) + 8
+    lens = (1.0 + r.exponential(mean_len, k)).astype(np.int64)
+    v = np.exp(r.normal(0.0, s, k) - s * s)
+    out = np.repeat(v, lens)
+    if out.size < n:
+        out = np.concatenate((out, np.full(n - out.size, v[-1])))
+    return out[:n]
+
+def _yd_smooth(x, w):
+    h = int(w) // 2
+    if h < 1 or x.size < 2:
+        return x
+    c = np.cumsum(np.concatenate((np.full(h + 1, x[0]), x, np.full(h, x[-1]))))
+    return (c[2 * h + 1:] - c[:-(2 * h + 1)]) / float(2 * h + 1)
+
+def _yd_carry(r, x, p):
+    n = x.size
+    if p <= 0.0 or n < 3:
+        return x
+    h = r.random(n) < p
+    h[0] = False
+    return x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
+
+def _yd_cycle(r, tb, f):
+
+    d_rise = r.uniform(230.0, 560.0)
+    d_top = r.uniform(60.0, 340.0)
+    d_ret = r.uniform(240.0, 660.0)
+    if r.random() < _YD_POST:
+        e = r.uniform(430.0, 800.0)
+    else:
+        e = r.uniform(-(d_top + 0.9 * d_rise), 1900.0)
+    t_ret = -e
+    t_top = t_ret - d_top
+    t_rise = t_top - d_rise
+    top2 = 1.0 + r.uniform(-0.05, 0.05)
+    kt = [t_rise, t_rise + 0.45 * d_rise, t_top, t_ret, t_ret + 0.4 * d_ret, t_ret + d_ret]
+    kv = [0.0, r.uniform(0.48, 0.72), 1.0, top2, top2 - f * r.uniform(0.42, 0.7), top2 - f]
+    if r.random() < 0.35:
+        a0 = r.uniform(0.12, 0.5)
+        t2e = t_rise - r.uniform(200.0, 1300.0)
+        t2s = t2e - r.uniform(120.0, 450.0)
+        t1e = t2s - r.uniform(40.0, 400.0)
+        t1s = t1e - r.uniform(200.0, 650.0)
+        c0 = r.uniform(-0.1, 0.2)
+        kt = [t1s, t1e, t2s, t2e] + kt
+        kv = [c0, c0 + a0, c0 + a0, r.uniform(-0.08, 0.12)] + kv
+    else:
+        kt = [t_rise - r.uniform(600.0, 2600.0)] + kt
+        kv = [r.uniform(-0.1, 0.25)] + kv
+    if r.random() < 0.40:
+        t3 = kt[-1] + r.uniform(30.0, 350.0)
+        kt = kt + [t3, t3 + r.uniform(60.0, 350.0)]
+        kv = kv + [kv[-1], kv[-1] + r.uniform(-0.15, 0.25)]
+    return np.interp(tb, np.array(kt), np.array(kv))
+
+def _yd_stairs(r, lvl, gap, q):
+    n = lvl.size
+    k = int(n / (0.8 * gap)) + 3
+    m = np.concatenate(([0.0], np.cumsum(r.uniform(0.8, 1.25, k) * gap))) - r.uniform(0.0, 0.8 * gap)
+    v = np.round(lvl[np.clip(m, 0.0, n - 1.0).astype(np.int64)] / q) * q
+    return v[np.searchsorted(m, np.arange(n, dtype=np.float64), side="right") - 1]
+
+def _yd_round(r, x, cum):
+    u = r.random()
+    return np.round(x, 2 if u < cum[0] else 3 if u < cum[1] else 4 if u < cum[2] else 5)
