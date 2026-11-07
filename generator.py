@@ -29032,3 +29032,292 @@ _apply_tail_rebase = _c251_apply_tail_rebase
 # uint64), pcg64_set_seed, has_uint32 = uinteger = 0), so every later draw is bit-identical; no RNG call is added,
 # removed or reordered anywhere.
 from numpy.random.bit_generator import ISpawnableSeedSequence as _C251ISS
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_first_doubles(words, out):
+    # words[k] = generate_state(4, uint64) of a SeedSequence; out[k] = Generator(PCG64(seed_seq)).random()
+    one = np.uint64(1)
+    s63 = np.uint64(63)
+    for k in range(words.shape[0]):
+        ih = (words[k, 2] << one) | (words[k, 3] >> s63)
+        il = (words[k, 3] << one) | one
+        lo = il + words[k, 1]
+        hi = ih + words[k, 0] + (one if lo < il else np.uint64(0))
+        hi, lo = _fcx_nb_step(hi, lo, ih, il)
+        hi, lo = _fcx_nb_step(hi, lo, ih, il)
+        out[k] = _fcx_nb_out(hi, lo)
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_ss_words(pool, hc, extra, out):
+    # numpy SeedSequence: mix the extra entropy words (here: the spawn key) into a cached 4-word pool, continuing the
+    # hash-constant sequence (hashmix / mix of _bit_generator.pyx), then generate_state(4, uint64).
+    m32 = np.uint64(0xFFFFFFFF)
+    s16 = np.uint64(16)
+    s32 = np.uint64(32)
+    ma = np.uint64(0x931E8875)
+    mb = np.uint64(0x58F38DED)
+    ml = np.uint64(0xCA01F9DD)
+    mr = np.uint64(0x4973F715)
+    p = np.empty(4, dtype=np.uint64)
+    for d in range(4):
+        p[d] = pool[d]
+    h = hc
+    for s in range(extra.shape[0]):
+        for d in range(4):
+            v = extra[s] ^ h
+            h = (h * ma) & m32
+            v = (v * h) & m32
+            v = v ^ (v >> s16)
+            r = (ml * p[d] - mr * v) & m32
+            p[d] = r ^ (r >> s16)
+    hb = np.uint64(0x8B51F9DD)
+    for j in range(4):
+        v0 = p[(2 * j) & 3] ^ hb
+        hb = (hb * mb) & m32
+        v0 = (v0 * hb) & m32
+        v0 = v0 ^ (v0 >> s16)
+        v1 = p[(2 * j + 1) & 3] ^ hb
+        hb = (hb * mb) & m32
+        v1 = (v1 * hb) & m32
+        v1 = v1 ^ (v1 >> s16)
+        out[j] = (v1 << s32) | v0
+
+
+class _C251SeedSeq(_C251ISS):
+    """Stand-in seed sequence for np.random.SeedSequence(entropy, spawn_key=spawn_key): PCG64.__init__ takes the
+    precomputed generate_state(4, uint64) words once; everything else (spawn, entropy, spawn_key, pool, state, ...)
+    is answered by a lazily built REAL SeedSequence with the same arguments, so Generator.spawn() and seed_seq
+    introspection by layers stacked on top see exactly what they would with uid76."""
+    __slots__ = ("_c251_e", "_c251_k", "_c251_w", "_c251_r")
+
+    def __init__(self, entropy, spawn_key, words):
+        self._c251_e = entropy
+        self._c251_k = spawn_key
+        self._c251_w = words
+        self._c251_r = None
+
+    def _c251_real(self):
+        r = self._c251_r
+        if r is None:
+            r = self._c251_r = np.random.SeedSequence(self._c251_e, spawn_key=self._c251_k)
+        return r
+
+    def generate_state(self, n_words, dtype=np.uint32):
+        w = self._c251_w
+        if w is not None and n_words == 4 and dtype is np.uint64:
+            self._c251_w = None
+            return w
+        return self._c251_real().generate_state(n_words, dtype)
+
+    def spawn(self, n_children):
+        return self._c251_real().spawn(n_children)
+
+    @property
+    def entropy(self):
+        return self._c251_e
+
+    @property
+    def spawn_key(self):
+        return self._c251_real().spawn_key
+
+    @property
+    def pool_size(self):
+        return self._c251_real().pool_size
+
+    @property
+    def n_children_spawned(self):
+        return self._c251_real().n_children_spawned
+
+    @property
+    def pool(self):
+        return self._c251_real().pool
+
+    @property
+    def state(self):
+        return self._c251_real().state
+
+    def __repr__(self):
+        return repr(self._c251_real())
+
+
+_C251_SS_POOLS = {}
+_C251_SS_ON = [True]
+_C251_M32 = 0xFFFFFFFF
+
+
+def _c251_rng(entropy, spawn_key):
+    """== np.random.default_rng(np.random.SeedSequence(entropy, spawn_key=spawn_key)) for a list/tuple of
+    non-negative Python ints as entropy and a non-empty tuple of non-negative Python ints as spawn key."""
+    if _C251_SS_ON[0]:
+        key = (entropy,) if type(entropy) is int else tuple(entropy)
+        e = _C251_SS_POOLS.get(key)
+        if e is None:
+            ok = len(key) > 0 and all(type(v) is int and v >= 0 for v in key)
+            if ok:
+                c = _FastCoin(list(key))
+                e = (np.array(c._pool, dtype=np.uint64), np.uint64(c._hc))
+                if len(_C251_SS_POOLS) > 4096:
+                    _C251_SS_POOLS.clear()
+                _C251_SS_POOLS[key] = e
+        if e is not None and spawn_key:
+            xs = []
+            for v in spawn_key:
+                if type(v) is not int or v < 0:
+                    xs = None
+                    break
+                if v == 0:
+                    xs.append(0)
+                while v > 0:
+                    xs.append(v & _C251_M32)
+                    v >>= 32
+            if xs is not None:
+                w = np.empty(4, dtype=np.uint64)
+                _c251_ss_words(e[0], e[1], np.array(xs, dtype=np.uint64), w)
+                return np.random.Generator(np.random.PCG64(_C251SeedSeq(entropy, tuple(spawn_key), w)))
+    return np.random.default_rng(np.random.SeedSequence(entropy, spawn_key=spawn_key))
+
+
+def _c251_selftest_rng():
+    big = 5125841920496347586
+    keys = [([0, 0], (0,)), ([1, 2], (3,)), ([big, 0x59C0_0001], (12345,)), ([2 ** 64 - 1, 0xC124B002], (2 ** 32 - 1,)),
+            ([2 ** 32, 7, 9], (2 ** 32,)), ([123, 0x59E0_0011], (5, 2)), ([big, 0x59C0_0001, 3], (0,)),
+            ([big], (7,)), ([0], (2 ** 40 + 3, 1)), (1234567, (9,)), (big, (0,)), (2 ** 31 - 1, (77777,))]
+    for ent, sk in keys:
+        a = np.random.default_rng(np.random.SeedSequence(ent, spawn_key=sk))
+        b = _c251_rng(ent, sk)
+        if a.bit_generator.state != b.bit_generator.state or not np.array_equal(a.random(3), b.random(3)):
+            return False
+        if b.bit_generator.seed_seq.entropy != ent or tuple(b.bit_generator.seed_seq.spawn_key) != tuple(sk):
+            return False
+        ca, cb = a.spawn(2), b.spawn(2)
+        if any(x.bit_generator.state != y.bit_generator.state for x, y in zip(ca, cb)):
+            return False
+    rows = [(big, 3, 17, 5, 0xC14401), (0, 0, 0, 0, 0), (2 ** 64 - 1, 9, 1, 2047, 0xC14401)]
+    for r_ in rows:
+        cols = _ss_columns([np.array([v], dtype=np.uint64) for v in r_], 1)
+        if cols is None:
+            return False
+        u = np.empty(1, dtype=np.float64)
+        _c251_first_doubles(_pcg64_seed_words(cols), u)
+        if u[0] != np.random.default_rng(np.random.SeedSequence(r_)).random():
+            return False
+    return True
+
+
+try:
+    _C251_SS_ON[0] = bool(_c251_selftest_rng())
+except Exception:
+    _C251_SS_ON[0] = False
+
+
+# ── P4: renewal-persistence gate (0.72 SeedSequence + default_rng per record, each used for ONE uniform). The gate
+# uniforms of all eligible slots are computed at once with uid76's own row-stream replica (_ss_columns /
+# _pcg64_seed_words: same entropy words (base_seed, chunk_index, fam, slot, STAGE), self-tested) + the first PCG64
+# double; slots are then visited in the same order with the same eligibility tests, and the selected slots build
+# path_rng / noise_rng and the replacement series exactly as before.
+def _c251_apply_renewal_persistence(chunk, fam_ids, base_seed, chunk_index, settings):
+    selected = np.zeros(len(chunk), dtype=bool)
+    rate = settings["rate"]
+    if rate <= 0.0:
+        return selected
+    eligible = settings["eligible_families"]
+    slots = []
+    fams = []
+    for slot, old in enumerate(chunk):
+        fam = int(fam_ids[slot])
+        if old is None or old.size == 0 or _FAMILIES[fam] not in eligible:
+            continue
+        slots.append(slot)
+        fams.append(fam)
+    if not slots:
+        return selected
+    gate = None
+    if _C251_SS_ON[0] and int(base_seed) >= 0 and int(chunk_index) >= 0:
+        cols = _ss_columns([int(base_seed), int(chunk_index), np.array(fams, dtype=np.uint64),
+                            np.array(slots, dtype=np.uint64), _RENEWAL_SELECT_STAGE], len(slots))
+        if cols is not None:
+            gate = np.empty(len(slots), dtype=np.float64)
+            _c251_first_doubles(_pcg64_seed_words(cols), gate)
+    for j in range(len(slots)):
+        slot = slots[j]
+        fam = fams[j]
+        old = chunk[slot]
+        coords = (int(base_seed), int(chunk_index), fam, slot)
+        if gate is not None:
+            u = gate[j]
+        else:
+            u = np.random.default_rng(np.random.SeedSequence((*coords, _RENEWAL_SELECT_STAGE))).random()
+        if u >= rate:
+            continue
+        path_rng = np.random.default_rng(np.random.SeedSequence((*coords, _RENEWAL_PATH_STAGE)))
+        noise_rng = np.random.default_rng(np.random.SeedSequence((*coords, _RENEWAL_NOISE_STAGE)))
+        chunk[slot] = _renewal_persistence_series(path_rng, noise_rng, int(old.size), settings)
+        selected[slot] = True
+    return selected
+
+
+_apply_renewal_persistence = _c251_apply_renewal_persistence
+
+
+# ═══════════════ c251-P5: exact numba _yqh_station (YQH station-hold scan, ~1.5 calls/record once C91/YQH open). ═══════════════
+# Same tests in the same order on the same values: all finite; d = s[t+1] - s[t] (np.diff); mv = d != 0.0;
+# >= 4 moves; real = s[mv[0]:] with size >= 256, min >= 0, max <= cap; mean(real == rint(real)) >= 0.98 (a mean of
+# booleans is the exact count / size; rint = round-half-even, an exact IEEE operation); np.median(|d[mv]|) <= 1.0
+# with numpy's median value: middle order statistic (odd n) or (0.0 + ((0.0 + a) + b)) / 2.0 (even n; identity-start
+# add.reduce then true_divide). The |d| are > 0, so the selected order statistics are sign-free and unique in value.
+# No RNG. Non-float inputs keep uid76's path.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_yqh_station_nb(s, cap):
+    n = s.shape[0]
+    for t in range(n):
+        if not np.isfinite(s[t]):
+            return False
+    if n < 2:
+        return False
+    cnt = 0
+    first = -1
+    for t in range(n - 1):
+        if s[t + 1] - s[t] != 0.0:
+            if first < 0:
+                first = t
+            cnt += 1
+    if cnt < 4:
+        return False
+    m = n - first
+    if m < 256:
+        return False
+    lo = s[first]
+    hi = s[first]
+    k = 0
+    for t in range(first, n):
+        v = s[t]
+        if v < lo:
+            lo = v
+        if v > hi:
+            hi = v
+        if v == np.rint(v):
+            k += 1
+    if lo < 0.0 or hi > cap:
+        return False
+    if k / m < 0.98:
+        return False
+    a = np.empty(cnt, dtype=np.float64)
+    j = 0
+    for t in range(n - 1):
+        dd = s[t + 1] - s[t]
+        if dd != 0.0:
+            a[j] = abs(dd)
+            j += 1
+    h = cnt // 2
+    _c251_kth(a, 0, cnt, h)
+    if cnt % 2 == 1:
+        med = 0.0 + a[h]
+    else:
+        lo2 = a[0]
+        for t in range(1, h):
+            if a[t] > lo2:
+                lo2 = a[t]
+        med = (0.0 + ((0.0 + lo2) + a[h])) / 2.0
+    return med <= 1.0
