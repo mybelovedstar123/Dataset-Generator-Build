@@ -1,9 +1,107 @@
+# cascade era 2594 entry
 from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
+
+_FC_M32 = 0xFFFFFFFF
+
+def _fc_words(v):
+    v = int(v)
+    if v < 0:
+        raise ValueError("negative entropy")
+    if v == 0:
+        return [0]
+    out = []
+    while v > 0:
+        out.append(v & _FC_M32)
+        v >>= 32
+    return out
+
+class _FastCoin:
+
+    __slots__ = ("_pool", "_hc", "_cache")
+
+    def __init__(self, entropy):
+        run = []
+        for e in entropy:
+            run += _fc_words(e)
+        if len(run) < 4:
+            run += [0] * (4 - len(run))
+        hc = 0x43B0D7E5
+        pool = []
+        for i in range(4):
+            v = (run[i] ^ hc) & _FC_M32
+            hc = (hc * 0x931E8875) & _FC_M32
+            v = (v * hc) & _FC_M32
+            pool.append(v ^ (v >> 16))
+        for s in range(4):
+            for d in range(4):
+                if s != d:
+                    v = (pool[s] ^ hc) & _FC_M32
+                    hc = (hc * 0x931E8875) & _FC_M32
+                    v = (v * hc) & _FC_M32
+                    v ^= v >> 16
+                    r = (0xCA01F9DD * pool[d] - 0x4973F715 * v) & _FC_M32
+                    pool[d] = r ^ (r >> 16)
+        for s in range(4, len(run)):
+            for d in range(4):
+                v = (run[s] ^ hc) & _FC_M32
+                hc = (hc * 0x931E8875) & _FC_M32
+                v = (v * hc) & _FC_M32
+                v ^= v >> 16
+                r = (0xCA01F9DD * pool[d] - 0x4973F715 * v) & _FC_M32
+                pool[d] = r ^ (r >> 16)
+        self._pool = tuple(pool)
+        self._hc = hc
+        self._cache = {}
+
+    def _consts(self, n_spawn):
+        c = self._cache.get(n_spawn)
+        if c is None:
+            hc = self._hc
+            seq = []
+            for _ in range(4 * n_spawn):
+                a = hc
+                hc = (hc * 0x931E8875) & _FC_M32
+                seq.append((a, hc))
+            hb = 0x8B51F9DD
+            out = []
+            for _ in range(8):
+                a = hb
+                hb = (hb * 0x58F38DED) & _FC_M32
+                out.append((a, hb))
+            c = (tuple(seq), tuple(out))
+            self._cache[n_spawn] = c
+        return c
+
+_FC_POOL = {}
+
+def _fcx_get(seed, tag):
+    key = (seed, tag)
+    e = _FC_POOL.get(key)
+    if e is None:
+        c = _FastCoin([seed, tag])
+        seq, outc = c._consts(1)
+        e = (c, np.array(c._pool, dtype=np.uint64), np.array(seq, dtype=np.uint64).reshape(4, 2),
+             np.array(outc, dtype=np.uint64).reshape(8, 2))
+        _FC_POOL[key] = e
+    return e
+
+def _fcx_coin(seed, tag, i):
+    if type(seed) is int and type(tag) is int and type(i) is int and seed >= 0 and tag >= 0 and 0 <= i <= _FC_M32:
+        c, p, q, o = _fcx_get(seed, tag)
+        return _fcx_nb_one(p, q, o, i)
+    return np.random.default_rng(np.random.SeedSequence([seed, tag], spawn_key=(i,))).random()
+
+def _fcx_coins(seed, tag, i, size):
+    if (type(seed) is int and type(tag) is int and type(i) is int and type(size) is int and seed >= 0 and tag >= 0
+            and 0 <= i <= _FC_M32 and size >= 0):
+        c, p, q, o = _fcx_get(seed, tag)
+        return _fcx_nb_many(p, q, o, i, size)
+    return np.random.default_rng(np.random.SeedSequence([seed, tag], spawn_key=(i,))).random(size)
 
 from cascade.interface import DataGenerator
 
