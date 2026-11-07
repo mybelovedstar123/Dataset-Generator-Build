@@ -14635,19 +14635,11 @@ class _pt_Generator(DataGenerator):
             np.clip(x, -3e+37, 3e+37, out=x)
             yield x
 
-
-# ═════════════════════════════ the generator ═════════════════════════════════
-# Probability that a row gets a partner-family second channel, and the
-
-# ---- Own-code teaching partner families (pandemic-to-endemic sums, syndromic
-# percent feeds, exchange traffic, sub-daily profiles, tides, rain, river stage,
-# counters, generic dynamics, held levels). ----
-import math  # noqa: E402
-from numba import njit  # noqa: E402
+import math
+from numba import njit
 
 _T_YEAR = 365.25
 _T_MASK32 = 0xFFFFFFFF
-
 
 @njit(cache=False, fastmath=False, nogil=True)
 def _t_ar1(innov, phi):
@@ -14661,10 +14653,8 @@ def _t_ar1(innov, phi):
             out[i, t] = prev
     return out
 
-
 @njit(cache=False, fastmath=False, nogil=True)
 def _t_bump_kernel(cen, amp, wl, wr, p_l, p_r, flat, out):
-    """out[i, j] += expm1(a * max(1 - |d/w|^p, 0)) on each wave's own support only."""
     n, K = cen.shape
     W = out.shape[1]
     for i in range(n):
@@ -14693,9 +14683,7 @@ def _t_bump_kernel(cen, amp, wl, wr, p_l, p_r, flat, out):
                     out[i, j] += math.expm1(a * (1.0 - x))
     return out
 
-
 def _t_bumps_fast(W, cen, amp, rise, fall, p_l, p_r, flat):
-    """Same bump sum as _t_bumps on a width-W grid whose column j is time j."""
     root = np.sqrt(np.log(5.0) / np.maximum(amp, 1e-6))
     f = np.ascontiguousarray
     out = np.zeros((cen.shape[0], int(W)))
@@ -14703,16 +14691,12 @@ def _t_bumps_fast(W, cen, amp, rise, fall, p_l, p_r, flat):
                           f(fall / root, dtype=np.float64), f(p_l, dtype=np.float64), f(p_r, dtype=np.float64),
                           f(flat, dtype=np.float64), out)
 
-
 def _t_ar1_rows(rng, n, L, phi, sd):
-    """Stationary unit-scaled AR(1) rows times per-row sd (phi, sd: (n,) arrays)."""
     e = rng.standard_normal((n, L))
     e *= (sd * np.sqrt(np.maximum(1.0 - phi * phi, 1e-12)))[:, None]
     return _t_ar1(e, np.ascontiguousarray(phi, dtype=np.float64))
 
-
 def _t_pad_left(x, S):
-    """Keep the last S[i] points of row i and repeat its first kept value before them."""
     n, L = x.shape
     S = np.clip(np.asarray(S, dtype=np.int64).reshape(-1), 64, L)
     start = L - S
@@ -14720,16 +14704,12 @@ def _t_pad_left(x, S):
     first = x[np.arange(n), start][:, None]
     return np.where(col < start[:, None], first, x)
 
-
 def _t_eval_len(rng, n, lo=260.0):
-    """Series lengths following the eval pool's context+horizon CDF."""
     u = rng.random(n)
     return np.interp(u, [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.0],
                      [lo, 520.0, 1000.0, 2300.0, 3500.0, 4096.0, 4096.0])
 
-
 def _t_bumps(t, cen, amp, rise, fall, p_l, p_r, flat):
-    """sum_k expm1(a_k * max(1 - |d/w|^p, 0)), flat top of flat_k days; computed on support only."""
     n, K = cen.shape
     L = t.shape[-1]
     out = np.zeros((n, L))
@@ -14753,7 +14733,6 @@ def _t_bumps(t, cen, amp, rise, fall, p_l, p_r, flat):
         out[:, j0:j1] += np.expm1(amp[:, k:k + 1] * np.maximum(1.0 - x, 0.0))
     return out
 
-
 def _t_weekday(rng, n, L, sd=0.08, we_lo=0.55, we_hi=0.95):
     prof = np.exp(rng.normal(0.0, sd, size=(n, 7)))
     prof[:, 5:] *= rng.uniform(we_lo, we_hi, size=(n, 1))
@@ -14761,27 +14740,11 @@ def _t_weekday(rng, n, L, sd=0.08, we_lo=0.55, we_hi=0.95):
     ph = rng.integers(0, 7, size=(n, 1))
     return np.take_along_axis(prof, (np.arange(L)[None, :] + ph) % 7, axis=1)
 
-
 def _t_nb(rng, lam, r):
-    """Negative-binomial counts with mean lam and shape r (gamma-Poisson)."""
     g = rng.gamma(np.broadcast_to(r, lam.shape), 1.0) / r
     return rng.poisson(np.minimum(lam * g, 1e8)).astype(np.float64)
 
-
-# --------------------------------------------------------------------------- #
-# 1. pandemic -> endemic hospitalisation feeds (rki / ukhsa / nys covid)
-# --------------------------------------------------------------------------- #
 def _t_covid_waves(rng, n, L):
-    """Big pandemic-era waves, then small seasonal endemic waves on deep troughs.
-
-    Pandemic MULTIPLIES WAVE AMPLITUDES, not the floor, so every trough stays deep;
-    the endemic envelope shrinks year on year; the row ends at the live edge with
-    right-truncated reporting on 65% of rows. Observed as 7-day rolling integer SUMS
-    (60%), daily counts (20%) or 7-day incidence per 100k at a 0.01 tick (20%).
-    Built on a grid aligned at each row's onset (column j = day j of the record),
-    then right-aligned into the (n, L) block, the pre-onset span padded with the
-    first observed value (the validator's left pad).
-    """
     S = rng.integers(1700, 2751, size=n)
     W = int(S.max())
     tau = np.arange(W, dtype=np.float64)[None, :]
@@ -14814,15 +14777,14 @@ def _t_covid_waves(rng, n, L):
     p_l = np.where(sharp, rng.uniform(0.8, 1.5, size=(n, K)), 2.0)
     p_r = np.where(sharp, rng.uniform(0.7, 1.4, size=(n, K)), 2.0)
     flat = np.where((~in_pand) & (rng.random((n, K)) < 0.5), rng.uniform(8.0, 50.0, size=(n, K)), 0.0)
-    # a broad elevated plateau late in the pandemic era on 75% of rows (Omicron-like
-    # overlapping waves): it lifts that year's troughs to 10-30% of the pandemic scale
+
     has_pl = rng.random(n) < 0.75
     pl_c = (P - rng.uniform(120.0, 260.0, size=n))[:, None]
     pl_a = np.where(has_pl[:, None], scale_p + rng.uniform(np.log(0.10), np.log(0.30), size=(n, 1)), 0.0)
     pl_r = rng.uniform(40.0, 90.0, size=(n, 1))
     pl_f = rng.uniform(60.0, 140.0, size=(n, 1))
     pl_fl = rng.uniform(200.0, 330.0, size=(n, 1))
-    # summer waves (endemic era, half the seasonal rows) ride as extra columns
+
     summer = (seasonal & (rng.random(n) < 0.5))[:, None] & ~in_pand & live
     c2 = cen + rng.uniform(150.0, 230.0, size=(n, K))
     a2 = np.where(summer, np.maximum(amp + np.log(rng.uniform(0.2, 0.8, size=(n, K))), np.log(1.0001)), 0.0)
@@ -14861,20 +14823,12 @@ def _t_covid_waves(rng, n, L):
         out[i, :L - e] = obs[i, 0]
     return out
 
-
-# --------------------------------------------------------------------------- #
-# 2. syndromic percent-of-visits feeds (cdc_nssp rsv / flu / covid / ari)
-# --------------------------------------------------------------------------- #
 def _t_pct_feed(rng, n, L):
-    """Short daily feeds of the % of ED visits for one pathogen: phase-locked winter
-    waves over a pathogen-specific trough, numerator NB over a visit count, 0.01 tick,
-    troughs reaching 0 for sharp pathogens. Records of 380-1500 days, left-padded.
-    Built on the last W columns only (W = longest history in the group)."""
     S = np.exp(rng.uniform(np.log(380.0), np.log(1500.0), size=n)).astype(np.int64)
     W = int(S.max())
     kind = rng.random(n)
-    sharp = kind < 0.5                      # rsv / flu
-    covid = (kind >= 0.5) & (kind < 0.75)   # two waves a year, moderate trough
+    sharp = kind < 0.5
+    covid = (kind >= 0.5) & (kind < 0.75)
     trough = np.exp(np.where(sharp, rng.uniform(np.log(0.01), np.log(0.4), size=n),
                     np.where(covid, rng.uniform(np.log(0.1), np.log(1.5), size=n),
                              rng.uniform(np.log(1.0), np.log(12.0), size=n))))
@@ -14910,12 +14864,7 @@ def _t_pct_feed(rng, n, L):
         out[i, :L - e] = obs[i, W - e]
     return out
 
-
-# --------------------------------------------------------------------------- #
-# 3. exchange / backbone traffic with a phase-locked daily cycle (ixp_* 5-min)
-# --------------------------------------------------------------------------- #
 def _t_period_profile(rng, n, P, H, h1_always=2, p_more=0.6):
-    """(n, Pmax) one-period Fourier profiles; row i uses its first P[i] columns."""
     Pm = int(P.max())
     u = np.arange(Pm, dtype=np.float64)[None, :] / P[:, None]
     prof = np.zeros((n, Pm))
@@ -14926,14 +14875,11 @@ def _t_period_profile(rng, n, P, H, h1_always=2, p_more=0.6):
         prof += a * np.cos(2.0 * np.pi * h * u) + b * np.sin(2.0 * np.pi * h * u)
     return prof
 
-
 def _t_tile_profile(prof, P, L, rng):
-    """Row i: prof[i, (j + phase_i) mod P_i] for j < L."""
     n = prof.shape[0]
     Pi = P.astype(np.int64)
     idx = (np.arange(L)[None, :] + rng.integers(0, 1 << 30, size=(n, 1))) % Pi[:, None]
     return np.take_along_axis(prof, idx, axis=1)
-
 
 def _t_ixp_cycle(rng, n, L):
     t = np.arange(L, dtype=np.float64)[None, :]
@@ -14964,10 +14910,6 @@ def _t_ixp_cycle(rng, n, L):
     S = np.where(rng.random(n) < 0.7, 4096.0, rng.uniform(1000.0, 4096.0, size=n))
     return _t_pad_left(np.round(x), S)
 
-
-# --------------------------------------------------------------------------- #
-# 4. sub-daily profile sensors / loads / footfall (15-, 30-, 60-min)
-# --------------------------------------------------------------------------- #
 def _t_profile_cycle(rng, n, L):
     t = np.arange(L, dtype=np.float64)[None, :]
     P = rng.choice(np.array([96.0, 48.0, 24.0]), size=n, p=[0.3, 0.25, 0.45])
@@ -14981,7 +14923,7 @@ def _t_profile_cycle(rng, n, L):
     season = rng.uniform(0.0, 0.5, size=(n, 1)) * np.sin(
         2.0 * np.pi * t / (365.0 * P[:, None]) + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1)))
     ar = _t_ar1_rows(rng, n, L, rng.uniform(0.5, 0.98, size=n), rng.uniform(0.05, 0.4, size=n))
-    additive = rng.random((n, 1)) < 0.35      # temperature-like rows
+    additive = rng.random((n, 1)) < 0.35
     amp = rng.uniform(0.3, 1.2, size=(n, 1))
     base = np.exp(rng.uniform(np.log(1.0), np.log(1e5), size=(n, 1)))
     wkf = np.where(wk & wk_on, np.log(rng.uniform(0.55, 1.0, size=(n, 1))), 0.0)
@@ -14994,12 +14936,7 @@ def _t_profile_cycle(rng, n, L):
     S = rng.uniform(800.0, 4096.0, size=n)
     return _t_pad_left(x, S)
 
-
-# --------------------------------------------------------------------------- #
-# 5. tide-gauge levels (5- to 15-min): astronomical constituents + surge
-# --------------------------------------------------------------------------- #
 _T_TIDE_H = np.array([12.4206, 12.0, 12.6583, 23.9345, 25.8193])
-
 
 def _t_tide_level(rng, n, L):
     t = np.arange(L, dtype=np.float64)[None, :]
@@ -15021,12 +14958,7 @@ def _t_tide_level(rng, n, L):
     S = rng.uniform(1500.0, 4096.0, size=n)
     return _t_pad_left(x, S)
 
-
-# --------------------------------------------------------------------------- #
-# 6. intermittent 15-min rainfall (tipping-bucket resolution)
-# --------------------------------------------------------------------------- #
 def _t_rain_burst(rng, n, L):
-    """Storm clusters on a dry background at 15 min, on a tipping-bucket lattice."""
     rate = 1.0 / (rng.uniform(1.0, 6.0, size=(n, 1)) * 96.0)
     start = rng.random((n, L)) < rate
     rr, cc = np.nonzero(start)
@@ -15047,10 +14979,6 @@ def _t_rain_burst(rng, n, L):
     S = rng.uniform(1500.0, 4096.0, size=n)
     return _t_pad_left(x, S)
 
-
-# --------------------------------------------------------------------------- #
-# 7. cumulative download / pull counters (dockerhub, npm, steam-like)
-# --------------------------------------------------------------------------- #
 def _t_cum_counter(rng, n, L):
     t = np.arange(L, dtype=np.float64)[None, :]
     P = rng.choice(np.array([48.0, 24.0, 1.0]), size=(n, 1), p=[0.5, 0.3, 0.2])
@@ -15081,12 +15009,7 @@ def _t_cum_counter(rng, n, L):
     S = rng.uniform(1500.0, 4096.0, size=n)
     return _t_pad_left(np.round(x), S)
 
-
-# --------------------------------------------------------------------------- #
-# 8. generic dynamics at eval-like lengths (breadth)
-# --------------------------------------------------------------------------- #
 def _t_generic_dyn(rng, n, L):
-    """Broad dynamics at eval-like lengths: AR around a trend, random walks, seasonal AR, level shifts."""
     t = np.arange(L, dtype=np.float64)[None, :]
     kind = rng.random(n)
     x = np.empty((n, L))
@@ -15121,10 +15044,6 @@ def _t_generic_dyn(rng, n, L):
     x = np.where(rnd, np.round(x), x)
     return _t_pad_left(x, _t_eval_len(rng, n))
 
-
-# --------------------------------------------------------------------------- #
-# 9. river stage / discharge at 15 min: storm hydrographs on a receding baseflow
-# --------------------------------------------------------------------------- #
 def _t_hydro_stage(rng, n, L):
     t = np.arange(L, dtype=np.float64)[None, :]
     per_day = 96.0
@@ -15135,7 +15054,7 @@ def _t_hydro_stage(rng, n, L):
     storms = (rng.random((n, L)) < rate) * np.exp(rng.normal(0.0, 1.0, size=(n, L)))
     mag = rng.uniform(0.5, 8.0, size=(n, 1))
     tau = rng.uniform(1.0, 10.0, size=n) * per_day
-    # impulse -> short rising limb (AR smoothing over hours) -> exponential recession (days)
+
     rise = np.exp(-1.0 / (rng.uniform(2.0, 24.0, size=n) * 4.0))
     limb = _t_ar1(np.ascontiguousarray(storms * mag), rise) * (1.0 - rise)[:, None]
     quick = _t_ar1(np.ascontiguousarray(limb), np.exp(-1.0 / tau))
@@ -15150,14 +15069,7 @@ def _t_hydro_stage(rng, n, L):
     S = rng.uniform(1500.0, 4096.0, size=n)
     return _t_pad_left(x, S)
 
-
-# --------------------------------------------------------------------------- #
-# 10. exact held levels with rare steps (policy rates, fuel prices, dock counts)
-# --------------------------------------------------------------------------- #
 def _t_stair_hold(rng, n, L):
-    """Piecewise-constant published levels: rare steps on a tick lattice, the row
-    ending in a held run of 64-720 points, so the flat continuation is taught here
-    too (the padded teaching rows would otherwise only show flat runs that break)."""
     haz = np.exp(rng.uniform(np.log(1.0 / 2000.0), np.log(1.0 / 40.0), size=(n, 1)))
     jump = rng.random((n, L)) < haz
     kind = rng.random((n, 1))
@@ -15175,7 +15087,7 @@ def _t_stair_hold(rng, n, L):
     x = start + np.cumsum(steps, axis=1)
     x = np.where(kind < 0.3, np.maximum(x, 0.0), x)
     x = np.round(x / tick) * tick
-    # guarantee at least one step inside the kept span (the pair needs a non-constant channel)
+
     S = _t_eval_len(rng, n, 400.0).astype(np.int64)
     for i in range(n):
         lo = L - int(S[i])
@@ -15183,7 +15095,6 @@ def _t_stair_hold(rng, n, L):
             j = int(rng.integers(lo + 1, max(lo + 2, L - int(hold_end[i]))))
             x[i, j:] += tick[i, 0] * (1.0 if rng.random() < 0.5 else -1.0) * float(rng.integers(1, 4))
     return _t_pad_left(x, S)
-
 
 _TEACH_FAMILIES = (
     ("covid_waves", _t_covid_waves),
@@ -15197,7 +15108,7 @@ _TEACH_FAMILIES = (
     ("generic_dyn", _t_generic_dyn),
     ("stair_hold", _t_stair_hold),
 )
-# row shares of the teaching stream (renormalised)
+
 _TEACH_MIX_MAIN = {"covid_waves": 0.24, "pct_feed": 0.10, "ixp_cycle": 0.14, "profile_cycle": 0.12,
                    "tide_level": 0.06, "rain_burst": 0.04, "hydro_stage": 0.04, "cum_counter": 0.08,
                    "generic_dyn": 0.10, "stair_hold": 0.08}
@@ -15209,15 +15120,12 @@ _TEACH_MIX_RKI = {"covid_waves": 0.36, "pct_feed": 0.10, "ixp_cycle": 0.12, "pro
                   "generic_dyn": 0.07, "stair_hold": 0.08}
 _TEACH_MIX = _TEACH_MIX_MAIN
 
-
 def _teach_weights(mix):
     w = np.array([float(mix.get(name, 0.0)) for name, _ in _TEACH_FAMILIES], dtype=np.float64)
     return w / w.sum()
 
-
 _TEACH_BATCH = 256
 _TEACH_SALT_ROWS = 0x7EAC4C02
-
 
 def _teach_batch(seed, b, L=4096, families=_TEACH_FAMILIES, weights=None):
     s = int(seed) & ((1 << 64) - 1)
@@ -15235,7 +15143,6 @@ def _teach_batch(seed, b, L=4096, families=_TEACH_FAMILIES, weights=None):
     np.nan_to_num(out, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     np.clip(out, -1e30, 1e30, out=out)
     return out, fam
-
 
 class _TeachStream:
     def __init__(self, seed):
@@ -15257,7 +15164,6 @@ class _TeachStream:
         self._pos += 1
         return np.array(row)
 
-
 def _teach_pair_ok(a, b):
     if a.ndim != 1 or b.shape != a.shape or not np.isfinite(a).all() or not np.isfinite(b).all():
         return False
@@ -15268,22 +15174,13 @@ def _teach_pair_ok(a, b):
     c = float(np.dot(a - a.mean(), b - b.mean()) / (a.size * sa * sb))
     return abs(c) < 0.99
 
-
-
-# ---- own-code teach2 families: IXP 5-min traffic, signed energy flows, web counters,
-# season onsets, sparse counts (real-pool-statistics matched). ----
-import math  # noqa: E402
-from numba import njit  # noqa: E402
+import math
+from numba import njit
 
 _T2_TAU = 2.0 * math.pi
-_T2_G = 256  # grid points per period for tabulated profiles
+_T2_G = 256
 
-
-# --------------------------------------------------------------------------- #
-# shared helpers
-# --------------------------------------------------------------------------- #
 def _t2_pad_left(x, S):
-    """Keep the last S[i] points of row i and repeat its first kept value before them."""
     n, L = x.shape
     S = np.clip(np.asarray(S, dtype=np.int64).reshape(-1), 64, L)
     start = L - S
@@ -15291,25 +15188,18 @@ def _t2_pad_left(x, S):
     first = x[np.arange(n), start][:, None]
     return np.where(col < start[:, None], first, x)
 
-
 def _t2_eval_len(rng, n, lo=260.0):
-    """Series lengths following the eval pool's context+horizon CDF."""
     u = rng.random(n)
     return np.interp(u, [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.0],
                      [lo, 520.0, 1000.0, 2300.0, 3500.0, 4096.0, 4096.0])
 
-
 def _t2_len(rng, n, L, p_own, lo, hi):
-    """Share p_own of rows at a source-like length U(lo, hi) (hi >= L means full), the
-    rest on the eval CDF, so short-history behaviour is still taught."""
     S = _t2_eval_len(rng, n)
     own = rng.random(n) < p_own
     S = np.where(own, rng.uniform(lo, hi, size=n), S)
     return np.minimum(S, L)
 
-
 def _t2_prof(rng, n, H, decay=1.0, p_more=0.7, G=_T2_G):
-    """(n, G) one-period Fourier profiles, mean 0, peak-to-trough 1."""
     u = np.arange(G, dtype=np.float64)[None, :] / G
     prof = np.zeros((n, G))
     for h in range(1, H + 1):
@@ -15320,18 +15210,14 @@ def _t2_prof(rng, n, H, decay=1.0, p_more=0.7, G=_T2_G):
     prof -= prof.mean(axis=1, keepdims=True)
     return prof / np.maximum(np.ptp(prof, axis=1, keepdims=True), 1e-9)
 
-
 def _t2_events(rng, n, lam):
-    """CSR event table: row pointer and the row index of each event (Poisson counts)."""
     cnt = rng.poisson(np.maximum(lam, 0.0))
     ptr = np.zeros(n + 1, dtype=np.int64)
     ptr[1:] = np.cumsum(cnt)
     return ptr, np.repeat(np.arange(n), cnt)
 
-
 @njit(cache=False, nogil=True)
 def _t2_pois1(lam, u):
-    """One Poisson draw from a uniform u: inverse CDF below 30, logistic-normal above."""
     if lam <= 0.0:
         return 0.0
     if lam < 30.0:
@@ -15348,7 +15234,6 @@ def _t2_pois1(lam, u):
     v = math.floor(lam + math.sqrt(lam) * zz + 0.5)
     return v if v > 0.0 else 0.0
 
-
 @njit(cache=False, nogil=True)
 def _t2_pois_kernel(lam, u, out):
     n, L = lam.shape
@@ -15356,7 +15241,6 @@ def _t2_pois_kernel(lam, u, out):
         for t in range(L):
             out[i, t] = _t2_pois1(lam[i, t], u[i, t])
     return out
-
 
 @njit(cache=False, nogil=True)
 def _t2_cumsum(x):
@@ -15369,11 +15253,8 @@ def _t2_cumsum(x):
             out[i, t] = s
     return out
 
-
 @njit(cache=False, nogil=True)
 def _t2_stale_kernel(x, u, p, maxrun):
-    """Polling staleness: with prob p[i] a point repeats the previous published value
-    (runs capped at maxrun), in place."""
     n, L = x.shape
     for i in range(n):
         pi = p[i]
@@ -15388,10 +15269,8 @@ def _t2_stale_kernel(x, u, p, maxrun):
                 run = 0
     return x
 
-
 @njit(cache=False, nogil=True)
 def _t2_ar1_kernel(z, phi):
-    """Row-wise AR(1) with unit stationary sd from standard-normal innovations z."""
     n, L = z.shape
     out = np.empty((n, L))
     for i in range(n):
@@ -15404,16 +15283,11 @@ def _t2_ar1_kernel(z, phi):
             out[i, t] = a
     return out
 
-
 def _t2_ar1_small(z, phi):
-    """AR(1) along axis 1 (unit stationary sd)."""
     return _t2_ar1_kernel(np.ascontiguousarray(z, dtype=np.float64), np.ascontiguousarray(phi, dtype=np.float64))
-
 
 @njit(cache=False, nogil=True)
 def _t2_pad_inplace(x, S):
-    """In-place twin of _t2_pad_left: row i keeps its last S[i] points (clipped to
-    [64, L]) and repeats the first kept value before them."""
     n, L = x.shape
     for i in range(n):
         s = min(max(int(S[i]), 64), L)
@@ -15423,10 +15297,8 @@ def _t2_pad_inplace(x, S):
             x[i, t] = v
     return x
 
-
 @njit(cache=False, nogil=True)
 def _t2_burst_kernel(buf, ev_ptr, ev_pos, ev_len, ev_mag):
-    """Add decaying bursts m * exp(-k / len), k = 0, 1, ... from ev_pos on, in place."""
     n, L = buf.shape
     for i in range(n):
         for e in range(ev_ptr[i], ev_ptr[i + 1]):
@@ -15442,10 +15314,8 @@ def _t2_burst_kernel(buf, ev_ptr, ev_pos, ev_len, ev_mag):
                 t += 1
     return buf
 
-
 @njit(cache=False, nogil=True)
 def _t2_prof_add(x, prof, P, ph0, scale):
-    """x[i, t] += scale[i] * prof[i, grid((t / P[i] + ph0[i]) mod 1)], in place."""
     n, L = x.shape
     G = prof.shape[1]
     for i in range(n):
@@ -15459,10 +15329,6 @@ def _t2_prof_add(x, prof, P, ph0, scale):
             x[i, t] += scale[i] * prof[i, g]
     return x
 
-
-# --------------------------------------------------------------------------- #
-# 1. IXP 5-min exchange traffic
-# --------------------------------------------------------------------------- #
 @njit(cache=False, nogil=True)
 def _t2_ixp_kernel(z, r, P, ph0, prof, amp, dv, drift, arphi, arsd, oamp, oper, oph,
                    sh_pos, sh_mag, ev_ptr, ev_pos, ev_len, ev_mag, ev_kind, lvl, out):
@@ -15495,7 +15361,7 @@ def _t2_ixp_kernel(z, r, P, ph0, prof, amp, dv, drift, arphi, arsd, oamp, oper, 
         for e in range(ev_ptr[i], ev_ptr[i + 1]):
             s = ev_pos[e]
             m = ev_mag[e]
-            if ev_kind[e] == 0:            # burst: jump, exponential decay
+            if ev_kind[e] == 0:
                 dec = math.exp(-1.0 / ev_len[e])
                 w = m
                 t = s
@@ -15503,7 +15369,7 @@ def _t2_ixp_kernel(z, r, P, ph0, prof, amp, dv, drift, arphi, arsd, oamp, oper, 
                     buf[t] += w
                     w *= dec
                     t += 1
-            else:                           # dip / outage: flat
+            else:
                 t1 = min(L, s + int(ev_len[e]))
                 for t in range(s, t1):
                     buf[t] += m
@@ -15513,18 +15379,15 @@ def _t2_ixp_kernel(z, r, P, ph0, prof, amp, dv, drift, arphi, arsd, oamp, oper, 
             out[i, j] = math.floor(math.exp(buf[te]) + 0.5)
     return out
 
-
 def _t2_ixp_core(rng, n, L):
     small = rng.random(n) < 0.22
     lvl = np.where(small, rng.uniform(4.0, 9.0, size=n), np.clip(rng.normal(11.0, 0.8, size=n), 8.5, 13.3))
     lvl = lvl * math.log(10.0)
-    # effective period of the daily cycle in points: 288 for most feeds, but graph
-    # exports / polled feeds cycle at ~420-475 or ~272-282 points per day
+
     kind = rng.choice(7, size=n, p=[0.64, 0.13, 0.04, 0.04, 0.06, 0.04, 0.05])
     base_P = np.array([288.0, 471.0, 420.0, 450.0, 277.0, 1440.0, 144.0])[kind]
     P = base_P * np.where(kind == 0, 1.0, rng.uniform(0.985, 1.015, size=n))
-    # sample-and-hold rows: a coarser feed re-gridded with duplicated polls
-    # (rep ~ 1 - r); its cycle stretches to P / r on the published grid
+
     sh = rng.random(n) < 0.07
     r = np.where(sh, rng.uniform(0.55, 0.72, size=n), 1.0)
     P = np.where(sh, 288.0 * rng.uniform(0.97, 1.0, size=n), P)
@@ -15534,7 +15397,7 @@ def _t2_ixp_core(rng, n, L):
     amp = np.where(small, rng.uniform(0.3, 2.8, size=n),
                    np.where(weak, rng.uniform(0.05, 0.35, size=n),
                             np.minimum(np.exp(rng.normal(math.log(1.6), 0.4, size=n)), 4.0)))
-    # day-level values: weekday profile (+ weekend dip on most rows) + a day AR walk
+
     D = int(L / 140.0) + 4
     wk = rng.normal(0.0, 1.0, size=(n, 7)) * rng.uniform(0.005, 0.04, size=(n, 1))
     we_on = rng.random(n) < 0.75
@@ -15553,11 +15416,11 @@ def _t2_ixp_core(rng, n, L):
     oamp = np.where(osc, rng.uniform(0.03, 0.25, size=n), 0.0)
     oper = rng.uniform(18.0, 32.0, size=n)
     oph = rng.uniform(0.0, _T2_TAU, size=n)
-    # peering / capacity level shifts (up to 2 per row)
+
     has = rng.random((n, 2)) < np.array([0.25, 0.08])
     sh_pos = np.where(has, rng.integers(1, L, size=(n, 2)), L + 1).astype(np.int64)
     sh_mag = rng.normal(0.0, 0.22, size=(n, 2))
-    # bursts (kind 0) and dips / outages (kind 1), CSR over rows
+
     days = L / P
     b_rate = np.exp(rng.uniform(math.log(0.2), math.log(8.0), size=n)) * days
     d_rate = rng.uniform(0.0, 5.0, size=n) * L / 4096.0
@@ -15578,28 +15441,21 @@ def _t2_ixp_core(rng, n, L):
     ev_ptr = bptr + dptr
     z = rng.standard_normal((n, L))
     f = np.ascontiguousarray
-    # the kernel reads z[i, t] before it writes out[i, t]: z doubles as the output
+
     out = _t2_ixp_kernel(z, f(r), f(P), f(ph0), f(prof), f(amp), dv, f(drift), f(arphi), f(arsd), f(oamp),
                          f(oper), f(oph), f(sh_pos), f(sh_mag), ev_ptr, f(ev_pos.astype(np.int64)), f(ev_len),
                          f(ev_mag), f(ev_kind), f(lvl), z)
-    # rare duplicated polls on most feeds
+
     _t2_stale_kernel(out, rng.random((n, L)), np.where(rng.random(n) < 0.6, rng.uniform(0.0, 0.003, size=n), 0.0), 1)
     S = _t2_len(rng, n, L, 0.7, float(L), float(L))
     _t2_pad_inplace(out, S)
     return out, {"freq": np.full(n, "5min"), "mode": kind + 10 * sh, "S": np.clip(S, 64, L).astype(np.int64)}
 
-
 def _t2_ixp_traffic(rng, n, L):
     return _t2_ixp_core(rng, n, L)[0]
 
-
-# --------------------------------------------------------------------------- #
-# 2. signed interconnector / interface flows (5-min)
-# --------------------------------------------------------------------------- #
 @njit(cache=False, nogil=True)
 def _t2_ou2_kernel(e, a, k, jh, off, res, out):
-    """v = a v + e (+ hour-boundary jump); y = (1 - k) y + v: a slow signed corridor
-    flow with momentum (autocorrelated increments) and ramped schedule jumps."""
     n, L = e.shape
     for i in range(n):
         v = 0.0
@@ -15613,11 +15469,8 @@ def _t2_ou2_kernel(e, a, k, jh, off, res, out):
             out[i, t] = y
     return out
 
-
 @njit(cache=False, nogil=True)
 def _t2_sched_kernel(sp, res, off, R, out):
-    """Setpoint k holds on [k*res, (k+1)*res) (shifted by off); the first R points of
-    each block ramp linearly from the previous setpoint."""
     n, L = out.shape
     for i in range(n):
         rs = res[i]
@@ -15632,10 +15485,8 @@ def _t2_sched_kernel(sp, res, off, R, out):
             out[i, t] = cur
     return out
 
-
 @njit(cache=False, nogil=True)
 def _t2_gap_kernel(x, ev_ptr, ev_pos, ev_stale, ev_zero):
-    """Feed gaps: the last value is re-published for ev_stale points, then zeros."""
     n, L = x.shape
     for i in range(n):
         for e in range(ev_ptr[i], ev_ptr[i + 1]):
@@ -15649,12 +15500,10 @@ def _t2_gap_kernel(x, ev_ptr, ev_pos, ev_stale, ev_zero):
                 x[i, t] = 0.0
     return x
 
-
 def _t2_flow_ac(rng, m, L, S1):
-    """AC corridor: slow signed OU with momentum, weak daily cycle, clip at capacity."""
     tau = np.exp(rng.uniform(math.log(80.0), math.log(700.0), size=m))
     a = rng.uniform(0.1, 0.6, size=m)
-    # schedule jumps on hour (or quarter-hour) boundaries, heavy-tailed sizes
+
     res = np.where(rng.random(m) < 0.6, 12, 3).astype(np.int64)
     K = L // 3 + 8
     pj = rng.uniform(0.05, 0.5, size=(m, 1)) * np.where(res == 3, 0.3, 1.0)[:, None]
@@ -15683,9 +15532,7 @@ def _t2_flow_ac(rng, m, L, S1):
         y[jr] += rng.standard_normal((jr.size, L)) * (S1[jr] * rng.uniform(0.0, 0.03, size=jr.size))[:, None]
     return y
 
-
 def _t2_flow_hvdc(rng, m, L, S1):
-    """HVDC link following hourly / 15-min setpoints, often pinned at +/- capacity."""
     res = np.where(rng.random(m) < 0.7, 12, 3).astype(np.int64)
     K = L // 3 + 8
     phi_h = rng.uniform(0.85, 0.99, size=m)
@@ -15701,7 +15548,7 @@ def _t2_flow_hvdc(rng, m, L, S1):
     jr = np.flatnonzero(rng.random(m) < 0.7)
     if jr.size:
         x[jr] += rng.uniform(0.05, 1.5, size=(jr.size, 1)) * rng.standard_normal((jr.size, L))
-    # maintenance outage at 0
+
     orow = np.flatnonzero(rng.random(m) < 0.12)
     s = rng.integers(0, L, size=orow.size)
     w = rng.integers(100, 900, size=orow.size)
@@ -15709,9 +15556,7 @@ def _t2_flow_hvdc(rng, m, L, S1):
         x[i, s[j]:s[j] + w[j]] = 0.0
     return x
 
-
 def _t2_flow_sch(rng, m, L, S1):
-    """Integer interface schedules: long exact plateaus changing on hour boundaries."""
     K = L // 12 + 3
     haz = np.exp(rng.uniform(math.log(0.01), math.log(0.3), size=(m, 1)))
     chg = rng.random((m, K)) < haz
@@ -15731,9 +15576,7 @@ def _t2_flow_sch(rng, m, L, S1):
     x = _t2_sched_kernel(np.ascontiguousarray(sp), np.full(m, 12, np.int64), off, R, np.empty((m, L)))
     return np.round(x, out=x)
 
-
 def _t2_fix_const(rng, x, S, step):
-    """Rows whose kept span is constant get one step inside it (a pair needs variation)."""
     n, L = x.shape
     S = np.clip(np.asarray(S, dtype=np.int64), 64, L)
     c = np.flatnonzero(x.max(axis=1) == x.min(axis=1))
@@ -15741,7 +15584,6 @@ def _t2_fix_const(rng, x, S, step):
         j = int(rng.integers(L - int(S[i]) + 1, L))
         x[i, j:] += step * (1.0 if rng.random() < 0.5 else -1.0) * max(abs(x[i, 0]) * 0.05, 1.0)
     return x
-
 
 def _t2_flow_core(rng, n, L):
     S1 = np.exp(rng.uniform(math.log(100.0), math.log(2000.0), size=n))
@@ -15751,13 +15593,13 @@ def _t2_flow_core(rng, n, L):
         idx = np.flatnonzero(mode == k)
         if idx.size:
             x[idx] = fn(rng, idx.size, L, S1[idx])
-    # published resolution: 0.01 MW, integer MW, or raw float
+
     rk = rng.random(n)
     for tk, sel in ((0.01, rk < 0.35), (1.0, (rk >= 0.35) & (rk < 0.45))):
         idx = np.flatnonzero(sel & (mode != 2))
         if idx.size:
             x[idx] = np.round(x[idx] / tk) * tk
-    # duplicated polls (runs <= 3) and feed gaps (stale run, then zeros)
+
     pd = np.where(rng.random(n) < 0.75, rng.uniform(0.01, 0.08, size=n), 0.0)
     _t2_stale_kernel(x, rng.random((n, L)), pd, 3)
     gp = np.where(rng.random(n) < 0.5, L / rng.uniform(1500.0, 6000.0, size=n), 0.0)
@@ -15770,18 +15612,11 @@ def _t2_flow_core(rng, n, L):
     _t2_pad_inplace(x, S)
     return _t2_fix_const(rng, x, S, 1.0), {"freq": np.full(n, "5min"), "mode": mode, "S": S}
 
-
 def _t2_signed_flow(rng, n, L):
     return _t2_flow_core(rng, n, L)[0]
 
-
-# --------------------------------------------------------------------------- #
-# 3. web counters / levels
-# --------------------------------------------------------------------------- #
 @njit(cache=False, nogil=True)
 def _t2_rate_kernel(P, ph0, prof, amp, dv, z, arphi, arsd, out):
-    """log-rate = amp * periodic profile + day-level value (linear across the day) + AR
-    noise; out may alias z (z[i, t] is read before out[i, t] is written)."""
     n, L = out.shape
     G = prof.shape[1]
     for i in range(n):
@@ -15800,21 +15635,16 @@ def _t2_rate_kernel(P, ph0, prof, amp, dv, z, arphi, arsd, out):
             out[i, t] = amp[i] * prof[i, g] + dv[i, day] * (1.0 - fr) + dv[i, day + 1] * fr + a
     return out
 
-
 @njit(cache=False, nogil=True)
 def _t2_logpois_kernel(lr, lvl, u, out):
-    """Poisson counts with rate exp(lvl[i] + lr[i, t]); out may alias lr."""
     n, L = lr.shape
     for i in range(n):
         for t in range(L):
             out[i, t] = _t2_pois1(math.exp(min(lvl[i] + lr[i, t], 40.0)), u[i, t])
     return out
 
-
 @njit(cache=False, nogil=True)
 def _t2_counter_kernel(lr, lvl, u, q, x0, rwsd, out):
-    """Cumulative counter: increments Poisson(exp(lvl + lr)) (or, where rwsd > 0, a
-    drifting signed walk), accumulated and published on a q-quantum; out may alias lr."""
     n, L = lr.shape
     for i in range(n):
         c = 0.0
@@ -15829,10 +15659,8 @@ def _t2_counter_kernel(lr, lvl, u, q, x0, rwsd, out):
             out[i, t] = x0[i] + q[i] * math.floor(c / q[i])
     return out
 
-
 @njit(cache=False, nogil=True)
 def _t2_level_kernel(lr, lvl, trend, s_pos, s_tau, s_mag, out):
-    """Integer level exp(lvl + lr + trend t + decaying surge); out may alias lr."""
     n, L = lr.shape
     for i in range(n):
         for t in range(L):
@@ -15842,9 +15670,7 @@ def _t2_level_kernel(lr, lvl, trend, s_pos, s_tau, s_mag, out):
             out[i, t] = math.floor(math.exp(v) + 0.5)
     return out
 
-
 def _t2_day_values(rng, n, D, sd, phi, we_lo, we_hi, p_we=1.0):
-    """(n, D) log day-level values: weekday profile with a weekend factor + day AR."""
     wk = rng.normal(0.0, 1.0, size=(n, 7)) * rng.uniform(0.0, 0.05, size=(n, 1))
     on = rng.random(n) < p_we
     for d in (5, 6):
@@ -15853,10 +15679,7 @@ def _t2_day_values(rng, n, D, sd, phi, we_lo, we_hi, p_we=1.0):
     wkd = np.take_along_axis(wk, (np.arange(D)[None, :] + d0) % 7, axis=1)
     return np.ascontiguousarray(wkd + _t2_ar1_small(rng.standard_normal((n, D)), phi) * sd[:, None])
 
-
 def _t2_web_cum(rng, m, L):
-    """Cumulative pull / item counters with bursty day-level rates; 20% signed-walk
-    table sizes (potaroo-like, non-monotone)."""
     P = rng.choice(np.array([48.0, 24.0, 1440.0]), size=m, p=[0.6, 0.25, 0.15])
     D = int(L / 24.0) + 4
     dv = _t2_day_values(rng, m, D, rng.uniform(0.1, 0.9, size=m), rng.uniform(0.3, 0.9, size=m), 0.3, 1.0, 0.7)
@@ -15864,7 +15687,7 @@ def _t2_web_cum(rng, m, L):
     lr = rng.standard_normal((m, L))
     _t2_rate_kernel(P, rng.uniform(0.0, 1.0, size=m), prof, rng.uniform(0.0, 0.6, size=m), dv, lr,
                     rng.uniform(0.0, 0.9, size=m), rng.uniform(0.05, 0.5, size=m), lr)
-    # pull bursts (CI fan-outs): short multiplicative spikes of the rate
+
     ptr, row = _t2_events(rng, m, rng.uniform(0.0, 4.0, size=m) * L / P)
     ne = row.size
     _t2_burst_kernel(lr, ptr, rng.integers(0, L, size=ne).astype(np.int64), rng.uniform(0.5, 4.0, size=ne),
@@ -15879,10 +15702,7 @@ def _t2_web_cum(rng, m, L):
     freq = np.where(P == 48.0, "30min", np.where(P == 24.0, "H", "min"))
     return lr, freq
 
-
 def _t2_web_daily(rng, m, L):
-    """Daily package downloads: strong weekday cycle, growth, release spikes, a year-end
-    dip, and missing days published as 0 (more frequent near the live edge)."""
     t = np.arange(L, dtype=np.float64)[None, :]
     dv = _t2_day_values(rng, m, L, rng.uniform(0.02, 0.12, size=m), rng.uniform(0.5, 0.95, size=m), 0.2, 0.6)
     lvl = rng.uniform(math.log(1e5), math.log(3e8), size=(m, 1))
@@ -15892,7 +15712,7 @@ def _t2_web_daily(rng, m, L):
     spk = (rng.random((m, L)) < (1.0 / rng.uniform(20.0, 150.0, size=(m, 1)))) * rng.uniform(0.1, 1.2, size=(m, L))
     spk = np.maximum(spk, np.roll(spk, 1, axis=1) * 0.4)
     x = np.round(np.exp(lvl + growth + dv + hol + spk + 0.02 * rng.standard_normal((m, L))))
-    # missing days -> 0; hazard ramps up over the last K days; trailing zeros on some rows
+
     base = np.where(rng.random((m, 1)) < 0.8, rng.uniform(0.002, 0.02, size=(m, 1)), 0.0)
     K = rng.uniform(20.0, 80.0, size=(m, 1))
     ramp = np.clip((t - (L - K)) / K, 0.0, 1.0) * np.where(rng.random((m, 1)) < 0.8, rng.uniform(0.15, 0.45, size=(m, 1)), 0.0)
@@ -15902,10 +15722,7 @@ def _t2_web_daily(rng, m, L):
     x[miss] = 0.0
     return x, np.full(m, "D")
 
-
 def _t2_web_players(rng, m, L):
-    """Concurrent players polled at an effective ~5.3-min step: daily cycle, weekend
-    lift, slow decline, launch surges, 8-22% stale repeats in runs <= 3."""
     P = np.where(rng.random(m) < 0.85, rng.uniform(270.0, 277.0, size=m), rng.uniform(262.0, 292.0, size=m))
     D = int(L / 260.0) + 4
     dv = _t2_day_values(rng, m, D, rng.uniform(0.02, 0.08, size=m), rng.uniform(0.6, 0.97, size=m), 1.1, 1.5, 0.9)
@@ -15927,9 +15744,7 @@ def _t2_web_players(rng, m, L):
     _t2_stale_kernel(lr, rng.random((m, L)), rng.uniform(0.12, 0.24, size=m), 3)
     return lr, np.full(m, "5min")
 
-
 def _t2_web_frac(rng, m, L):
-    """Adoption percentage: slow logistic growth, day-level noise, weekday wobble."""
     t = np.arange(L, dtype=np.float64)[None, :]
     Kc = rng.uniform(30.0, 95.0, size=(m, 1))
     w = rng.uniform(200.0, 1500.0, size=(m, 1))
@@ -15938,23 +15753,21 @@ def _t2_web_frac(rng, m, L):
     wk = 1.0 + rng.uniform(-0.04, 0.04, size=(m, 1)) * ((t + rng.integers(0, 7, size=(m, 1))) % 7 >= 5)
     slow = np.exp(_t2_ar1_small(rng.standard_normal((m, L)), rng.uniform(0.9, 0.995, size=m))
                   * rng.uniform(0.01, 0.06, size=(m, 1)))
-    # methodology / panel changes: 0-3 level steps of +-3-15%
+
     stp = np.exp(np.cumsum((rng.random((m, L)) < rng.uniform(0.0, 0.75, size=(m, 1)) / L)
                            * rng.normal(0.0, 0.08, size=(m, L)), axis=1))
     noise = rng.standard_t(3.0, size=(m, L)) * (rng.uniform(0.005, 0.03, size=(m, 1)) * base)
     x = base * wk * slow * stp + noise
-    # bad measurement days: drops toward 0 or spikes
+
     bad = rng.random((m, L)) < rng.uniform(0.0, 0.012, size=(m, 1))
     x = np.where(bad, x * np.where(rng.random((m, L)) < 0.5, rng.uniform(0.0, 0.3, size=(m, L)),
                                    rng.uniform(1.2, 1.8, size=(m, L))), x)
     return np.round(np.maximum(x, 0.0), 4), np.full(m, "D")
 
-
 _T2_WEB_MODES = (_t2_web_cum, _t2_web_daily, _t2_web_players, _t2_web_frac)
 _T2_WEB_P = np.array([0.50, 0.18, 0.26, 0.06])
-# (share at a source-like length, lo, hi) per mode
-_T2_WEB_LEN = ((0.6, 4096.0, 4500.0), (0.75, 450.0, 800.0), (0.6, 4096.0, 4500.0), (0.6, 4096.0, 4500.0))
 
+_T2_WEB_LEN = ((0.6, 4096.0, 4500.0), (0.75, 450.0, 800.0), (0.6, 4096.0, 4500.0), (0.6, 4096.0, 4500.0))
 
 def _t2_web_core(rng, n, L):
     mode = rng.choice(len(_T2_WEB_MODES), size=n, p=_T2_WEB_P)
@@ -15971,19 +15784,11 @@ def _t2_web_core(rng, n, L):
     _t2_pad_inplace(x, S)
     return _t2_fix_const(rng, x, S, 1.0), {"freq": freq, "mode": mode, "S": S}
 
-
 def _t2_web_counter(rng, n, L):
     return _t2_web_core(rng, n, L)[0]
 
-
-# --------------------------------------------------------------------------- #
-# 4. seasonal onset in a short daily %-of-visits record (RSV-like)
-# --------------------------------------------------------------------------- #
 @njit(cache=False, nogil=True)
 def _t2_season_kernel(cen, peak, wl, wr, flat, trough, noise, ph, we_pct, we_vis, visits, u, S, out):
-    """Day t of the record (t = 0 .. S-1, right-aligned in out): pct = trough + sum of
-    asymmetric Gaussian season bumps (flat-topped), times AR noise and a weekend factor;
-    numerator Poisson over the day's visit count; published % on a 0.01 lattice."""
     n, L = out.shape
     K = cen.shape[1]
     for i in range(n):
@@ -16014,14 +15819,13 @@ def _t2_season_kernel(cen, peak, wl, wr, flat, trough, noise, ph, we_pct, we_vis
             out[i, t] = v
     return out
 
-
 def _t2_season_core(rng, n, L):
     S = np.where(rng.random(n) < 0.75, rng.uniform(420.0, 720.0, size=n), rng.uniform(720.0, 1500.0, size=n))
     S = np.where(rng.random(n) < 0.15, _t2_eval_len(rng, n, 300.0), S)
     S = np.clip(S, 64, L).astype(np.int64)
     W = int(S.max())
     K = int(W / 365.25) + 3
-    # season centres on the record's own day axis; the record starts anywhere in the year
+
     c0 = rng.uniform(-365.25, 0.0, size=(n, 1))
     cen = c0 + 365.25 * np.arange(K)[None, :] + rng.normal(0.0, 15.0, size=(n, K))
     trough = np.exp(rng.uniform(math.log(0.002), math.log(0.04), size=n))
@@ -16039,14 +15843,9 @@ def _t2_season_core(rng, n, L):
     last_c = np.where(mid <= S[:, None], mid, -np.inf).max(axis=1)
     return out, {"freq": np.full(n, "D"), "S": S, "peak_from_end": S - last_c}
 
-
 def _t2_season_onset(rng, n, L):
     return _t2_season_core(rng, n, L)[0]
 
-
-# --------------------------------------------------------------------------- #
-# 5. zero-heavy hourly counts (notes) and small hourly active-user counts
-# --------------------------------------------------------------------------- #
 def _t2_sparse_core(rng, n, L):
     users = rng.random(n) < 0.35
     P = np.full(n, 24.0)
@@ -16066,9 +15865,9 @@ def _t2_sparse_core(rng, n, L):
     _t2_rate_kernel(P, rng.uniform(0.0, 1.0, size=n), prof, amp, dv, lr, arphi, arsd, lr)
     lvl = np.where(users, rng.uniform(math.log(3.0), math.log(80.0), size=n),
                    rng.uniform(math.log(0.4), math.log(15.0), size=n))
-    # slow decline of most instances over the record
+
     lr += (rng.uniform(-0.4, 0.15, size=n) / L)[:, None] * np.arange(L)[None, :]
-    # reply storms on the notes feeds: short multiplicative bursts in the log-rate
+
     ptr, row = _t2_events(rng, n, np.where(users, 0.0, L / rng.uniform(48.0, 400.0, size=n)))
     ne = row.size
     _t2_burst_kernel(lr, ptr, rng.integers(0, L, size=ne).astype(np.int64), rng.uniform(1.0, 10.0, size=ne),
@@ -16078,10 +15877,8 @@ def _t2_sparse_core(rng, n, L):
     _t2_pad_inplace(lr, S)
     return _t2_fix_const(rng, lr, S, 1.0), {"freq": np.full(n, "H"), "mode": users.astype(np.int64), "S": S}
 
-
 def _t2_sparse_counts(rng, n, L):
     return _t2_sparse_core(rng, n, L)[0]
-
 
 _TEACH2_FAMILIES = (
     ("ixp_traffic", _t2_ixp_traffic),
@@ -16090,13 +15887,10 @@ _TEACH2_FAMILIES = (
     ("season_onset", _t2_season_onset),
     ("sparse_counts", _t2_sparse_counts),
 )
-# row shares within the teach2 block (renormalised by the caller)
+
 _TEACH2_MIX = {"ixp_traffic": 0.30, "signed_flow": 0.22, "web_counter": 0.24, "season_onset": 0.10,
                "sparse_counts": 0.14}
-# suggested merged teaching-stream mix over teach.py's _TEACH_FAMILIES + _TEACH2_FAMILIES
-# (names do not collide): teach.py's main mix scaled to 0.63 with the overlapping ixp_cycle /
-# cum_counter / pct_feed trimmed and the healthcare families kept, teach2 at 0.37. It changes
-# only the partner content, not the partner dose Q.
+
 _TEACH2_MIX_MERGED = {"covid_waves": 0.20, "pct_feed": 0.08, "ixp_cycle": 0.04, "profile_cycle": 0.07,
                       "tide_level": 0.04, "rain_burst": 0.02, "hydro_stage": 0.03, "cum_counter": 0.03,
                       "generic_dyn": 0.06, "stair_hold": 0.06,
@@ -16107,31 +15901,14 @@ _TEACH_FAMILIES = _TEACH2_FAMILIES
 _TEACH_MIX = _TEACH2_MIX
 _teach_batch.__defaults__ = (4096, _TEACH_FAMILIES, None)
 
-# SeedSequence tag of that per-row decision.
-_Q = 0.25  # c159: partner channel on 25% of rows (king-147 used 0.296). Teach share stays 0.4375.
+_Q = 0.25
 _CPL = 0.2
 _TAG = 0x5A17C0DE
 _TMIX = 0.4375
 _TMIX_TAG = 0x7EAC0001
 
-
-# ---- teach2 extension (w9q): daily ED-visit share for the NSSP pathogens other than RSV ----
-# Targets cdc_nssp_ed_{influenza,covid19,ari,pathogen_mix}_daily_by_state and
-# cdc_nssp_ed_respiratory_daily (408 local windows, 4.1%; the king's gain over init there is
-# +0.75 pp, and w9nq only ties it, while on rsv, which has its own teach2 family, w9nq is
-# +8.6% / +4.7% over the king). Calibrated to by-state group statistics of the pool snapshot
-# (gain2/w9q_nssp_real.py), no single series fitted:
-#   influenza  trough ~0.04 %, winter peak ~8 % (5.9-10.2), half-widths 14 / 17 d, deep floor at the end
-#   covid19    trough ~0.07 %, winter peak ~1 % (0.4-1.9), half-widths 23 / 53 d, summer wave ~end-18 d
-#   ari        trough ~6.9 % (5.5-8.3), winter peak ~22 %, half-widths 24 / 40 d
-# Records are ~516 d long and every state's last winter peak sits at end-266 d (264-269), so
-# the h256 context ends ~10 d after the peak and the target is the decay to the floor.
-# 60% of rows anchor the last winter peak at end-U(235, 310) d (covers today's phase plus
-# ~6 weeks of drift); 40% draw the phase uniformly. Same kernel as season_onset (Poisson
-# numerator over the day's visits, weekend effect, 0.01 % publication lattice).
-_T2ED_MODE_P = np.array([0.36, 0.34, 0.30])  # influenza, covid19, ari
+_T2ED_MODE_P = np.array([0.36, 0.34, 0.30])
 _T2ED_ANCHOR = 0.6
-
 
 def _t2ed_core(rng, n, L):
     u = rng.random(n)
@@ -16147,7 +15924,7 @@ def _t2ed_core(rng, n, L):
     last_w = np.where(anch, Sf - rng.uniform(235.0, 310.0, size=n), Sf - rng.uniform(0.0, 365.25, size=n))
     j = (np.arange(nw) - (nw - 2)).astype(np.float64)[None, :]
     wc = last_w[:, None] + 365.25 * j + rng.normal(0.0, 10.0, size=(n, nw)) * (j != 0.0)
-    # per-mode winter season
+
     trough = np.where(flu, np.exp(rng.uniform(math.log(0.03), math.log(0.2), size=n)),
                       np.where(cov, np.exp(rng.uniform(math.log(0.04), math.log(0.2), size=n)),
                                np.exp(rng.uniform(math.log(5.0), math.log(8.5), size=n))))
@@ -16160,9 +15937,7 @@ def _t2ed_core(rng, n, L):
                    np.where(cov[:, None], rng.uniform(30.0, 50.0, size=(n, nw)), rng.uniform(25.0, 42.0, size=(n, nw))))
     wfl = np.where(flu[:, None], rng.uniform(0.0, 10.0, size=(n, nw)),
                    np.where(cov[:, None], rng.uniform(0.0, 15.0, size=(n, nw)), rng.uniform(0.0, 20.0, size=(n, nw))))
-    # second bump per year: covid summer wave (peak ~end-18 d on anchored rows); influenza
-    # broad shoulders around its sharp peak (plus a spring B tail); ari broad Oct-Mar
-    # respiratory season under its sharp winter peak (real ari median ~1.5x its summer low)
+
     sc = np.where(cov[:, None], wc + rng.uniform(220.0, 265.0, size=(n, nw)),
                   np.where(flu[:, None], wc + rng.uniform(15.0, 70.0, size=(n, nw)), wc - rng.uniform(0.0, 30.0, size=(n, nw))))
     spk = np.where(cov[:, None], np.exp(rng.uniform(math.log(0.2), math.log(1.2), size=(n, 1)) + rng.normal(0.0, 0.4, size=(n, nw))),
@@ -16188,17 +15963,10 @@ def _t2ed_core(rng, n, L):
     out = _t2_fix_const(rng, out, S, 0.01)
     return out, {"freq": np.full(n, "D"), "S": S, "mode": mode, "anchored": anch, "last_winter_from_end": Sf - last_w}
 
-
 def _t2ed_share(rng, n, L):
     return _t2ed_core(rng, n, L)[0]
 
-
 def _t2_slow_level(rng, n, L):
-    """Continuous level with no calendar wave: sticky rates, shares, and prices.
-
-    80% daily, 20% hourly. A fifth of the daily rows are nearly flat. Rounded to
-    a few decimals so the row stays non-integer. No weekday or yearly sine.
-    """
     n = int(n)
     L = int(L)
     if n <= 0:
@@ -16265,40 +16033,22 @@ def _t2_slow_level(rng, n, L):
         x[i] = np.round(x[i], int(dp[i]))
     return x
 
-
 _TEACH2_FAMILIES = _TEACH2_FAMILIES + (("ed_visit_share", _t2ed_share), ("slow_level", _t2_slow_level),)
-# teach2 row shares (renormalised by the caller). Same teach2 dose as w9nq (Q .296, TMIX .4375):
-# signed_flow cut from its overdose (.22 -> .06), ixp trimmed at 97% saturation (.30 -> .22),
-# sparse trimmed (.14 -> .08), web raised (.24 -> .36, cumulative and players modes), season
-# kept near its still-responding dose (.10 -> .12), new ed_visit_share at .16.
-# c159: slow_level 0.16 taken from web_counter (0.36 -> 0.24) and ixp_traffic (0.22 -> 0.18).
+
 _TEACH2_MIX = {"ixp_traffic": 0.18, "signed_flow": 0.06, "web_counter": 0.24, "season_onset": 0.12,
                "sparse_counts": 0.08, "ed_visit_share": 0.16, "slow_level": 0.16}
 _TEACH_FAMILIES = _TEACH2_FAMILIES
 _TEACH_MIX = _TEACH2_MIX
 _teach_batch.__defaults__ = (4096, _TEACH_FAMILIES, None)
 
-
-# ---- w9q: season-phase-faithful RKI hospitalisation rows for the P1 partner family ----
-# Every rki_germany_covid_hospitalizations window is the LAST h days of a series and all 25
-# series end on the same date, so each horizon cuts at a fixed season phase (gain2/rki.md):
-# endemic winter peaks ~1000 / ~680 / ~290 days before the end, then a burn-out to a floor of
-# ~1e-3 of the max (h256 = the post-peak burn-out, h720 = cut 40 days before the penultimate
-# peak). P1's rki_epidemic_weekly_sums (== 111 epi_burnout_counts) matches the global stats but
-# centres its last wave at m*U(.855,.915), i.e. anywhere from 70 days before to 70 days after
-# the h256 cut, so it grows a new wave inside the target far too often (tgtpk256 .55 vs .15).
-# This builder keeps the P1 body/observation code and places the three endemic peaks at the
-# real end phase; _W9Q_RKI_PHASED_P of the family's rows use it, the rest keep the original
-# random-phase builder. Heights are calibrated to gain2/rki_peaks.log.
 _W9Q_RKI_PHASED_P = 0.70
 _W9Q_RKI_LAST_SHOULDER = 2.2
-
 
 def _w9q_rki_endemic_sums(rng, n):
     m = int(rng.integers(2350, 2401))
     t = np.arange(m + 6, dtype=np.float64)
     T = float(m + 5)
-    # pandemic era: the P1 body (pre / main / fading waves), ending at winter 22/23
+
     n_pre_waves = int(rng.integers(1, 3))
     n_main_waves = int(rng.integers(2, 4))
     n_fading_waves = int(rng.integers(1, 3))
@@ -16316,7 +16066,7 @@ def _w9q_rki_endemic_sums(rng, n):
     a1 = T - rng.uniform(1300.0, 1420.0)
     u = (np.arange(W, dtype=np.float64) / (W - 1.0)) ** rng.uniform(0.72, 1.05)
     body_centers = a0 + (a1 - a0) * u + rng.normal(0.0, 0.09 * (a1 - a0) / (W - 1.0), W)
-    # endemic winters at the real end phase (days before the end), common drift of the pool date
+
     drift = rng.normal(0.0, 8.0)
     tail_centers = T - np.array([rng.uniform(960.0, 1025.0), rng.uniform(645.0, 760.0),
                                  rng.uniform(250.0, 325.0)]) + drift
@@ -16335,8 +16085,7 @@ def _w9q_rki_endemic_sums(rng, n):
         for _ in range(2):
             if rng.random() < 0.7:
                 side = 1.0 if rng.random() < 0.65 else -1.0
-                # the last winter's post-peak shoulder stays inside its season (real: .3-.8 of the
-                # peak at +60 d, ~0 by +150 d), so it does not start a new wave in the h256 target
+
                 off_hi = _W9Q_RKI_LAST_SHOULDER if j == k - 1 else 3.2
                 wave_curve += amps[j] * rng.uniform(0.25, 0.75) * _pt_asymmetric_gaussian_wave(
                     t, centers[j] + side * fall_widths[j] * rng.uniform(1.4, off_hi),
@@ -16369,12 +16118,10 @@ def _w9q_rki_endemic_sums(rng, n):
         x[-1] = x[-1] + 1.0
     return np.ascontiguousarray(x, dtype=np.float64)
 
-
 def _w9q_rki_weekly_sums(rng, n):
     if rng.random() < _W9Q_RKI_PHASED_P:
         return _w9q_rki_endemic_sums(rng, n)
     return _pt_epidemic_weekly_sums(rng, n)
-
 
 _pt_FAMILY_BUILDERS['rki_epidemic_weekly_sums'] = _w9q_rki_weekly_sums
 
