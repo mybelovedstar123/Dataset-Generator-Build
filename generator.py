@@ -30238,3 +30238,57 @@ class Generator(_SG_BASE):
 # Here every packed record of width >= 2 keeps its K0 record label with probability _MVK_P (else SING's singletons), so the variate
 # attention is trained on a small share of rows while the rest stay univariate. Values are byte-identical to SING; only labels change.
 _MVK_P = 0.1
+_MVK_TAG = 0x4D564B50
+_MVK_SING = Generator
+
+
+def _mvk_labels(g, u):
+    """g: K0 labels (one contiguous block per packed record); u: one uniform per block. Canonical relabel."""
+    g = np.asarray(g)
+    C = g.shape[0]
+    starts = [0] + [c for c in range(1, C) if g[c] != g[c - 1]]
+    ends = starts[1:] + [C]
+    out = np.empty(C, dtype=np.uint8)
+    nxt = 0
+    for b, (s, e) in enumerate(zip(starts, ends)):
+        if e - s >= 2 and u[b] < _MVK_P:
+            out[s:e] = nxt
+            nxt += 1
+        else:
+            out[s:e] = np.arange(nxt, nxt + (e - s), dtype=np.uint8)
+            nxt += e - s
+    return out, len(starts)
+
+
+class Generator(_MVK_SING):
+    def generate(self, n_series):
+        inner = _SG_BASE.generate(self, n_series)   # SING's parent (MG2): the K0 record labels, values as SING yields them
+        seed = int(getattr(self, "_seed", 0)) & ((1 << 64) - 1)
+        k = 0
+        try:
+            for y in inner:
+                g = np.asarray(y["groups"])
+                if not (g.shape == (y["values"].shape[0],) and int(g[0]) == 0
+                        and bool((np.diff(g.astype(np.int64)) >= 0).all())
+                        and bool((np.diff(g.astype(np.int64)) <= 1).all())):
+                    raise RuntimeError(f"MVKEEP: parent labels not one contiguous block per record: {g.tolist()}")
+                u = np.random.default_rng(np.random.SeedSequence([seed, _MVK_TAG, k])).random(g.shape[0])
+                lab, nrec = _mvk_labels(g, u)
+                if not (lab.dtype == np.uint8 and lab.shape == g.shape and int(lab[0]) == 0
+                        and bool((np.diff(lab.astype(np.int64)) >= 0).all()) and bool((np.diff(lab.astype(np.int64)) <= 1).all())
+                        and bool(np.all(np.bincount(lab) >= 1))):
+                    raise RuntimeError(f"MVKEEP assert-before-yield failed (groups): {lab.tolist()}")
+                out = dict(y)
+                out["groups"] = lab
+                yield out
+                k += 1
+        finally:
+            inner.close()
+
+
+# ═══════════════ PADK-NEAR (append-only, last; no RNG, no state): late-first-move NON-binary channels become constant ═════════
+# SING makes every channel a univariate row, so a channel whose first change from its first value comes late is an 'exact
+# constant prefix, then a jump' row: the forecast for an exactly constant (z = 0) eval history fits how often such rows move
+# after a long z = 0 prefix (census near cells s in [119-j, 127-j] for lead j; first-move patch >= 97 feeds leads 0..22).
+# Channels whose first change lies in the last _PKN_BACK points (patch >= 96) become constant; 0/1 channels are kept.
+_PKN_BACK = 1024
