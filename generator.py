@@ -29994,3 +29994,108 @@ def _k0_serial_base_generate(self, n_series: int) -> Iterator[np.ndarray]:
         produced += take
         emitted_points += chunk_points
         chunk_index += 1
+
+_K0_THREADED_BASE_GENERATE = _BaseGenerator.generate  # the replaced threaded method (the serial-vs-threaded gate uses it)
+_BaseGenerator.generate = _k0_serial_base_generate
+
+_K0_C = 8
+_K0_L = 4096
+_K0_LOOKAHEAD = 64
+_K0_V1_PER_V2_NUM, _K0_V1_PER_V2_DEN = 8803, 10000
+_K0_F32_MAX = 3.4028234663852886e38
+
+
+def _k0_v1_child_budget(n):
+    return max(0, 64 * (int(n) - 2)) * _K0_V1_PER_V2_NUM // _K0_V1_PER_V2_DEN
+
+
+def _k0_record(x):
+    a = np.asarray(x, dtype=np.float64)
+    if a.ndim == 1:
+        a = a.reshape(1, -1)
+    if a.ndim != 2 or a.shape[1] != _K0_L or not 1 <= a.shape[0] <= _K0_C:
+        return None
+    if not bool(np.isfinite(a).all()) or float(np.abs(a).max()) > _K0_F32_MAX:
+        return None
+    return a
+
+
+_K0Parent = Generator
+
+
+class Generator(_K0Parent):
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        global _C91_CHILD_BUDGET, _C215LP_STREAM_POINTS
+        n = int(n_series)
+        if n <= 0:
+            return
+        _C91_CHILD_BUDGET = _k0_v1_child_budget(n)
+        _C215LP_STREAM_POINTS = _k0_v1_child_budget(n)
+        self._k0_dropped_records = 0
+        self._k0_dropped_groups = 0
+        base = super().generate(n)
+        carry = []
+        emitted = 0
+        live = True
+        try:
+            while live and emitted < n:
+                group, filled, rest = [], 0, []
+                for a in carry:
+                    if filled + a.shape[0] <= _K0_C:
+                        group.append(a)
+                        filled += a.shape[0]
+                    else:
+                        rest.append(a)
+                carry = rest
+                while filled < _K0_C and len(carry) < _K0_LOOKAHEAD:
+                    try:
+                        x = next(base)
+                    except StopIteration:
+                        live = False
+                        break
+                    a = _k0_record(x)
+                    if a is None:
+                        self._k0_dropped_records += 1
+                    elif filled + a.shape[0] <= _K0_C:
+                        group.append(a)
+                        filled += a.shape[0]
+                    else:
+                        carry.append(a)
+                if filled < _K0_C:
+                    if live:
+                        self._k0_dropped_groups += 1
+                    continue
+                out = np.ascontiguousarray(np.concatenate(group, axis=0), dtype=np.float64)
+                if not (out.dtype == np.float64 and out.shape == (_K0_C, _K0_L) and out.flags.c_contiguous
+                        and bool(np.isfinite(out).all()) and float(np.abs(out).max()) <= _K0_F32_MAX):
+                    raise RuntimeError(f"K0 assert-before-yield failed: {out.dtype} {out.shape}")
+                yield out
+                emitted += 1
+        finally:
+            base.close()
+
+
+# ═══════════════ K0-32G: 32-channel GROUPED packer (append-only; a final Generator layer over K0) ════════════════════════
+# WHY. Since cascade-v2 251a6a5 every v2 yield must carry EXACTLY 32 channels (chain.toml [generator] min_channels =
+# max_channels = 32). A yield may instead be a record {"values": float (32, L), "groups": integer (32,)} with CANONICAL
+# labels (first label 0; each new label = the number of distinct labels seen so far). The pyramid model restricts its
+# variate (channel-mixing) attention to channels that share a label and draws one copula latent per label. A bare
+# (32, 4096) array of packed records is ONE 32-variate series to the model: unrelated c268 records would attend to each
+# other and share one copula noise, i.e. it would learn cross-channel structure that does not exist. Giving every packed
+# c268 record its own label keeps variate attention and copula noise inside each real record: a univariate record trains
+# like eval's single-series windows (eval inference passes no groups), and a multichannel record (always kept whole)
+# keeps its genuine coupling inside its own group.
+# CONTRACT. groups are accepted ONLY under the bound v2 training contract ([v2.training] accepted_fields = ["groups"]).
+# Every UNBOUND check (plain `cascade verify`, deploy, the pre-launch submit verification) refuses any record field other
+# than "values", so this build is EXPECTED to fail those with the reserved-field error. Bare (32, L) arrays stay valid
+# everywhere; this layer is for the bound v2 contract only.
+# WHAT. generate(n) repeats K0's packer EXACTLY: the same base stream (_K0Parent.generate(self, n): c268 + K0's serial
+# base), the same budget rescale set before the base starts (_C91_CHILD_BUDGET = _C215LP_STREAM_POINTS =
+# _k0_v1_child_budget(n)), the same _k0_record filter, the same first-fit fill with at most _K0_LOOKAHEAD carried
+# records, never a partial group, never a split / padded / duplicated record. Only the width differs (32 channels) and
+# the yield is {"values": float64 C-contiguous (32, 4096), "groups": uint8 (32,)} with one label per packed record in
+# packing order: labels = np.repeat(np.arange(len(group)), widths). ASSERT BEFORE YIELD: values float64, (32, 4096),
+# C-contiguous, finite, |v| <= float32 max; labels uint8 (32,), canonical, one contiguous block per packed record whose
+# width equals that record's channel count. Anything else raises (never yields a bad record).
+_K32G_C = 32
