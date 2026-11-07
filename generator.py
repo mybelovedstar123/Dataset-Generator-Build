@@ -24859,3 +24859,232 @@ def _yl_profiles(r, per_day, kind):
     s = s - np.sum(s * we) / np.sum(we)
     de = 0.5 * amp * s / m if m > 0 else s
     return wk, np.clip(dk, -0.9, 0.9), we, np.clip(de, -0.9, 0.9)
+
+def _yl_bike_draw(r, L):
+    L = int(L)
+    u = r.random(16)
+    cad = 0 if u[0] < _YL_P_1MIN else 1
+    per_day, per_h = _YL_STEP[cad]
+    n = _yl_len(r, L, cad)
+    z = float(r.standard_normal())
+    c, s_lo, s_hi = _YL_ACT[cad]
+    ev_day = float(np.clip(np.exp(c + (s_lo if z < 0.0 else s_hi) * z), *_YL_ACT_LIM))
+    zone = u[12] < _YL_ZONE[cad]
+    noisy = (not zone) and u[11] < _YL_NOISY[cad] and z > _YL_NOISY[4]
+    if noisy:
+        ev_day = min(ev_day * _YL_NOISY[5], _YL_ACT_LIM[1])
+    if zone:
+        ev_day = _yl_lu(r, *_YL_ZONE_ACT[cad])
+        cap = int(round(_yl_lu(r, *_YL_ZONE_CAP)))
+    elif u[1] < _YL_P_BIG:
+        cap = int(r.integers(60, 201))
+    else:
+        cap = int(np.clip(round(np.exp(_YL_CAP[0][cad] + _YL_CAP[1] * z + _YL_CAP[2] * r.standard_normal())), 1, _YL_CAP_MAX))
+    kind = 3 if zone else min(int(np.searchsorted(_YL_TYPE_CUM, u[2], side="right")), 3)
+    wk, dk, we, de = _yl_profiles(r, per_day, kind)
+
+    a = np.arange(n, dtype=np.int64) + int(u[3] * per_day) - (n - 1) + 7 * per_day * 4
+    sod = a % per_day
+    weekend = ((a // per_day + int(7 * u[4])) % 7) >= 5
+    act = np.where(weekend, we[sod], wk[sod])
+    imb = np.where(weekend, de[sod], dk[sod])
+    nd = n // per_day + 2
+    dayf = np.exp(0.25 * r.standard_normal(nd) * u[5])
+    lam = (ev_day / per_day) * act * dayf[(a // per_day) - (a[0] // per_day)]
+    A = r.poisson(lam * (0.5 + 0.5 * imb)).astype(np.float64)
+    D = r.poisson(lam * (0.5 - 0.5 * imb)).astype(np.float64)
+    xm = (r.uniform(*_YL_XB[0]) + _YL_XB[1] * r.random() * min(1.0, ev_day / _YL_XB[2])) * _YL_XB[3][cad]
+    pb = 1.0 / (1.0 + xm)
+    for M in (A, D):
+        i = np.flatnonzero(M > 0)
+        if i.size:
+            e = r.geometric(pb, i.size) - 1.0
+            sp = np.minimum(r.binomial(e.astype(np.int64), _YL_XB[4][cad]), e)
+            M[i] += e - sp
+            j = i + r.geometric(_YL_XB[5][cad], i.size)
+            k = j < n
+            np.add.at(M, j[k], sp[k])
+    inc = A - D
+
+    s2 = 1.0 + 2.0 * xm * (1.0 + xm) / max(pb, 1e-3) * 0.5
+    sdf = _yl_lu(r, *_YL_SDF) * cap
+    K = float(np.clip(2.0 * sdf * sdf / s2, *_YL_K))
+    tau = float(np.clip(K / max(float(_v2_meanm(lam)), 1e-9), per_h * _yl_lu(r, *_YL_TAU_MIN_H), 14.0 * per_day))
+    phi = float(np.exp(-1.0 / tau))
+    sd0 = float(np.sqrt(max(float(_v2_meanm(lam)), 1e-9) * s2 * 0.5 * tau))
+    inc[0] += r.standard_normal() * min(sd0, 0.6 * cap)
+    y = _yl_ar1(inc, phi)
+    fill = r.uniform(*_YL_ZONE_FILL) if zone else r.beta(*_YL_FILL[cad]) * cap
+
+    nh = n // per_h + 3
+    pw = float(np.exp(-1.0 / (_yl_lu(r, *_YL_WANDER_D) * 24.0)))
+    wh = _yl_ar1(r.standard_normal(nh) * np.sqrt(1.0 - pw * pw), pw)
+    wh[0] = r.standard_normal()
+    w = np.interp(np.arange(n, dtype=np.float64) / per_h, np.arange(nh, dtype=np.float64), wh) * (cap * _YL_WANDER * u[7])
+    lvl = fill + w + y
+
+    lvl = lvl + _yl_wall(-0.45 - lvl, tau) - _yl_wall(lvl - (cap + 0.45), tau)
+
+    if u[8] < _YL_P_REB and not zone:
+        k = int(min(r.poisson(_yl_lu(r, *_YL_REB_DAY) * n / per_day), 40))
+        if k > 0:
+            ts = np.sort(r.integers(1, n, k))
+            jm = np.zeros(n, dtype=np.float64)
+            tj, aj = [], []
+            for t in ts.tolist():
+                s = float(lvl[t]) + sum(ja * phi ** (t - tt) for tt, ja in zip(tj, aj))
+                if s < _YL_REB_TRIG[0] * cap:
+                    tgt = cap * r.uniform(0.4, 0.95)
+                elif s > _YL_REB_TRIG[1] * cap:
+                    tgt = cap * r.uniform(0.05, 0.6)
+                else:
+                    continue
+                j = float(np.round(tgt - s))
+                tj.append(t)
+                aj.append(j)
+                jm[t] += j
+            if tj:
+                lvl = lvl + _yl_ar1(jm, phi)
+    x = np.clip(np.round(lvl), 0.0, float(cap))
+
+    if noisy or u[9] < _YL_P_DIP:
+        g = _yl_lu(r, *_YL_NOISY[2:4]) if noisy else _yl_lu(r, *_YL_DIP)
+        k = int(min(r.poisson(g * ev_day * n / per_day), 600))
+        if k > 0:
+            s = r.integers(0, n, k)
+            e = np.minimum(s + r.geometric(1.0 / (1.0 + _YL_DIP_LEN[cad] * r.random()), k), n)
+            off = np.zeros(n + 1, dtype=np.float64)
+            dn = r.random(k) < _YL_DIP_DOWN
+            fr = r.uniform(*_YL_DIP_SIZE, k)
+            g = np.floor(np.where(dn, -fr * x[s], fr * (cap - x[s])) + r.random(k))
+            np.add.at(off, s, g)
+            np.add.at(off, e, -g)
+            x = np.clip(x + np.cumsum(off)[:n], 0.0, float(cap))
+
+    mr = float(_v2_mean(np.diff(x) != 0)) if n > 1 else 0.0
+    fl = _yl_lu(r, *_YL_FLICK) * mr * max(0.1, 1.0 - mr / _YL_FLICK_FADE)
+    if fl > 0:
+        i = np.flatnonzero(r.random(n) < fl)
+        if i.size:
+            x[i] = np.clip(x[i] + np.where(r.random(i.size) < 0.5, -1.0, 1.0), 0.0, float(cap))
+
+    if u[10] < _YL_P_STALE:
+        for _ in range(1 + int(r.poisson(0.7))):
+            m = int(_yl_lu(r, *_YL_STALE_H) * per_h)
+            if m < n // 2:
+                s = int(r.integers(1, n - m))
+                x[s:s + m] = x[s - 1]
+    if float(x.max()) <= float(x.min()):
+        s = int(r.integers(1, n))
+        x[s:] = x[s:] + (1.0 if x[0] < cap else -1.0)
+    return x, cad
+
+def _yl_bike(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    x, _ = _yl_bike_draw(r, L)
+    n = x.size
+    if n > L:
+        x = x[n - L:]
+        n = L
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    return out
+
+_YM_MIN_N = 320
+_YM_MADRID = 0.20
+_YM_TYPE_CUM_P = np.cumsum([0.18, 0.17, 0.65, 0.00])
+_YM_TYPE_CUM_M = np.cumsum([0.04, 0.36, 0.38, 0.22])
+_YM_UNIT_CUM_P = np.cumsum([0.50, 0.08, 0.32, 0.10])
+_YM_UNIT_CUM_M = np.cumsum([0.46, 0.12, 0.24, 0.18])
+_YM_MAX_STEP = 150.0
+
+def _ym_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _ym_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _ym_target(r, nd, K, sig, dsd, jrate, jlo, jhi, pshift):
+    ns = nd * K
+    phi = float(np.exp(-1.0 / (r.uniform(8.0, 40.0) * K)))
+    e = r.standard_normal(ns) * (dsd / K * np.sqrt(1.0 - phi * phi))
+    v = np.empty(ns)
+    a = float(r.standard_normal() * dsd / K)
+    for i in range(ns):
+        a = phi * a + e[i]
+        v[i] = a
+    v += (sig / np.sqrt(K)) * r.standard_normal(ns)
+    if jrate > 0.0:
+        k = int(r.poisson(jrate * nd))
+        if k > 0:
+            np.add.at(v, r.integers(0, ns, k), np.where(r.random(k) < 0.5, -1.0, 1.0)
+                      * np.exp(r.uniform(np.log(jlo), np.log(jhi), k)))
+    rho = 1.0 - 1.0 / (r.uniform(20.0, 60.0) * K)
+    w = np.empty(ns)
+    a = 0.0
+    for i in range(ns):
+        a = rho * a + v[i]
+        w[i] = a
+    if r.random() < pshift:
+        w[int(r.integers(1, max(ns, 2))):] += (1.0 if r.random() < 0.5 else -1.0) * r.uniform(30.0, 100.0)
+    return w - w[0] + r.normal(0.0, 3.0)
+
+def _ym_times(r, nd, Pd, phases, jit, rate, dayf, bern=False):
+    lam = np.minimum(rate * dayf, 60.0)
+    k = (r.random(nd) < lam).astype(np.int64) if bern else r.poisson(lam)
+    tot = int(k.sum())
+    if tot == 0:
+        return np.zeros(0)
+    day = np.repeat(np.arange(nd, dtype=np.float64), k)
+    if jit is None:
+        ph = r.uniform(0.0, Pd, tot)
+    else:
+        ph = np.asarray(phases)[r.integers(0, len(phases), tot)] + r.normal(0.0, jit, tot)
+    return np.sort(day * Pd + ph)
+
+def _ym_quant(r, a, d, unit):
+    v = a + d
+    if unit == 0:
+        new = a + 10.0 * np.round(d / 10.0)
+    elif unit == 1:
+        new = a + 5.0 * np.round(d / 5.0)
+    elif unit == 2:
+        b = np.floor(v / 10.0) * 10.0
+        c = np.array((b - 1.0, b + 5.0, b + 9.0))
+        new = float(c[int(np.argmin(np.abs(c - v)))])
+    elif r.random() < 0.5:
+        new = np.round((v - 9.0) / 10.0) * 10.0 + 9.0
+    else:
+        new = float(np.round(v))
+    s = float(new - a)
+    return s if abs(s) >= 1.0 else 0.0
+
+def _ym_base(r, times, slot, w, band, unit, p0, cap):
+    nt = times.size
+    idx = np.zeros(2 * nt, dtype=np.int64)
+    stp = np.zeros(2 * nt)
+    pre = 0.15 if unit >= 2 else 0.0
+    cur = 0.0
+    m = 0
+    sl = np.minimum((times / slot).astype(np.int64), w.size - 1)
+    for j in range(nt):
+        d = w[sl[j]] - cur
+        if abs(d) < band:
+            continue
+        s = _ym_quant(r, p0 + cur, min(max(d, -cap), cap), unit)
+        if s == 0.0:
+            continue
+        cur += s
+        if abs(s) >= 10.0 and r.random() < pre:
+            e = (1.0, 2.0, 4.0)[int(r.integers(0, 3))] * (1.0 if s > 0 else -1.0)
+            idx[m], stp[m] = int(times[j]), e
+            idx[m + 1], stp[m + 1] = int(times[j] + _ym_lu(r, 10.0, 300.0)), s - e
+            m += 2
+            continue
+        idx[m] = int(times[j])
+        stp[m] = s
+        m += 1
+    return idx[:m], stp[:m]
