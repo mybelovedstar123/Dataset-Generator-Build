@@ -27386,3 +27386,293 @@ def _yz_num(v, default: float) -> float:
     return v if np.isfinite(v) and v >= 0.0 else default
 
 _YZParent = Generator
+
+class Generator(_YZParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        cfg: dict = {}
+        try:
+            with open(_yz_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yz_json.load(fh).get("y_insert", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        mult = min(_yz_num(cfg.get("rate", 1.0), 1.0), 20.0)
+        fams = []
+        for k, (key, fn) in enumerate(_YZ_FAMS):
+            q = min(_yz_num(cfg.get(key, 0.0), 0.0) * mult, _YZ_MAX_SHARE)
+            f = globals().get(fn)
+            if q > 0.0 and callable(f):
+                fams.append((k, q, f))
+        self._yz_fams = tuple(fams)
+
+        self._yz_open = min(max(_yz_num(cfg.get("open", 0.0), 0.0), 0.0), 0.95)
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        fams = self._yz_fams
+        seed = int(self._seed) & ((1 << 64) - 1)
+        slots = len(_YZ_FAMS)
+        out = 0
+        lo = self._yz_open * _YZ_CHILD_BUDGET
+        pos = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                fams = self._yz_fams
+                if fams and (lo <= 0 or pos >= lo):
+                    u = _fcx_coins(seed, _YZ_TAG, i, slots)
+                    for k, q, f in fams:
+                        if u[k] >= q:
+                            continue
+                        w = None
+                        try:
+                            with np.errstate(all="ignore"):
+                                w = f(np.random.default_rng(np.random.SeedSequence([seed, _YZ_TAG, k + 1], spawn_key=(i,))), _YZ_L)
+                        except Exception:
+                            w = None
+                        if (isinstance(w, np.ndarray) and w.ndim == 1 and w.size == _YZ_L and w.dtype.kind == "f"
+                                and bool(np.all(np.isfinite(w))) and float(w.max()) > float(w.min())):
+                            yield np.ascontiguousarray(w, dtype=np.float64)
+                            out += 1
+                            if lo > 0:
+                                pos += _YZ_L
+                            if out >= n:
+                                return
+                yield x
+                if lo > 0:
+                    pos += _yz_points(x)
+                out += 1
+                if out >= n:
+                    return
+        finally:
+            base.close()
+
+import json as _yc_json
+import os as _yc_os
+
+_YC_TAG = 0x59C0_0001
+_YC_MIN_LEN = 256
+_YC_MAX_SHARE = 0.5
+_YC_HOSTS = (1, 2, 3, 4)
+
+_YC_FAMS = (("ch_airqm", "_ya_airqm"), ("ch_airq0", "_ya_airq0"), ("ch_grid15", "_yb_grid15"), ("ch_min1440", "_yc_min1440"),
+            ("ch_rates", "_yd_rates"), ("ch_freeze", "_yf_freeze"), ("ch_counts2", "_ye_counts2"),
+            ("ch_civic", "_yj_civic"), ("ch_bike", "_yl_bike"), ("ch_health", "_yi_health"), ("ch_hydro", "_yk_hydro"),
+            ("ch_micro", "_yn_micro"), ("ch_fuel", "_ym_fuel"), ("ch_ozone", "_yo_ozone"),
+            ("ch_hourly0", "_yp_hourly0"), ("ch_econ", "_yt_econ"), ("ch_sales", "_yr_sales"), ("ch_energy", "_ys_energy"), ("ch_transport", "_yq_transport"))
+
+def _yc_num(v, default: float) -> float:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if np.isfinite(v) and v >= 0.0 else default
+
+def _yc_host(x, hosts=_YC_HOSTS) -> bool:
+    if not isinstance(x, np.ndarray) or x.dtype != np.float64:
+        return False
+    c = 1 if x.ndim == 1 else (x.shape[0] if x.ndim == 2 else 0)
+    if c not in hosts or x.shape[-1] < _YC_MIN_LEN:
+        return False
+    if x.flags.c_contiguous:
+        if not _v2_all_finite(x.reshape(-1)):
+            return False
+    elif not bool(np.all(np.isfinite(x))):
+        return False
+    x0 = x if x.ndim == 1 else x[0]
+    if x0.flags.c_contiguous:
+        if _v2_all_equal_first(x0):
+            return False
+    elif bool(np.all(x0 == x0[0])):
+        return False
+    for h in ("_k87_quiet", "_w86b_intlike"):
+        f = globals().get(h)
+        if callable(f):
+            try:
+                if f(x0):
+                    return False
+            except Exception:
+                return False
+    return True
+
+_YCParent = Generator
+
+class Generator(_YCParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        cfg: dict = {}
+        try:
+            with open(_yc_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yc_json.load(fh).get("y_channel", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        mult = min(_yc_num(cfg.get("rate", 1.0), 1.0), 20.0)
+        fams = []
+        for k, (key, fn) in enumerate(_YC_FAMS):
+            q = min(_yc_num(cfg.get(key, 0.0), 0.0) * mult, _YC_MAX_SHARE)
+            f = globals().get(fn)
+            if q > 0.0 and callable(f):
+                fams.append((k, q, f))
+        self._yc_fams = tuple(fams)
+        try:
+            hs = tuple(int(h) for h in cfg.get("hosts", _YC_HOSTS))
+        except (TypeError, ValueError):
+            hs = _YC_HOSTS
+        self._yc_hosts = tuple(h for h in hs if 1 <= h <= 7) or _YC_HOSTS
+
+        self._yc_open = min(max(_yc_num(cfg.get("open", 0.0), 0.0), 0.0), 0.95)
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        fams = self._yc_fams
+        seed = int(self._seed) & ((1 << 64) - 1)
+        slots = len(_YC_FAMS)
+        lo = self._yc_open * _YZ_CHILD_BUDGET if "_YZ_CHILD_BUDGET" in globals() else 0.0
+        pos = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                fams = self._yc_fams
+                if fams and (lo <= 0 or pos >= lo) and _yc_host(x, self._yc_hosts):
+                    u = _fcx_coins(seed, _YC_TAG, i, slots)
+                    for k, q, f in fams:
+                        if u[k] >= q:
+                            continue
+                        L = int(x.shape[-1])
+                        w = None
+                        try:
+                            with np.errstate(all="ignore"):
+                                w = f(np.random.default_rng(np.random.SeedSequence([seed, _YC_TAG, k + 1], spawn_key=(i,))), L)
+                        except Exception:
+                            w = None
+                        if (isinstance(w, np.ndarray) and w.ndim == 1 and w.size == L and w.dtype.kind == "f"
+                                and bool(np.all(np.isfinite(w))) and float(w.max()) > float(w.min())):
+                            h = x.reshape(1, L) if x.ndim == 1 else x
+                            z = np.empty((h.shape[0] + 1, L), dtype=np.float64)
+                            z[:-1] = h
+                            z[-1] = w
+                            x = z
+                            break
+                if lo > 0:
+                    pos += _yz_points(x)
+                yield x
+        finally:
+            base.close()
+
+import json as _yac_json
+import os as _yac_os
+
+_YAC_TAG = 0x59E0_0001
+
+def _yac_moving(c) -> bool:
+    d = np.diff(c)
+    return bool(_v2_mean(d == 0.0) < 0.3) and not bool(np.all(c == np.round(c)))
+
+def _yac_couple(x, r):
+    C, L = x.shape
+    d0 = np.diff(x[0])
+    s0 = float(_v2_std(d0))
+    if not np.isfinite(s0) or s0 <= 0.0 or not _yac_moving(x[0]):
+        return None
+    z0 = d0 / s0
+    out = x.copy()
+    for k in range(1, C):
+        xk = x[k]
+        dk = np.diff(xk)
+        sk = float(_v2_std(dk))
+        if not np.isfinite(sk) or sk <= 0.0 or not _yac_moving(xk):
+            continue
+        lag = int(r.integers(0, 4))
+        zl = np.concatenate([np.zeros(lag), z0[: len(z0) - lag]]) if lag else z0
+        rho = float(np.clip(r.beta(4.0, 3.0), 0.2, 0.95)) * (1.0 if r.random() < 0.85 else -1.0)
+        own = (dk - _v2_meanm(dk)) / sk
+        dn = rho * zl + np.sqrt(1.0 - rho * rho) * own
+        y = np.concatenate([[xk[0]], xk[0] + np.cumsum(dn * sk + _v2_meanm(dk))])
+        if bool(np.all(xk >= 0.0)):
+            y = np.maximum(y, 0.0)
+        if bool(np.all(np.isfinite(y))) and float(y.max()) > float(y.min()):
+            out[k] = y
+    return out
+
+_YACParent = Generator
+
+class Generator(_YACParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_yac_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yac_json.load(fh).get("y_couple", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        try:
+            q = float(cfg.get("q", 0.0))
+        except (TypeError, ValueError):
+            q = 0.0
+        self._yac_q = q if np.isfinite(q) and 0.0 <= q <= 1.0 else 0.0
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        q = self._yac_q
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                q = self._yac_q
+                if q > 0.0 and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.ndim == 2 and x.shape[0] >= 2 and x.shape[1] >= 256:
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _YAC_TAG], spawn_key=(i,)))
+                    if r.random() < q:
+                        try:
+                            with np.errstate(all="ignore"):
+                                z = _yac_couple(x, r)
+                            if z is not None and bool(np.all(np.isfinite(z))):
+                                x = z
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
+
+import json as _ybq_json
+import os as _ybq_os
+
+_YBQ_TAG = 0x59E0_0002
+
+def _ybq_round(c, r):
+    if bool(np.all(c == np.round(c))):
+        return c
+    lvl = float(np.median(np.abs(c)))
+    if not np.isfinite(lvl) or lvl <= 0.0:
+        return c
+    if lvl >= 20.0 and r.random() < 0.5:
+        y = np.round(c)
+    else:
+        digits = 3 if r.random() < 0.5 else 4
+        step = 10.0 ** (np.floor(np.log10(lvl)) - digits + 1)
+        y = np.round(c / step) * step
+    return y if float(y.max()) > float(y.min()) else c
+
+_YBQParent = Generator
