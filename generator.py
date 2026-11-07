@@ -4764,18 +4764,6 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
     "road_commute_counts": 0.0,
 }
 
-
-# --- RNG-stream isolation: dispatch reference -------------------------------
-#
-# The throne corpus's exact family_weights (raw values copied verbatim from
-# gen-08-11-rk4-intfrac-086-tidal-005-cw-006-v1/config.json). Dispatch first
-# assigns every row against THIS fixed reference cdf — bit-identical to the
-# source's ``rng.choice(..., p=family_weights)`` when the config weights equal
-# the reference — and then moves the minimal possible mass (a maximal
-# coupling) from the reference assignment to the ACTIVE config weights using a
-# dedicated per-chunk stream. A +2pp weight edit therefore reassigns only
-# ~the shifted mass (total-variation distance) instead of the ~18% that the
-# inverse-cdf coupling reassigns when every cumulative boundary rescales.
 _DISPATCH_REF_RAW: dict[str, float] = {
     "trend_seasonal_ar": 0.019766081871345043,
     "regime_shift": 0.015204678362573111,
@@ -4812,24 +4800,17 @@ _DISPATCH_REF_RAW: dict[str, float] = {
     "sl_noisy_int": 0.0,
     "rk4_flows": 0.025,
     "tidal_constituents": 0.052631578947368425,
-    # Grafted families: zero REFERENCE weight so the reference cdf still spans
-    # all 36 families while assigning exactly the throne's 34-family
-    # distribution. Their cdf entries sit at exactly 1.0 (cumsum adds 0.0,
-    # then /= cdf[-1] — the same divisor as the 34-family cdf), so
-    # ``searchsorted(u, side="right")`` with u < 1 can never land on them:
-    # reference assignment for existing rows stays bit-identical, and only
-    # the maximal-coupling rebalance can move rows into these families.
+
     "envelope_mod": 0.0,
     "rate_counts": 0.0,
     "dispersion_counts": 0.0,
     "dispatch_blocks": 0.0,
-    # chronoforge grafts: same treatment — zero reference weight, cdf at 1.0
+
     **{name: 0.0 for name in CF_GRAFT},
     **{name: 0.0 for name in _ED5},
     **{name: 0.0 for name in _POOL4},
     **{name: 0.0 for name in _DEEP1},
-    # grafted vanta native family: zero reference weight, cdf at 1.0 (unreachable
-    # by the base searchsorted; enters only via maximal-coupling excess)
+
     "cycle_profile": 0.0,
     "sales_promo_stockout_panel": 0.0,
     "settle_hold": 0.0,
@@ -4846,11 +4827,7 @@ _DISPATCH_REF_RAW: dict[str, float] = {
     "road_commute_counts": 0.0,
 }
 
-
 def _build_dispatch_ref() -> tuple[np.ndarray, np.ndarray]:
-    """Replicate Generator.__init__'s weight parse bit-for-bit on the
-    reference raw weights, then build the cdf exactly the way
-    ``Generator.choice`` builds it internally (cumsum, then /= cdf[-1])."""
     weights = dict(_DEFAULT_WEIGHTS)
     for key, value in _DISPATCH_REF_RAW.items():
         if key in weights:
@@ -4861,56 +4838,17 @@ def _build_dispatch_ref() -> tuple[np.ndarray, np.ndarray]:
     cdf /= cdf[-1]
     return w, cdf
 
-
 _DISPATCH_REF, _DISPATCH_REF_CDF = _build_dispatch_ref()
 
-# Seed-key tag for the per-chunk dispatch-coupling stream. All isolated
-# streams use fixed-length 5-tuple keys (base_seed, chunk, fam, slot, tag);
-# the dispatch stream uses fam = 999 — a sentinel no family index can take
-# now or under any near-term graft (was len(_FAMILIES), which collides as
-# soon as a 35th family is appended: fam index 34 would share the old key).
 _DISPATCH_STREAM_FAM = 999
 
-
-# --- throughput: hoisted draw tables ---------------------------------------
-#
-# ``Generator.choice`` re-validates ``a``, re-normalises ``p`` and rebuilds the
-# cumulative table on EVERY call, which costs ~24us against ~2us for the draw
-# itself — and at n=1 this generator calls it once per row per family. numpy
-# implements the weighted case as ``cdf.searchsorted(self.random(shape),
-# side="right")`` and the unweighted case as ``a[self.integers(0, len(a),
-# shape)]``, so hoisting the table out reproduces both the values AND the
-
-# ==============================================================================
-# RNG: seeding, stream pools, self-check
-# ==============================================================================
-
 def _choice_cdf(p) -> np.ndarray:
-    """Pre-build the exact cumulative table ``Generator.choice`` derives."""
     cdf = np.asarray(p, dtype=np.float64).cumsum()
     cdf /= cdf[-1]
     return cdf
 
-
 _CHOICE_PM1 = np.array([-1.0, 1.0], dtype=np.float64)
 
-
-# --- throughput: batched stream seeding -------------------------------------
-#
-# Every row derives three isolated streams (builder / observation / postprocess)
-# and the observation stage derives four more, so a single row pays SEVEN
-# ``default_rng(SeedSequence(...))`` constructions — ~40us each, ~15% of total
-# generation time, to draw as few as one number per stream.
-#
-# The streams themselves are load-bearing (they are what makes a config edit
-# touch only the rows it feeds), so the seeds must not change. Instead the
-# construction is replaced by numpy's own algorithm, run in bulk: SeedSequence
-# mixes a 4-word pool with a fixed integer hash chain and PCG64 seeds itself
-# from ``generate_state(4, uint64)``, both of which vectorise across keys that
-# share an entropy layout. The result is the identical 128-bit PCG64 state, so
-# every stream is byte-for-byte the stream numpy would have produced
-# (verified against numpy for every key shape used here in
-# _speedup/seedseq_check.py). Keys with an unexpected layout fall back to numpy.
 _SS_U32 = 0xFFFFFFFF
 _SS_U128 = (1 << 128) - 1
 _SS_POOL_SIZE = 4
@@ -4923,9 +4861,7 @@ _SS_MIX_R = np.uint32(0x4973F715)
 _SS_XSHIFT = np.uint32(16)
 _PCG64_MULT = 47026247687942121848144207491837523525
 
-
 def _ss_entropy_words(value: int) -> list[int]:
-    """numpy's ``_int_to_uint32_array``: little-endian words, ``[0]`` for zero."""
     value = int(value)
     if value < 0:
         raise ValueError("seed entropy must be non-negative")
@@ -4937,7 +4873,6 @@ def _ss_entropy_words(value: int) -> list[int]:
         value >>= 32
     return words
 
-
 def _ss_hashmix(value: np.ndarray, hash_const: int):
     value = value ^ np.uint32(hash_const)
     hash_const = (hash_const * _SS_MULT_A) & _SS_U32
@@ -4945,18 +4880,11 @@ def _ss_hashmix(value: np.ndarray, hash_const: int):
     value = value ^ (value >> _SS_XSHIFT)
     return value, hash_const
 
-
 def _ss_mix(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     result = _SS_MIX_L * x - _SS_MIX_R * y
     return result ^ (result >> _SS_XSHIFT)
 
-
 def _pcg64_seed_words(columns: list[np.ndarray]) -> np.ndarray:
-    """``SeedSequence(entropy).generate_state(4, uint64)`` for a batch of keys.
-
-    ``columns[i]`` holds word ``i`` of every key's assembled uint32 entropy.
-    Returns an ``(n_keys, 4)`` uint64 array.
-    """
     hash_const = _SS_INIT_A
     n_words = len(columns)
     zero = np.zeros_like(columns[0])
@@ -4985,16 +4913,8 @@ def _pcg64_seed_words(columns: list[np.ndarray]) -> np.ndarray:
         packed[:, i] = value ^ (value >> _SS_XSHIFT)
     return packed.view(np.uint64)
 
-
 @njit(cache=False, fastmath=False)
 def _pcg64_seed_words_jit(seeds):
-    """Per-key form of :func:`_pcg64_seed_words` for scalar integer seeds.
-
-    Same hash chain, compiled: the vectorised form only pays for its ~50 numpy
-    dispatches across a whole chunk, and a pure-python loop is slower than the
-    numpy constructor it replaces. ``seeds`` is a uint64 vector; the returned
-    ``(k, 4)`` uint64 array holds each key's ``generate_state(4, uint64)``.
-    """
     mask = np.uint64(0xFFFFFFFF)
     mult_a = np.uint64(0x931E8875)
     mult_b = np.uint64(0x58F38DED)
@@ -5012,8 +4932,7 @@ def _pcg64_seed_words_jit(seeds):
 
     for key in range(k):
         seed = seeds[key]
-        # numpy encodes an integer as little-endian uint32 words, and zero as a
-        # single zero word.
+
         if seed > mask:
             entropy[0] = seed & mask
             entropy[1] = seed >> thirty_two
@@ -5057,15 +4976,7 @@ def _pcg64_seed_words_jit(seeds):
             out[key, i] = words[2 * i] | (words[2 * i + 1] << thirty_two)
     return out
 
-
 def _ss_columns(parts: list, n_keys: int) -> list[np.ndarray] | None:
-    """Assemble entropy columns, or ``None`` if the keys are not uniform.
-
-    ``parts`` mixes python ints (shared by every key) with integer arrays (one
-    value per key). numpy encodes each component as however many little-endian
-    uint32 words its magnitude needs, so a part whose values straddle 2**32 has
-    no single column layout and the caller must fall back to numpy.
-    """
     columns: list[np.ndarray] = []
     for part in parts:
         if np.ndim(part) == 0:
@@ -5076,10 +4987,10 @@ def _ss_columns(parts: list, n_keys: int) -> list[np.ndarray] | None:
         if values.min() < 0 or values.max() >= (1 << 64):
             return None
         values = values.astype(np.uint64)
-        # zero and any value below 2**32 occupy one word; above it, two.
+
         n_words = 2 if values.max() > _SS_U32 else 1
         if n_words == 2 and values.min() <= _SS_U32:
-            return None  # mixed widths within one component
+            return None
         for shift in range(n_words):
             columns.append(
                 ((values >> np.uint64(32 * shift)) & np.uint64(_SS_U32))
@@ -5087,15 +4998,7 @@ def _ss_columns(parts: list, n_keys: int) -> list[np.ndarray] | None:
             )
     return columns
 
-
 class _StreamPool:
-    """Reusable PCG64/Generator pairs, reseeded in place per row.
-
-    Constructing a ``Generator`` is ~40us; overwriting a bit generator's state
-    is ~3us. Each slot owns a distinct pair, so streams that are live at the
-    same time (a row's observation stream and the four stage streams it
-    derives) never share a bit generator.
-    """
 
     __slots__ = ("_bitgens", "_rngs")
 
@@ -5104,7 +5007,6 @@ class _StreamPool:
         self._rngs = [np.random.Generator(b) for b in self._bitgens]
 
     def seeded(self, slot: int, w0, w1, w2, w3) -> np.random.Generator:
-        """Reseed slot ``slot`` from one key's four uint64 state words."""
         seed = (int(w0) << 64) | int(w1)
         inc = ((((int(w2) << 64) | int(w3)) << 1) | 1) & _SS_U128
         state = (inc + seed) & _SS_U128
@@ -5117,17 +5019,7 @@ class _StreamPool:
         }
         return self._rngs[slot]
 
-
 def _assert_seeding_replica() -> None:
-    """Fail at import if the seeding fast path stops matching numpy.
-
-    ``_pcg64_seed_words``/``_pcg64_seed_words_jit``/``_StreamPool.seeded``
-    reimplement ``SeedSequence`` mixing and ``PCG64`` init to skip ~16% of the
-    per-row cost. That is only sound while it reproduces numpy exactly, so
-    check it against the real thing rather than trusting the pin in
-    requirements.txt. A wrong stream here would silently change every series,
-    which is far worse than refusing to load.
-    """
     pool = _StreamPool(1)
 
     def check(what, key, words):
@@ -5139,8 +5031,6 @@ def _assert_seeding_replica() -> None:
                 f"{np.__version__} on key {key!r}"
             )
 
-    # Both entropy-width regimes: every component under 2**32 (one uint32 word
-    # each) and every component above it (two).
     big = 5125841920496347586
     for batch in (
         [(0, 0, 0, 0, 0), (1, 2, 3, 4, 5), (123456789, 17, 4, 2, 9)],
@@ -5157,8 +5047,6 @@ def _assert_seeding_replica() -> None:
         for row, key in enumerate(batch):
             check("vectorised", key, state_words[row])
 
-    # A component straddling 2**32 has no single column layout, and the caller
-    # relies on None to fall back to numpy rather than emitting a wrong stream.
     if _ss_columns([np.array([1, big], dtype=np.uint64)], 2) is not None:
         raise RuntimeError("_ss_columns accepted a mixed-width component")
 
@@ -5167,21 +5055,11 @@ def _assert_seeding_replica() -> None:
     for row, seed in enumerate(scalar_seeds.tolist()):
         check("scalar", int(seed), words[row])
 
-
 _assert_seeding_replica()
 
-
-# The observation stage's four sub-streams are derived inside a module-level
-# function, so their pool lives here. Thread-local because the pool is mutable
-# state and a caller may drain more than one generator at once.
 _STAGE_POOL = local()
 
-# Same reason, for the per-row streams the chunk loop hands to each family
-# group. A _StreamPool reseeds one bit generator in place per slot, so two
-# family groups building at once must not share one: thread-local pools give
-# each builder thread its own, keyed by the tag count in use.
 _ROW_POOL = local()
-
 
 def _row_pool(size: int) -> "_StreamPool":
     if getattr(_ROW_POOL, "size", 0) < size:
@@ -5189,34 +5067,7 @@ def _row_pool(size: int) -> "_StreamPool":
         _ROW_POOL.size = size
     return _ROW_POOL.pool
 
-# ==============================================================================
-# Parallel family-group workers
-# ==============================================================================
-
 def _producer_workers() -> int:
-    """Threads used to build the family groups of one chunk.
-
-    The family groups of a chunk are independent: each draws from streams keyed
-    (base_seed, chunk_index, fam, slot, tag) and writes only its own slots, so
-    the corpus does not depend on how many run at once or in what order.
-
-    What caps this is the GIL, not the core count -- only the numba kernels and
-    the bulk ufunc loops release it, so the curve saturates early and then goes
-    backwards. Measured on h6-sales against the 5.3M points/s serial baseline:
-
-        cores   1 worker   2 workers   3 workers   4 workers
-          1       1.02x      0.98x       0.95x       0.94x
-          2       1.00x      1.41x       1.25x       1.19x
-          4       1.03x      1.44x       1.50x       1.49x
-         32       1.01x      1.42x       1.45x       1.38x
-
-    Hence the steps below. A one-core lane must stay serial -- threads there
-    are a real if small loss -- and three is only worth it once the slice can
-    actually hold three runnable threads.
-
-    The affinity set, not os.cpu_count(), is what a pod lane is allowed to use:
-    on a cgroup-limited container cpu_count reports the whole host.
-    """
     try:
         avail = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
@@ -5226,18 +5077,9 @@ def _producer_workers() -> int:
         return 1
     return 2 if avail < 4 else 3
 
-
 _PRODUCER_WORKERS = _producer_workers()
 
-
 def _run_family_groups(build, tasks: list) -> None:
-    """Build a chunk's family groups across ``_PRODUCER_WORKERS`` threads.
-
-    Groups claim work off a shared index and write only into their own slots of
-    the chunk, so the result is independent of scheduling. The first exception
-    stops the remaining claims and is re-raised on the calling thread, which
-    keeps the producer's existing error path intact.
-    """
     nxt = [0]
     err: list[BaseException] = []
     lock = Lock()
@@ -5266,27 +5108,18 @@ def _run_family_groups(build, tasks: list) -> None:
     if err:
         raise err[0]
 
-
-# ==============================================================================
-# Hoisted CDF / physical constant tables
-# ==============================================================================
-
 _ENV_PERIODS = np.array([24.0, 48.0, 96.0, 168.0])
 _ENV_PERIOD_CDF = _choice_cdf([0.35, 0.20, 0.30, 0.15])
 _RATE_PERIODS = np.array([24.0, 96.0, 168.0, 336.0])
 _RATE_PERIOD_CDF = _choice_cdf([0.35, 0.30, 0.20, 0.15])
 _HOLD_FACTORS = np.array([2, 4, 8])
 _HOLD_FACTOR_CDF = _choice_cdf([0.55, 0.30, 0.15])
-# _cycle_profile drew these per row via ``rng.choice(a, p=...)``, the last such
-# site in this file. Hoisted for the reason given above _choice_cdf: the table
-# rebuild costs an order of magnitude more than the draw, and the hoisted form
-# reproduces the value and the stream position exactly.
+
 _CYCLE_PERIODS = np.array([7, 24, 48, 60, 96, 144, 168, 240, 288, 336, 672])
 _CYCLE_PERIOD_CDF = _choice_cdf(
     [0.1113, 0.2321, 0.0862, 0.1610, 0.1386, 0.0392,
      0.0040, 0.0040, 0.2156, 0.0040, 0.0040]
 )
-
 
 _CLEAN: frozenset[str] = frozenset({
     "held_rate",
@@ -5308,62 +5141,25 @@ _CLEAN: frozenset[str] = frozenset({
     "road_commute_counts",
 })
 
-
-# Standard tidal constituents: period in HOURS and typical amplitude relative
-# to M2. These are physical constants, not fitted parameters — the ratios
-# between them are what generate the spring-neap beat, and they are identical
-# at every gauge on Earth. Only the amplitudes and phases are site-specific.
 _TIDE_CONSTITUENTS = np.array([
-    [12.420601, 1.00],   # M2  principal lunar semidiurnal
-    [12.000000, 0.46],   # S2  principal solar semidiurnal
-    [12.658348, 0.19],   # N2  larger lunar elliptic
-    [11.967235, 0.13],   # K2  lunisolar semidiurnal
-    [23.934470, 0.58],   # K1  lunisolar diurnal
-    [25.819342, 0.41],   # O1  principal lunar diurnal
-    [24.065890, 0.19],   # P1  principal solar diurnal
-    [26.868357, 0.08],   # Q1  larger lunar elliptic diurnal
+    [12.420601, 1.00],
+    [12.000000, 0.46],
+    [12.658348, 0.19],
+    [11.967235, 0.13],
+    [23.934470, 0.58],
+    [25.819342, 0.41],
+    [24.065890, 0.19],
+    [26.868357, 0.08],
 ], dtype=np.float64)
 
-# Sampling intervals in MINUTES that real gauge feeds arrive on. The period in
-# SAMPLES depends on this, so drawing it here is what lets one family cover
-# 5-min, 15-min and hourly gauges with the same physics.
 _TIDE_DT_MINUTES = np.array([5.0, 6.0, 10.0, 15.0, 30.0, 60.0], dtype=np.float64)
 _TIDE_DT_CDF = _choice_cdf([0.35, 0.25, 0.15, 0.15, 0.05, 0.05])
 _TIDE_DIURNAL = np.array(
     [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64
 )[None, :]
 
-
-# ==============================================================================
-# Native specialized families
-# ==============================================================================
-
 def _tidal_constituents(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Tide gauge records built from the real constituent set.
 
-    Measured on the pool's ``marine_ie_tide_gauges`` series (5-min sampling):
-    dominant periods 147.6 / 295.2 / 138.9 samples, which are M2 (149.0), K1
-    (287.2) and S2 (144.0). Range +-1.7 m about a site datum, std ~1.0.
-
-    Why ``_tidal_harmonic`` cannot cover this. It draws ``base ~ U(10, 400)``
-    and each period as ``base * U(0.31, 2.7)`` — arbitrary and mutually
-    unconstrained. The predictability of a tide record does not come from
-    having several sinusoids; it comes from those sinusoids sitting at FIXED
-    frequency ratios, which produce a repeatable spring-neap envelope (M2
-    against S2 beats with a 14.77-day period) that a model can read off the
-    context and extrapolate exactly. Randomising the ratios destroys the one
-    structure worth learning, and leaves a signal whose correct interval looks
-    much wider than a real gauge's.
-
-    In the duel receipt where uid31 was dethroned, the winning challenger cut
-    the king's WQL on ``marine_ie_tide_gauges`` from 0.1193 to 0.0694 (+41.8%,
-    winning 96% of those windows) — and king31 weights ``tidal_harmonic`` at
-    exactly 0.0, so it trains on no tidal signal at all.
-    """
-    # Weighted toward 5-6 min: that is what real gauge networks publish (the
-    # pool's marine_ie feed is 5-min, NOAA is 6-min), and drawing uniformly
-    # over the six intervals would leave only ~1/6 of these rows at the
-    # sampling the eval gauges actually use, diluting the signal that matters.
     dt = _TIDE_DT_MINUTES[
         _TIDE_DT_CDF.searchsorted(rng.random((n, 1)), side="right")
     ]
@@ -5373,20 +5169,13 @@ def _tidal_constituents(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     periods_h = _TIDE_CONSTITUENTS[:, 0]
     rel_amp = _TIDE_CONSTITUENTS[:, 1]
 
-    # Site character: how strongly diurnal vs semidiurnal this gauge runs.
-    # The form factor (K1+O1)/(M2+S2) is the standard classifier, and real
-    # gauges span semidiurnal (<0.25) through mixed to diurnal (>3).
     form = np.exp(rng.normal(np.log(0.35), 0.9, size=(n, 1)))
 
-    # One np.sin over the stacked (constituent, row, time) argument instead of
-    # eight separate full-length calls. The draws stay interleaved in their
-    # original amp-then-phase order, and every elementwise expression is
-    # unchanged, so the accumulated sum is bit-identical.
     two_pi_t = 2.0 * np.pi * t
     amps = np.empty((n_con, n, 1), dtype=np.float64)
     args = np.empty((n_con, n, L), dtype=np.float64)
     for i in range(n_con):
-        period_samples = periods_h[i] * 60.0 / dt          # (n,1)
+        period_samples = periods_h[i] * 60.0 / dt
         amp = rel_amp[i] * (1.0 + 0.25 * rng.normal(size=(n, 1)))
         amps[i] = np.abs(amp) * np.where(_TIDE_DIURNAL[:, i] > 0, form, 1.0)
         phase = rng.uniform(0.0, 2.0 * np.pi, size=(n, 1))
@@ -5398,9 +5187,6 @@ def _tidal_constituents(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     for i in range(n_con):
         out += amps[i] * args[i]
 
-    # Meteorological residual: a slow, smooth surge riding on the astronomy.
-    # Real gauges carry it, and it is the part that is genuinely uncertain —
-    # keeping it SMALL relative to the deterministic sum is the whole lesson.
     surge = np.cumsum(rng.normal(size=(n, L)), axis=1)
     surge = surge - surge.mean(axis=1, keepdims=True)
     surge_sd = np.maximum(surge.std(axis=1, keepdims=True), 1e-9)
@@ -5411,16 +5197,6 @@ def _tidal_constituents(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     datum = rng.uniform(-1.0, 1.0, size=(n, 1)) * scale
     return out * scale + datum
 
-
-# Two-process envelope superposition, after SarSim0 (arXiv:2601.00970) whose
-# ablation reports removing this "SARIMA-2" mechanism causes the largest
-# accuracy drop across backbones: a fast base process (intraday/weekly-scale
-# seasonality + AR texture) is cross-modulated by an INDEPENDENT slow
-# envelope, additively or multiplicatively. Real web/cloudops load is exactly
-# a daily shape carried by a weekly/holiday envelope; spring-neap-like beats
-# give the same structure to environmental series. Our existing families
-# superpose harmonics of ONE process; none modulate a fast process with a
-# second independent slow one.
 def _envelope_mod(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     t = _time_index(L)
     base_period = _ENV_PERIODS[
@@ -5434,8 +5210,7 @@ def _envelope_mod(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     phi = rng.uniform(0.5, 0.95, size=(n, 1))
     sigma = rng.uniform(0.05, 0.35, size=(n, 1))
     eps = rng.normal(size=(n, L)) * sigma
-    # scipy's compiled recurrence is bit-identical to the scalar loop and
-    # removes ~8 ms of Python overhead from each isolated envelope row.
+
     ar = _ar1_batch(eps, phi)
     base = base + ar
 
@@ -5445,8 +5220,7 @@ def _envelope_mod(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     walk = np.cumsum(rng.normal(size=(n, L)), axis=1)
     kernel_w = max(int(L / 32), 8)
     kernel = np.ones(kernel_w) / kernel_w
-    # np.apply_along_axis rebuilds an iterator and a closure frame per row; the
-    # loop calls the same np.convolve on the same input.
+
     smooth = np.empty_like(walk)
     for r in range(walk.shape[0]):
         smooth[r] = np.convolve(walk[r], kernel, mode="same")
@@ -5467,15 +5241,6 @@ def _envelope_mod(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     offset = rng.uniform(-1.0, 3.0, size=(n, 1))
     return (out + offset) * scale
 
-
-# Level-dependent rate noiser family, after SarSim0 (arXiv:2601.00970, App.
-# E.3): a smooth latent intensity drives per-step count/positive draws --
-# doubly-stochastic Poisson (request/error/dispatch counts), Gamma or
-# Lognormal (positive heavy-tailed rates). Distinct from seasonal_counts /
-# intermittent, whose intensity is their own fixed seasonal template: here
-# ANY smooth latent (seasonal + AR + slow walk) modulates the observation
-# law, so low-intensity stretches emit exact-zero runs and high-intensity
-# stretches emit near-Gaussian counts in one series.
 def _rate_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     t = _time_index(L)
     period = _RATE_PERIODS[
@@ -5509,7 +5274,6 @@ def _rate_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             )
     return out
 
-
 def _step_level(
     rng: np.random.Generator,
     n: int,
@@ -5521,20 +5285,6 @@ def _step_level(
     noise_lo: float = 0.002,
     noise_hi: float = 0.03,
 ) -> np.ndarray:
-    """Piecewise-constant level with rare jumps, exactly flat in between.
-
-    Rows drawn into the ``exact_frac`` share carry literally zero within-segment
-    noise, so the optimal forecast is the last value with a zero-width interval.
-    A quantile loss punishes any spread there; an absolute-error loss does not
-    notice.
-
-    The defaults reproduce the original fixed constants. They also make this the
-    single largest source of the corpus's plateau statistics: ``jumps_hi`` 8 over
-    a length-4096 row means segments average around 900 samples, and at
-    ``exact_frac`` 0.6 most of those segments are exactly constant, giving a mean
-    held-run of 770 samples against 9.9 in the eval pool. The parameters exist so
-    that dose can be varied without changing the family's share of dispatch mass.
-    """
     jumps = rng.uniform(jumps_lo, jumps_hi, size=(n, 1))
     at = rng.random((n, L)) < (jumps / max(L, 1))
     at[:, 0] = True
@@ -5548,19 +5298,10 @@ def _step_level(
     integral = rng.random((n, 1)) < 0.65
     return np.where(integral, np.rint(out), out)
 
-
 def _vol_regime_switch(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
-    """Persistent low/high volatility episodes with a stable level.
-
-    conditional_stability teaches that volatility clusters, which pushes the
-    model toward a wide interval everywhere. This teaches the conditional
-    version: the recent window says which regime you are in, and the correct
-    interval in the quiet regime is narrow. The regime is identifiable from the
-    context, so a well-calibrated model can exploit it.
-    """
     drive = _ar1_batch(rng.normal(0.0, 1.0, size=(n, L)),
                        rng.uniform(0.990, 0.9995, size=(n, 1)))
-    # row-standardise in place; _standardize is not one of our helpers
+
     drive = ((drive - drive.mean(axis=1, keepdims=True))
              / np.maximum(drive.std(axis=1, keepdims=True), 1e-9))
     hot = drive > rng.uniform(0.2, 1.2, size=(n, 1))
@@ -5571,7 +5312,6 @@ def _vol_regime_switch(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
                    rng.uniform(0.90, 0.999, size=(n, 1)))
     scale = np.exp(rng.uniform(np.log(1.0), np.log(500.0), size=(n, 1)))
     return x * scale + rng.uniform(-1.0, 1.0, size=(n, 1)) * scale
-
 
 def _weekly_demand(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     """Daily attention counts (per-article pageview class): 1 step = 1 day.
