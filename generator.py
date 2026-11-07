@@ -30292,3 +30292,31 @@ class Generator(_MVK_SING):
 # after a long z = 0 prefix (census near cells s in [119-j, 127-j] for lead j; first-move patch >= 97 feeds leads 0..22).
 # Channels whose first change lies in the last _PKN_BACK points (patch >= 96) become constant; 0/1 channels are kept.
 _PKN_BACK = 1024
+_PKN_RECORD = _k0_record
+
+
+def _k0_record(x):
+    a = _PKN_RECORD(x)
+    if a is None:
+        return a
+    out = None
+    for c in range(a.shape[0]):
+        row = a[c]
+        nz = np.flatnonzero(row != row[0])
+        if nz.size and int(nz[0]) >= a.shape[1] - _PKN_BACK and not bool(
+                np.all((np.abs(row) < 1e-9) | (np.abs(row - 1.0) < 1e-9))):
+            if out is None:
+                out = np.array(a, dtype=np.float64, copy=True)
+            out[c] = row[0]
+    return a if out is None else out
+
+
+
+# ═══════════════ LCP-LATE (append-only, last; late-only sibling of SINGMV10PKN1024-32G: cooldown-only change): 'pknback:1536+set:_YM_MIN_N=2560+set:_C128_HYDRO_CUM=(0.12,0.44,0.74,0.79,0.84,0.88,0.92,0.95,1.0)+set:_XA_N_CUM=(0.0,0.0,1.0)+set:_XA_N_FWD=(1700,4064)+set:_XA_P_SHIFT=0.1+set:_MVK_TAG=0x4D564B51' for child yields k >= _LCP_K0 ═══
+# The trainer reads the 32 child streams round-robin, one (32, 4096) yield each, 16 per update: update u consumes child yield
+# floor(u / 2), and the WSD cooldown (updates 21,674..23,840) starts at child yield 10,837 = _LCP_K0. This wrapper counts ITS OWN
+# yields and switches the hooks in _LCP_SWITCH from their base values to their late values just before it pulls yield _LCP_K0 from
+# the parent chain; yields k < _LCP_K0 are the parent's objects, untouched, built while every hook held its base value (no hook
+# draws or skips a random number). Record-level hooks act on every c268 record pulled after the switch (records the packer already
+# carried keep the base behaviour). Built by mk_late.py on generator md5 646e77e1ffb2dcce930a3c55213cef37 (base package md5 646e77e1ffb2dcce930a3c55213cef37).
+_LCP_K0 = 10837
