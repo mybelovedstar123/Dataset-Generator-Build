@@ -1,21 +1,3 @@
-"""SN91 cascade generator — single native module (s1 of c313k105c303epi_fast).
-
-One generator, no packed sources: the engine, its vendored chronoforge family
-library and the partner family program are ordinary top-level code of this
-module.  Output rows are byte-identical to the c313 exec-wrapper for every seed
-and ``n``: the engine produces each row; with probability ``_Q`` (decided by a
-per-row SeedSequence draw) the next partner-family row is stacked under it as a
-second channel.
-
-Name layout (to keep every former module's globals separate):
-  * engine names are unchanged, except its public ``Generator`` which is
-    ``_EngineGenerator`` here;
-  * chronoforge names are unchanged unless they would collide, in which case
-    they are prefixed ``_<cf_module>_``;
-  * partner-family names are prefixed ``_pt_``; its config lives in
-    ``config.json["partner"]``.
-"""
-
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -25,14 +7,6 @@ import numpy as np
 
 from cascade.interface import DataGenerator
 
-# ═══════════════ engine: runtime setup and imports ═══════════════
-# Cascade V145 — native support integrity over the V144 persistence candidate.
-#
-# Experimental training-data generator. No measured forecasting gain is implied.
-
-
-# H393: production-sandbox thread control before numerical imports.
-# These must be set before the first numerical import to take effect.
 import os as _h393_os
 for _h393_var in (
         "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
@@ -52,66 +26,31 @@ from typing import Any
 from numba import njit
 from scipy.signal import lfilter
 
-
-# --- graft: chronoforge, inlined (logic unchanged) ---
-
-
-# ═══════════════ chronoforge: cf_rng ═══════════════
-# Deterministic RNG stream derivation.
-#
-# Every random number in the corpus comes from ``np.random.SeedSequence`` entropy
-# built from four 32-bit words::
-#
-#     (seed_hi, seed_lo, batch_index, stage_id)
-#
-# ``batch_index`` is the unit of reproducibility: batch sizes follow a schedule
-# that depends on the batch index alone (never on ``n_series``), so the corpus is
-# prefix-stable by construction.  ``stage_id`` isolates the pipeline stages from
-# each other, which is what makes weight sweeps *paired*: changing family ``f``'s
-# weight leaves every other family's per-row parameter draws byte-identical.
-#
-# Nothing here reads the clock, the environment, ``os.urandom``, or a global RNG.
-
-
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
 
-# ── stage identifiers ──────────────────────────────────────────────────────
-STAGE_ASSIGN = 0        # length + cadence + family assignment
-STAGE_CALENDAR = 1      # calendar bundle (start day-of-week / day-of-year)
-STAGE_FAMILY_PARAM = 1000   # + family index: dense per-row parameter draws
-STAGE_FAMILY_BULK = 5000    # + family index: group-sized innovation draws
-STAGE_OBSERVE = 9000    # observation layer
-STAGE_SCALE = 9001      # scale / offset
-STAGE_AGGREGATE = 9002  # structured hierarchical aggregation
-STAGE_SANITISE = 9003   # fallback regeneration + degeneracy repair
-STAGE_COUNT = 9004      # count prior: nonnegative floor + level quantisation
-
+STAGE_ASSIGN = 0
+STAGE_CALENDAR = 1
+STAGE_FAMILY_PARAM = 1000
+STAGE_FAMILY_BULK = 5000
+STAGE_OBSERVE = 9000
+STAGE_SCALE = 9001
+STAGE_AGGREGATE = 9002
+STAGE_SANITISE = 9003
+STAGE_COUNT = 9004
 
 def seed_words(seed: int) -> tuple[int, int]:
-    """Split an arbitrary Python int seed into two 32-bit words."""
     s = int(seed) & MASK64
     return (s >> 32) & MASK32, s & MASK32
 
-
 def stream(seed_hi: int, seed_lo: int, batch: int, stage: int) -> np.random.Generator:
-    """Independent PCG64 stream for ``(seed, batch, stage)``."""
     ss = np.random.SeedSequence(
         [int(seed_hi) & MASK32, int(seed_lo) & MASK32,
          int(batch) & MASK32, int(stage) & MASK32]
     )
     return np.random.Generator(np.random.PCG64(ss))
 
-
 def _self_test() -> None:
-    """Fail loudly at import if stream derivation is not reproducible.
-
-    We deliberately do not hard-code NumPy's internal bit-generator state (that
-    would pin us to one NumPy build for no benefit).  What we *do* assert is the
-    three properties the corpus relies on: same coordinates -> same draws,
-    different coordinates -> different draws, and the derivation is insensitive
-    to how the Python int seed is spelled.
-    """
     a = stream(1234, 5678, 7, 1003).random(8)
     b = stream(1234, 5678, 7, 1003).random(8)
     if not np.array_equal(a, b):
@@ -126,46 +65,26 @@ def _self_test() -> None:
     hi, lo = seed_words((1 << 63) + 12345)
     if (hi << 32 | lo) != ((1 << 63) + 12345):
         raise RuntimeError("chronoforge: seed word split loses bits")
-    # zero seed must still produce a usable stream
+
     if not np.isfinite(stream(0, 0, 0, 0).random(4)).all():
         raise RuntimeError("chronoforge: zero seed produced non-finite draws")
 
-
 _self_test()
-
-
-# ═══════════════ chronoforge: cf_spectral ═══════════════
-# FFT-based Gaussian-process synthesis.
-#
-# Every stationary GP in the corpus is drawn by sampling complex white noise in
-# the frequency domain, shaping it by ``sqrt(S(f))`` and taking one batched
-# inverse real FFT on a ``2L`` grid (the 2x embedding removes circular
-# wrap-around; we crop back to ``L``).  Cost is O(L log L) per row and the whole
-# batch goes through a single ``irfft`` call.
-#
-# No Cholesky, no ``multivariate_normal``, no BLAS GEMM: that is deliberate.  It
-# is asymptotically cheaper than the O(L^3) factorisation route *and* it removes
-# the threaded-BLAS reduction-order hazard, which matters because the producer is
-# multi-threaded and the corpus digest must be byte-identical at any thread count.
-
 
 try:
     from scipy.special import gammaincinv as _gammaincinv
     HAVE_SCIPY_SPECIAL = True
-except Exception:  # pragma: no cover
+except Exception:
     HAVE_SCIPY_SPECIAL = False
     _gammaincinv = None
 
 TWO_PI = 2.0 * np.pi
 
-
 @lru_cache(maxsize=16)
 def freq_grid(L: int) -> np.ndarray:
-    """rfft frequency grid (cycles/sample) for the 2L circulant embedding."""
     f = np.fft.rfftfreq(2 * L, d=1.0)
     f.flags.writeable = False
     return f
-
 
 @lru_cache(maxsize=16)
 def time_grid(L: int) -> np.ndarray:
@@ -173,19 +92,7 @@ def time_grid(L: int) -> np.ndarray:
     t.flags.writeable = False
     return t
 
-
-# ───────────────────────────── PSD primitives ──────────────────────────────
-# All return a (n, nf) array up to an arbitrary positive constant; the sampler
-# normalises each realised row to unit standard deviation anyway, so only the
-# *shape* of S(f) matters.
-
 def psd_matern(f: np.ndarray, ell: np.ndarray, nu: float) -> np.ndarray:
-    """Matern-nu spectral density in 1-D.
-
-    The half-integer orders we actually use give integer exponents, so they are
-    evaluated by reciprocal multiplication rather than ``np.power`` — the same
-    numbers, several times cheaper on a (n, L+1) grid.
-    """
     w = TWO_PI * f[None, :] * ell
     d = 1.0 + (w * w) / (2.0 * nu)
     if nu == 0.5:
@@ -196,18 +103,15 @@ def psd_matern(f: np.ndarray, ell: np.ndarray, nu: float) -> np.ndarray:
         return 1.0 / (d * d * d)
     return d ** (-(nu + 0.5))
 
-
 def psd_rbf(f: np.ndarray, ell: np.ndarray) -> np.ndarray:
     a = 2.0 * np.pi ** 2 * (ell ** 2) * (f[None, :] ** 2)
     return np.exp(-np.minimum(a, 700.0))
 
-
 def psd_rq(f: np.ndarray, ell: np.ndarray, alpha: np.ndarray, J: int = 8) -> np.ndarray:
-    """Rational-quadratic as a Gamma scale-mixture of RBF densities."""
     q = (np.arange(J, dtype=np.float64) + 0.5) / J
     if HAVE_SCIPY_SPECIAL:
         g = _gammaincinv(np.maximum(alpha, 1e-3), q[None, :])
-    else:  # Wilson-Hilferty approximation of the Gamma quantile
+    else:
         a = np.maximum(alpha, 1e-3)
         zq = np.sqrt(2.0) * _erfinv_approx(2.0 * q - 1.0)[None, :]
         g = a * (1.0 - 1.0 / (9.0 * a) + zq / np.sqrt(9.0 * a)) ** 3
@@ -218,21 +122,14 @@ def psd_rq(f: np.ndarray, ell: np.ndarray, alpha: np.ndarray, J: int = 8) -> np.
         out += psd_rbf(f, ell_j[:, None])
     return out / J
 
-
 def _erfinv_approx(x: np.ndarray) -> np.ndarray:
     a = 0.147
     ln = np.log(np.maximum(1.0 - x * x, 1e-12))
     term = 2.0 / (np.pi * a) + ln / 2.0
     return np.sign(x) * np.sqrt(np.sqrt(term ** 2 - ln / a) - term)
 
-
 def psd_periodic(f: np.ndarray, f0: np.ndarray, n_harm: int,
                  decay: np.ndarray, width: np.ndarray) -> np.ndarray:
-    """Comb of Gaussian peaks at harmonics of f0.
-
-    ``width`` broadens the peaks, which is exactly the PSD-domain effect of
-    multiplying the periodic kernel by an RBF envelope (locally periodic).
-    """
     out = np.zeros((f0.shape[0], f.shape[0]))
     for k in range(1, n_harm + 1):
         centre = f0 * k
@@ -240,10 +137,8 @@ def psd_periodic(f: np.ndarray, f0: np.ndarray, n_harm: int,
         out += amp * np.exp(-0.5 * ((f[None, :] - centre) / width) ** 2)
     return out
 
-
 def psd_spectral_mixture(f: np.ndarray, centres: np.ndarray, widths: np.ndarray,
                          weights: np.ndarray) -> np.ndarray:
-    """Sum of Q Gaussian peaks at arbitrary (non-integer-period) centres."""
     out = np.zeros((centres.shape[0], f.shape[0]))
     Q = centres.shape[1]
     for q in range(Q):
@@ -252,21 +147,11 @@ def psd_spectral_mixture(f: np.ndarray, centres: np.ndarray, widths: np.ndarray,
         out += weights[:, q:q + 1] * np.exp(-0.5 * ((f[None, :] - c) / w) ** 2)
     return out
 
-
 def psd_pink(f: np.ndarray, beta: np.ndarray, f_break: np.ndarray) -> np.ndarray:
-    """1/f^beta with a low-frequency spectral break (flat below ``f_break``)."""
     ff = np.maximum(f[None, :], 1e-12)
     return 1.0 / (f_break ** beta + ff ** beta)
 
-
-# ─────────────────────────────── the sampler ───────────────────────────────
-
 def gp_from_psd(rng: np.random.Generator, psd: np.ndarray, L: int) -> np.ndarray:
-    """Draw a stationary Gaussian field with spectral density ``psd``.
-
-    ``psd`` has shape (n, L + 1) on the 2L rfft grid.  Rows are returned with
-    zero mean and unit standard deviation.
-    """
     n, nf = psd.shape
     amp = np.sqrt(np.maximum(psd, 0.0))
     re = rng.standard_normal((n, nf))
@@ -285,14 +170,11 @@ def gp_from_psd(rng: np.random.Generator, psd: np.ndarray, L: int) -> np.ndarray
     x /= s
     return x
 
-
 def matern_gp(rng: np.random.Generator, n: int, L: int, ell: np.ndarray,
               nu: float = 1.5) -> np.ndarray:
-    """Convenience: unit-variance Matern-nu field with per-row lengthscale."""
     f = freq_grid(L)
     ell = np.asarray(ell, dtype=np.float64).reshape(n, 1)
     return gp_from_psd(rng, psd_matern(f, ell, nu), L)
-
 
 def pink_gp(rng: np.random.Generator, n: int, L: int, beta: np.ndarray,
             f_break: np.ndarray | float = 1.0 / 4096.0) -> np.ndarray:
@@ -301,9 +183,7 @@ def pink_gp(rng: np.random.Generator, n: int, L: int, beta: np.ndarray,
     fb = np.full((n, 1), f_break) if np.isscalar(f_break) else np.asarray(f_break).reshape(n, 1)
     return gp_from_psd(rng, psd_pink(f, beta, fb), L)
 
-
 def psd_convolve(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """PSD convolution == kernel product.  Both inputs (n, nf), same n."""
     n, nf = a.shape
     m = 1
     while m < 2 * nf:
@@ -313,40 +193,21 @@ def psd_convolve(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     c = np.fft.irfft(fa * fb, n=m, axis=1)[:, :nf]
     return np.maximum(c, 0.0)
 
-
-# ═══════════════ chronoforge: cf_kernels ═══════════════
-# Sequential recursions that NumPy cannot vectorise, as numba kernels.
-#
-# Every kernel takes *per-row parameter arrays* and writes into a caller-allocated
-# ``(n, L)`` output, so one call replaces ``n`` Python-level calls.  All are
-# compiled with ``fastmath=False`` and ``parallel=False`` (no reduction-order
-# variation), ``nogil=True`` (so the producer threads actually overlap) and
-# ``cache=False`` (the sandbox must not write files).
-#
-# Randomness never originates inside a kernel: every stochastic kernel consumes
-# pre-drawn uniform / normal / gamma variates produced by a seeded NumPy
-# ``Generator``.  That keeps the corpus a pure function of ``(seed, batch)``
-# regardless of numba's internal thread-local RNG state.
-
-
 import math
 import threading
 
-
-try:  # pragma: no cover - exercised by whichever branch the env provides
+try:
     from numba import njit as _numba_njit
 
     HAVE_NUMBA = True
-except Exception:  # numba unavailable -> pure-Python fallback (slow but correct)
+except Exception:
     HAVE_NUMBA = False
     _numba_njit = None
-
 
 def _kernel(fn):
     if HAVE_NUMBA:
         return _numba_njit(cache=False, fastmath=False, parallel=False, nogil=True)(fn)
     return fn
-
 
 def _inline(fn):
     if HAVE_NUMBA:
@@ -354,16 +215,8 @@ def _inline(fn):
                            nogil=True, inline="always")(fn)
     return fn
 
-
-# ─────────────────────────── count sampling helper ─────────────────────────
-
 @_inline
 def _pois(lam, u, z):
-    """Poisson draw from a pre-drawn uniform ``u`` and standard normal ``z``.
-
-    Exact inversion below lambda=30; a continuity-corrected normal above it
-    (relative error < 1e-3 there, and the tail behaviour is what matters).
-    """
     if lam <= 0.0:
         return 0.0
     if lam < 30.0:
@@ -380,7 +233,6 @@ def _pois(lam, u, z):
         v = 0.0
     return math.floor(v + 0.5)
 
-
 @_kernel
 def k_poisson(lam, u, z, out):
     n, L = lam.shape
@@ -388,12 +240,8 @@ def k_poisson(lam, u, z, out):
         for t in range(L):
             out[i, t] = _pois(lam[i, t], u[i, t], z[i, t])
 
-
-# ───────────────────────────────── ARMA ────────────────────────────────────
-
 @_kernel
 def k_arma(phi, p_ord, theta, q_ord, e, out):
-    """Per-row ARMA(p, q) filter.  ``out`` must be zero-initialised."""
     n, L = e.shape
     for i in range(n):
         p = p_ord[i]
@@ -414,10 +262,8 @@ def k_arma(phi, p_ord, theta, q_ord, e, out):
                 v = -1.0e150
             out[i, t] = v
 
-
 @_kernel
 def k_seasonal_int(x, m, out):
-    """Inverse of the seasonal difference (1 - B^m), per row."""
     n, L = x.shape
     for i in range(n):
         mm = m[i]
@@ -429,10 +275,8 @@ def k_seasonal_int(x, m, out):
             else:
                 out[i, t] = out[i, t - mm] + x[i, t]
 
-
 @_kernel
 def k_setar(thr, c_lo, phi_lo, c_hi, phi_hi, e, out):
-    """Two-regime self-exciting threshold AR(1)."""
     n, L = e.shape
     for i in range(n):
         x = e[i, 0]
@@ -450,10 +294,8 @@ def k_setar(thr, c_lo, phi_lo, c_hi, phi_hi, e, out):
             out[i, t] = v
             x = v
 
-
 @_kernel
 def k_ar1_tv(phi, mu, e, out):
-    """AR(1) around a time-varying mean: x_t = mu_t + phi (x_{t-1} - mu_{t-1}) + e_t."""
     n, L = e.shape
     for i in range(n):
         d = e[i, 0]
@@ -466,12 +308,8 @@ def k_ar1_tv(phi, mu, e, out):
                 d = -1.0e150
             out[i, t] = mu[i, t] + d
 
-
-# ───────────────────────────────── GARCH ───────────────────────────────────
-
 @_kernel
 def k_garch(omega, alpha, gamma, beta, z, out_r, out_s):
-    """GJR-GARCH(1,1): sigma^2_t = w + (a + g*1[e<0]) e^2_{t-1} + b sigma^2_{t-1}."""
     n, L = z.shape
     for i in range(n):
         denom = 1.0 - alpha[i] - 0.5 * gamma[i] - beta[i]
@@ -492,16 +330,8 @@ def k_garch(omega, alpha, gamma, beta, z, out_r, out_s):
             out_s[i, t] = sd
             eprev = e
 
-
-# ───────────────────────────────── Hawkes ──────────────────────────────────
-
 @_kernel
 def k_hawkes(mu, decays, weights, u, z, out_lam, out_n):
-    """Discrete-time self-exciting process with K exponential kernels.
-
-    ``decays[i, k]`` is exp(-1/tau_k); ``weights[i, k]`` the branching weight of
-    component k.  Emits both the conditional intensity and the counts.
-    """
     n, L = mu.shape
     K = decays.shape[1]
     s = np.zeros(K, dtype=np.float64)
@@ -522,15 +352,8 @@ def k_hawkes(mu, decays, weights, u, z, out_lam, out_n):
             for k in range(K):
                 s[k] = decays[i, k] * (s[k] + weights[i, k] * cnt)
 
-
-# ───────────────────────── closed-loop resource control ────────────────────
-
 @_kernel
 def k_feedback(d, th_up, th_dn, k_up, k_dn, gam, lag, c0, mode, out, out_cap):
-    """Autoscaling controller.
-
-    mode 0 -> utilisation min(d/c, 1); 1 -> capacity c_t; 2 -> queue backlog.
-    """
     n, L = d.shape
     for i in range(n):
         c = c0[i]
@@ -594,10 +417,8 @@ def k_feedback(d, th_up, th_dn, k_up, k_dn, gam, lag, c0, mode, out, out_cap):
                     q = 1.0e12
                 out[i, t] = q
 
-
 @_kernel
 def k_counter_reset_cal(inc, reset, out):
-    """Monotone accumulation with resets flagged in ``reset`` (0/1)."""
     n, L = inc.shape
     for i in range(n):
         acc = 0.0
@@ -609,17 +430,8 @@ def k_counter_reset_cal(inc, reset, out):
                 acc = 1.0e14
             out[i, t] = acc
 
-
-# ─────────────────────────── epidemic renewal ──────────────────────────────
-
 @_kernel
 def k_renewal(w, nw, rt, imports, gam, u, z, i0, out):
-    """I_t ~ NB( R_t * sum_s w_s I_{t-s} + imports_t , k ).
-
-    ``gam[i, t]`` is a pre-drawn Gamma(k_i, 1) variate divided by k_i by the
-    caller, so ``lam * gam`` is the gamma-mixed Poisson mean (i.e. negative
-    binomial with dispersion k_i).
-    """
     n, L = rt.shape
     W = w.shape[1]
     for i in range(n):
@@ -641,16 +453,8 @@ def k_renewal(w, nw, rt, imports, gam, u, z, i0, out):
                 lam = 1.0e9
             out[i, t] = _pois(lam * gam[i, t], u[i, t], z[i, t])
 
-
-# ─────────────────────── chaotic / delay-differential ──────────────────────
-
 @_kernel
 def k_rk4_3d(system, par, dt, state0, sub, out):
-    """RK4 integration of Lorenz / Rossler / Chua / Hindmarsh-Rose.
-
-    ``out`` has shape (n, L, 3).  ``sub`` is the number of RK4 sub-steps taken
-    per emitted sample.
-    """
     n = out.shape[0]
     L = out.shape[1]
     k1 = np.zeros(3, dtype=np.float64)
@@ -692,37 +496,31 @@ def k_rk4_3d(system, par, dt, state0, sub, out):
             out[i, t, 1] = st[1]
             out[i, t, 2] = st[2]
 
-
 @_inline
 def _deriv3(sysid, s, a, b, c, d, o):
     x = s[0]
     y = s[1]
     z = s[2]
-    if sysid == 0:  # Lorenz
+    if sysid == 0:
         o[0] = a * (y - x)
         o[1] = x * (b - z) - y
         o[2] = x * y - c * z
-    elif sysid == 1:  # Rossler
+    elif sysid == 1:
         o[0] = -y - z
         o[1] = x + a * y
         o[2] = b + z * (x - c)
-    elif sysid == 2:  # Chua (cubic nonlinearity)
+    elif sysid == 2:
         g = -a * x + b * x * x * x
         o[0] = c * (y - x - g)
         o[1] = x - y + z
         o[2] = -d * y
-    else:  # Hindmarsh-Rose bursting neuron
+    else:
         o[0] = y - a * x * x * x + b * x * x - z + d
         o[1] = 1.0 - c * x * x - y
         o[2] = 0.006 * (4.0 * (x + 1.6) - z)
 
-
 @_kernel
 def k_mackey_glass(beta, gamma_, nexp, delay, hist, out):
-    """Mackey-Glass delay differential equation, 4 sub-steps per sample.
-
-    ``hist[i, :]`` is a pre-filled circular history buffer (length >= delay+2).
-    """
     n, L = out.shape
     B = hist.shape[1]
     sub = 4
@@ -761,12 +559,8 @@ def k_mackey_glass(beta, gamma_, nexp, delay, hist, out):
                 hist[i, pos] = x
             out[i, t] = x
 
-
-# ───────────────────────── quasi-periodic physiology ───────────────────────
-
 @_kernel
 def k_template(phase, tmpl, tid, out):
-    """Linear-interpolated lookup of a per-row waveform template at ``phase``."""
     n, L = phase.shape
     S = tmpl.shape[1]
     for i in range(n):
@@ -784,15 +578,10 @@ def k_template(phase, tmpl, tid, out):
                 j2 = 0
             out[i, t] = tmpl[r, j] * (1.0 - fr) + tmpl[r, j2] * fr
 
-
-# ─────────────────────────────── warm-up ───────────────────────────────────
-
 _WARM_LOCK = threading.Lock()
 _WARMED = False
 
-
 def warmup() -> None:
-    """Force numba compilation before the streaming loop starts."""
     global _WARMED
     if _WARMED or not HAVE_NUMBA:
         _WARMED = True
@@ -836,76 +625,42 @@ def warmup() -> None:
                    i32.copy(), np.zeros((n, L)))
         _WARMED = True
 
-
-# ═══════════════ chronoforge: cf_prims ═══════════════
-# Vectorised building blocks shared by the family modules.
-#
-# Everything here is written to operate on a whole *group* of rows at once with
-# per-row parameters carried as ``(n, 1)`` columns.  There are no per-series
-# Python loops in the hot path; where a loop is unavoidable it runs over a small
-# fixed number of *slots* (event slots, harmonics, mixture components), never over
-# rows.
-
-
 try:
     from scipy.ndimage import maximum_filter1d as _max_filter
     from scipy.ndimage import minimum_filter1d as _min_filter
     _HAVE_NDIMAGE = True
-except Exception:  # pragma: no cover
+except Exception:
     _HAVE_NDIMAGE = False
     _max_filter = _min_filter = None
 
 _cf_prims_TWO_PI = 2.0 * np.pi
 
-
-# ─────────────────────────────── draw helpers ──────────────────────────────
-
 def logu(rng: np.random.Generator, lo: float, hi: float, size) -> np.ndarray:
-    """Log-uniform draw."""
     return np.exp(rng.uniform(np.log(lo), np.log(hi), size=size))
 
-
 def col(x: np.ndarray) -> np.ndarray:
-    """Reshape a length-n vector into an (n, 1) broadcast column."""
     return np.asarray(x, dtype=np.float64).reshape(-1, 1)
 
-
 def categorical(rng: np.random.Generator, probs, size: int) -> np.ndarray:
-    """Vectorised categorical draw; returns int64 indices."""
     p = np.asarray(probs, dtype=np.float64)
     c = np.cumsum(p / p.sum())
     u = rng.random(size)
     return np.searchsorted(c, u, side="right").clip(0, len(p) - 1).astype(np.int64)
 
-
 def bernoulli(rng: np.random.Generator, p, size: int) -> np.ndarray:
     return rng.random(size) < p
 
-
 def safe_std(x: np.ndarray) -> np.ndarray:
-    """Row standard deviation, floored so no downstream division can overflow.
-
-    The floor is relative as well as absolute: a *nearly* constant row (std far
-    below its own magnitude) would otherwise be amplified to infinity.  Rows that
-    trip the relative floor are degenerate by construction and get caught by the
-    sanitiser's regeneration guard.
-    """
     s = x.std(axis=1, keepdims=True)
     m = np.abs(x).max(axis=1, keepdims=True)
     return np.maximum(s, np.maximum(m * 1e-12, 1e-300))
 
-
 def unit_std(x: np.ndarray) -> np.ndarray:
-    """Zero-mean, unit-std rows (never in place)."""
     x = x - x.mean(axis=1, keepdims=True)
     return x / safe_std(x)
 
-
-# ───────────────────────────── linear processes ────────────────────────────
-
 def ar1(rng: np.random.Generator, n: int, L: int, phi: np.ndarray,
         sigma: np.ndarray | float = 1.0) -> np.ndarray:
-    """AR(1) with per-row phi.  Returns (n, L)."""
     e = rng.standard_normal((n, L))
     phi = np.asarray(phi, dtype=np.float64).reshape(n, 1)
     e *= np.sqrt(np.maximum(1.0 - phi ** 2, 1e-6))
@@ -919,17 +674,13 @@ def ar1(rng: np.random.Generator, n: int, L: int, phi: np.ndarray,
         out *= np.asarray(sigma, dtype=np.float64).reshape(n, 1)
     return out
 
-
 def ou(rng: np.random.Generator, n: int, L: int, tau: np.ndarray) -> np.ndarray:
-    """Discretised Ornstein-Uhlenbeck with correlation time ``tau`` samples."""
     phi = np.exp(-1.0 / np.maximum(np.asarray(tau, dtype=np.float64).reshape(n, 1), 1e-3))
     return ar1(rng, n, L, np.clip(phi, 0.0, 0.99999))
-
 
 def local_linear_trend(rng: np.random.Generator, n: int, L: int,
                        sig_level: np.ndarray, sig_slope: np.ndarray,
                        damp: np.ndarray | None = None) -> np.ndarray:
-    """Local-linear-trend state space; ``damp`` < 1 gives a damped trend."""
     es = rng.standard_normal((n, L)) * np.asarray(sig_slope).reshape(n, 1)
     el = rng.standard_normal((n, L)) * np.asarray(sig_level).reshape(n, 1)
     if damp is None:
@@ -943,15 +694,7 @@ def local_linear_trend(rng: np.random.Generator, n: int, L: int,
     lag[:, 1:] = slope[:, :-1]
     return np.cumsum(lag + el, axis=1)
 
-
-# ─────────────────────────── segmentation helpers ──────────────────────────
-
 def segment_map(dwell: np.ndarray, L: int) -> tuple[np.ndarray, np.ndarray]:
-    """Map cumulative dwell times to a per-sample segment id.
-
-    ``dwell`` is (n, M) positive lengths.  Returns ``(seg_id, seg_start)`` both
-    (n, L) int64 / float64, computed with bincount + cumsum (no per-row loop).
-    """
     n, M = dwell.shape
     edges = np.cumsum(np.maximum(dwell, 1.0), axis=1)
     pos = np.floor(edges).astype(np.int64)
@@ -960,25 +703,18 @@ def segment_map(dwell: np.ndarray, L: int) -> tuple[np.ndarray, np.ndarray]:
     flat = (rows[valid] * L + pos[valid])
     mark = np.bincount(flat, minlength=n * L).reshape(n, L).astype(np.int64)
     seg_id = np.cumsum(mark, axis=1)
-    # segment start index for each sample
+
     t = np.arange(L, dtype=np.float64)[None, :]
     starts = np.where(mark > 0, t, 0.0)
     seg_start = np.maximum.accumulate(starts, axis=1)
     return seg_id, seg_start
 
-
 def gather_levels(levels: np.ndarray, seg_id: np.ndarray) -> np.ndarray:
-    """levels (n, M) gathered at per-sample segment ids (n, L)."""
     M = levels.shape[1]
     idx = np.clip(seg_id, 0, M - 1)
     return np.take_along_axis(levels, idx, axis=1)
 
-
 def run_mask(n: int, L: int, starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
-    """Boolean mask covering runs [s, s+len) given ragged start/length lists.
-
-    ``starts`` / ``lengths`` are (n, E) arrays; non-positive lengths are ignored.
-    """
     E = starts.shape[1]
     s = np.clip(starts, 0, L - 1).astype(np.int64)
     e = np.clip(starts + np.maximum(lengths, 0), 0, L).astype(np.int64)
@@ -989,18 +725,14 @@ def run_mask(n: int, L: int, starts: np.ndarray, lengths: np.ndarray) -> np.ndar
     np.add.at(delta, (rows[live], e[live]), -1)
     return np.cumsum(delta[:, :L], axis=1) > 0
 
-
 def event_positions(rng: np.random.Generator, n: int, L: int, count: np.ndarray,
                     E: int) -> tuple[np.ndarray, np.ndarray]:
-    """Uniform event positions with a per-row count, padded to E slots."""
     pos = rng.integers(0, L, size=(n, E)).astype(np.int64)
     live = np.arange(E)[None, :] < np.asarray(count).reshape(n, 1)
     return pos, live
 
-
 def bursty_gaps(rng: np.random.Generator, n: int, L: int, rate: np.ndarray,
                 mean_len: np.ndarray, E: int = 24) -> np.ndarray:
-    """Boolean gap mask from a bursty (LogN-length) outage process."""
     cnt = rng.poisson(np.maximum(np.asarray(rate).reshape(n, 1) * L, 0.0), size=(n, E))
     cnt = (cnt > 0).astype(np.int64)
     starts = rng.integers(0, L, size=(n, E))
@@ -1009,45 +741,35 @@ def bursty_gaps(rng: np.random.Generator, n: int, L: int, rate: np.ndarray,
     lens = np.where(cnt > 0, lens, 0.0)
     return run_mask(n, L, starts, lens)
 
-
 def locf(x: np.ndarray, gap: np.ndarray) -> np.ndarray:
-    """Last-observation-carried-forward over a boolean gap mask."""
     n, L = x.shape
     idx = np.where(gap, -1, np.arange(L)[None, :])
     idx = np.maximum.accumulate(idx, axis=1)
     idx = np.maximum(idx, 0)
     return np.take_along_axis(x, idx, axis=1)
 
-
-# ─────────────────────────── periodic profile shapes ───────────────────────
-
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(x, -60.0, 60.0)))
-
 
 def phase_of(L: int, period: np.ndarray, phase0: np.ndarray,
              drift: np.ndarray | None = None,
              period_drift: np.ndarray | None = None) -> np.ndarray:
-    """Cycle phase in [0,1) with optional slow phase drift / period drift."""
     t = time_grid(L)[None, :]
     p = np.maximum(np.asarray(period, dtype=np.float64).reshape(-1, 1), 1e-6)
     if period_drift is None:
         ph = t / p
     else:
         d = np.asarray(period_drift, dtype=np.float64).reshape(-1, 1)
-        # instantaneous frequency 1/p * (1 + d * t/L); phase = integral
+
         ph = (t / p) * (1.0 + d * t / (2.0 * L))
     ph = ph + np.asarray(phase0, dtype=np.float64).reshape(-1, 1)
     if drift is not None:
         ph = ph + np.asarray(drift, dtype=np.float64).reshape(-1, 1) * (t / L)
     return ph
 
-
 def warp_phase(ph: np.ndarray, kappa: np.ndarray) -> np.ndarray:
-    """Circle map theta -> theta + kappa sin(theta), applied on the unit cycle."""
     k = np.asarray(kappa, dtype=np.float64).reshape(-1, 1)
     return ph + (k / _cf_prims_TWO_PI) * np.sin(_cf_prims_TWO_PI * ph)
-
 
 def profile_harmonic(rng, n, L, ph, H=5):
     alpha = rng.uniform(0.7, 1.8, size=(n, 1))
@@ -1058,7 +780,6 @@ def profile_harmonic(rng, n, L, ph, H=5):
         psi = rng.uniform(0.0, _cf_prims_TWO_PI, size=(n, 1))
         out += np.where(h <= nh, 1.0, 0.0) * amp * np.cos(_cf_prims_TWO_PI * h * ph + psi)
     return out
-
 
 def profile_trapezoid(rng, n, L, ph):
     a = rng.uniform(0.20, 0.35, size=(n, 1))
