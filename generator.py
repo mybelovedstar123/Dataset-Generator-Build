@@ -29782,3 +29782,233 @@ def _c251_c91_generate(self, n_series: int) -> Iterator[np.ndarray]:
             yield x
     finally:
         base.close()
+
+
+if getattr(_C124B2Parent.__dict__.get("generate"), "__code__", None) is not None and \
+        _C124B2Parent.__dict__["generate"].__code__.co_firstlineno == 18660 and _C124B2Parent.__dict__["generate"].__name__ == "generate":
+    _C124B2Parent.generate = _c251_c91_generate
+
+
+def _c251_c128_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    seed = int(self._seed) & ((1 << 64) - 1)
+    lo = _C128_OPEN_NUM * int(_C91_CHILD_BUDGET)
+    pos = 0
+    base = super(_XZParent, self).generate(n)
+    try:
+        for i, x in enumerate(base):
+            inside = _C128_Q > 0.0 and _C128_OPEN_DEN * pos >= lo
+            pos += _c91_points(x)
+            if inside and _c128_eligible(x):
+                r = _c251_rng([seed, _C128_TAG], (i,))
+                if r.random() < _C128_Q:
+                    k = min(int(np.searchsorted(_C128_CUM, r.random(), side="right")), len(_C128_FAMS) - 1)
+                    try:
+                        L = int(x.shape[1])
+                        with np.errstate(all="ignore"):
+                            w = _C128_FAMS[k][2](r, L)
+                        if _c128_keep(w, L):
+                            z = np.empty((_C128_HOST_C + 1, L), dtype=np.float64)
+                            z[:_C128_HOST_C] = x
+                            z[_C128_HOST_C] = w
+                            x = z
+                    except Exception:
+                        pass
+            yield x
+    finally:
+        base.close()
+
+
+if getattr(_XZParent.__dict__.get("generate"), "__code__", None) is not None and \
+        _XZParent.__dict__["generate"].__code__.co_firstlineno == 20094 and _XZParent.__dict__["generate"].__name__ == "generate":
+    _XZParent.generate = _c251_c128_generate
+
+
+def _c251_acuh_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    seed = int(self._seed) & ((1 << 64) - 1)
+    base = super(_YZParent, self).generate(n)
+    try:
+        for i, x in enumerate(base):
+            if _ACUH_Q > 0.0 and _acuh_eligible(x):
+                r = _c251_rng([seed, _ACUH_TAG], (i,))
+                if r.random() < _ACUH_Q:
+                    k = min(int(np.searchsorted(_ACUH_CUM, r.random(), side="right")), len(_ACUH_FAMS) - 1)
+                    try:
+                        L = int(x.shape[1])
+                        with np.errstate(all="ignore"):
+                            w = np.asarray(_ACUH_FAMS[k][2](r, L), dtype=np.float64).reshape(-1)
+                        if _acuh_keep(w, x):
+                            z = np.empty((_ACUH_HOST_C + 1, L), dtype=np.float64)
+                            z[:_ACUH_HOST_C] = x
+                            z[_ACUH_HOST_C] = w
+                            x = z
+                    except Exception:
+                        pass
+            yield x
+    finally:
+        base.close()
+
+
+if getattr(_YZParent.__dict__.get("generate"), "__code__", None) is not None and \
+        _YZParent.__dict__["generate"].__code__.co_firstlineno == 21645 and _YZParent.__dict__["generate"].__name__ == "generate":
+    _YZParent.generate = _c251_acuh_generate
+
+
+def _c251_yc_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    fams = self._yc_fams
+    seed = int(self._seed) & ((1 << 64) - 1)
+    slots = len(_YC_FAMS)
+    lo = self._yc_open * _YZ_CHILD_BUDGET if "_YZ_CHILD_BUDGET" in globals() else 0.0
+    pos = 0
+    base = super(_YACParent, self).generate(n)
+    try:
+        for i, x in enumerate(base):
+            fams = self._yc_fams
+            if fams and (lo <= 0 or pos >= lo) and _yc_host(x, self._yc_hosts):
+                u = _fcx_coins(seed, _YC_TAG, i, slots)
+                for k, q, f in fams:
+                    if u[k] >= q:
+                        continue
+                    L = int(x.shape[-1])
+                    w = None
+                    try:
+                        with np.errstate(all="ignore"):
+                            w = f(_c251_rng([seed, _YC_TAG, k + 1], (i,)), L)
+                    except Exception:
+                        w = None
+                    if (isinstance(w, np.ndarray) and w.ndim == 1 and w.size == L and w.dtype.kind == "f"
+                            and bool(np.all(np.isfinite(w))) and float(w.max()) > float(w.min())):
+                        h = x.reshape(1, L) if x.ndim == 1 else x
+                        z = np.empty((h.shape[0] + 1, L), dtype=np.float64)
+                        z[:-1] = h
+                        z[-1] = w
+                        x = z
+                        break
+            if lo > 0:
+                pos += _yz_points(x)
+            yield x
+    finally:
+        base.close()
+
+
+if getattr(_YACParent.__dict__.get("generate"), "__code__", None) is not None and \
+        _YACParent.__dict__["generate"].__code__.co_firstlineno == 27538 and _YACParent.__dict__["generate"].__name__ == "generate":
+    _YACParent.generate = _c251_yc_generate
+
+
+def _c251_yqh_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    seed = int(self._seed) & ((1 << 64) - 1)
+    k = self._yqh
+    lo = _C91_OPEN_NUM * int(_C91_CHILD_BUDGET)
+    pos = 0
+    base = super(_SLParent, self).generate(n)
+    try:
+        for i, x in enumerate(base):
+            if (k["q"] > 0.0 and _C91_OPEN_DEN * pos >= lo and isinstance(x, np.ndarray) and x.dtype == np.float64
+                    and x.ndim == 2 and x.shape[0] > 1 and x.shape[1] >= 256):
+                st = [c for c in range(x.shape[0]) if _yqh_station(x[c], k["cap"])]
+                if st:
+                    out = None
+                    for g in _yqh_groups(x, st, k["couple"]):
+                        r = _c251_rng([seed, _YQH_TAG], (i, g[0]))
+                        if r.random() >= k["q"]:
+                            continue
+                        try:
+                            w = _yqh_extend(x[g], r, k)
+                        except Exception:
+                            w = None
+                        if w is not None and np.all(np.isfinite(w)):
+                            if out is None:
+                                out = x.copy()
+                            out[g] = w
+                    if out is not None:
+                        x = out
+            pos += _c91_points(x)
+            yield x
+    finally:
+        base.close()
+
+
+if getattr(_SLParent.__dict__.get("generate"), "__code__", None) is not None and \
+        _SLParent.__dict__["generate"].__code__.co_firstlineno == 28255 and _SLParent.__dict__["generate"].__name__ == "generate":
+    _SLParent.generate = _c251_yqh_generate
+
+
+def _c251_pt_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    seed = self._base_seed
+    for i in range(int(n_series)):
+        rng = _c251_rng(seed, (i,))
+        fam = self._family_keys[rng.choice(len(self._family_keys), p=self._family_probs)]
+        self._last_fam = fam
+        n = _pt_sample_series_length(rng)
+        x = _pt_FAMILY_BUILDERS[fam](rng, n)
+        x = _c251_nan0(x)
+        is_raw = fam in self._raw
+        keep_native = fam in _pt_NATIVE_SCALE_FAMILIES or is_raw
+        was_integer = keep_native and bool(np.all(x == np.round(x)))
+        was_nonneg = keep_native and bool(x.min() >= 0.0)
+        if rng.random() < self._vol_warp_prob and (not keep_native):
+            x = _pt_warp_increments_stochastic_vol(rng, x, self._vol_warp_strength)
+        if rng.random() < self._level_shift_prob and (not keep_native):
+            x = _pt_add_heavy_tailed_level_shifts(rng, x, self._level_shift_rate, self._level_shift_scale)
+        if not is_raw:
+            x = self._randomize_scale(rng, x, fam)
+        if was_integer:
+            x = np.round(x)
+        repeat_frac = float(_v2_mean(np.diff(x) == 0.0)) if x.size > 1 else 1.0
+        hold_allowed = (repeat_frac >= self._hold_gate_min_repeat_frac) | (rng.random() < self._hold_gate_bypass_prob)
+        if rng.random() < self._tail_hold_prob and (not is_raw) and hold_allowed:
+            x = _pt_apply_tail_hold(rng, x, self._tail_hold_max_len)
+            if was_integer:
+                x = np.round(x)
+            if was_nonneg:
+                np.maximum(x, 0.0, out=x)
+        if rng.random() < self._segment_hold_prob and (not is_raw):
+            x = _pt_hold_random_segments(rng, x, self._segment_max_count, self._segment_min_len, self._segment_max_len, self._segment_extreme_prob)
+            if was_integer:
+                x = np.round(x)
+        if rng.random() < self._flat_tail_prob and (not is_raw) and hold_allowed:
+            x = _pt_hold_flat_tail(rng, x, self._flat_tail_min_len, self._flat_tail_max_frac, self._flat_tail_extreme_prob)
+        if rng.random() < self._pad_prob:
+            x = self._pad(rng, x)
+        else:
+            x = x[:self._target_len]
+        x = _c251_nan0(x)
+        zf = float((x == 0.0).mean())
+        if zf > 0.35 and (not keep_native):
+            abs_max = float(np.abs(x).max())
+            offset = max(1.0, abs_max * float(rng.uniform(0.15, 0.8)))
+            x = x + (np.round(offset) if float(np.all(x == np.round(x))) else offset)
+        np.clip(x, -3e+37, 3e+37, out=x)
+        yield x
+
+
+if getattr(_pt_Generator.__dict__.get("generate"), "__code__", None) is not None and \
+        _pt_Generator.__dict__["generate"].__code__.co_firstlineno == 15128 and _pt_Generator.__dict__["generate"].__name__ == "generate":
+    _pt_Generator.generate = _c251_pt_generate
+
+
+# ═══════════════ c251-P10: exact W9Q coupling statistics (published core: partner/teach 2nd channel on 25% of rows). ═══════════════
+# uid76's method verbatim, with two expression blocks evaluated by numba on the same (2, L) float64 C-contiguous
+# arrays (other shapes keep uid76's expressions):
+#  * coupling: s_c = sqrt(var(diff(z[c]))) with uid76's own _v2_var_nb (two-pass: (0.0 + pairwise) / n mean, then
+#    (0.0 + pairwise((x - m) * (x - m))) / n; sqrt is correctly rounded everywhere); zz = [0, clip((d0 - mean(d0)) /
+#    s0, -6, 6)] with numpy's clip semantics (NaN kept, max(x, -6) then min(., 6)); zz[:p] = 0 for p = first index
+#    with z1 != z1[0]; new row 1 = z1 + (_CPL * s1) * zz (multiply rounded first);
+#  * keep test: all_c std(z[c]) > 1e-9 * (mean|z[c]| + 1e-12) and std(z[0] - z[1]) > 1e-9 * (mean|z| + 1e-12), with
+#    np.std / np.mean's exact pairwise reductions (row-wise for axis=1, over all C*L elements for the flat mean of a
+#    C-contiguous array; verified bit-equal to numpy on random data).
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_std1(x):
+    return np.sqrt(_v2_var_nb(x))
