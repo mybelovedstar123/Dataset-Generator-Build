@@ -25384,3 +25384,286 @@ def _yo_quant(r, x, q, p_odd):
         d = 2.0 if r.random() < 0.5 else 3.0
         y[m] = np.round(np.round(x[m] * d / q) * q / d, 2)
     return y
+
+def _yo_nox(r, n, h0, d0, mean, smooth):
+    t = np.arange(n, dtype=np.int64) + h0
+    h = t % 24
+    day = t // 24
+    nd = int(day[-1]) + 2
+    nid = (t + 12) // 24
+    hh = np.arange(24, dtype=np.float64) + 0.5
+    hm, he = r.uniform(6.0, 8.5), r.uniform(16.0, 19.5)
+    tr = (r.uniform(0.15, 0.5) + np.exp(-0.5 * ((hh - hm) / r.uniform(0.8, 1.8)) ** 2)
+          + r.uniform(0.4, 1.1) * np.exp(-0.5 * ((hh - he) / r.uniform(1.2, 2.8)) ** 2))
+    wk = np.ones(7)
+    wk[5] = r.uniform(0.55, 0.95)
+    wk[6] = wk[5] * r.uniform(0.55, 0.95)
+    win = _yo_window(r.uniform(16.5, 19.5), r.uniform(7.5, 10.5), r.uniform(1.0, 3.0))
+    dayx = 1.0 - r.uniform(0.3, 0.8) * (1.0 - win)
+    dd = (hh - r.uniform(12.0, 15.5) + 12.0) % 24.0 - 12.0
+    trough = np.exp(-0.5 * (dd / r.uniform(2.5, 4.5)) ** 2)
+    calm = 1.0 / (1.0 + np.exp(-(r.uniform(-1.2, 1.2) + _yo_ou(r, nd + 1, _yo_lu(r, 0.3, 1.2), r.uniform(1.0, 2.0)))))
+    lx = np.log(tr * dayx)[h] + np.log(wk)[(day + d0) % 7] + r.uniform(0.5, 1.4) * calm[nid] * win[h]
+    lx -= (r.uniform(1.0, 3.0) * np.exp(r.normal(0.0, 0.8, nd)))[day] * trough[h]
+    lx += _yo_ou(r, nd, _yo_lu(r, 0.2, 0.7), r.uniform(0.3, 0.7))[day]
+    lx += _yo_ou(r, n, r.uniform(1.0, 3.0), r.uniform(0.05, 0.2) if smooth else r.uniform(0.4, 0.75))
+    ns = r.random(n) < (0.0 if smooth else _yo_lu(r, 0.008, 0.08))
+    lx += ns * r.uniform(0.5, 1.5, n)
+    x = np.exp(np.minimum(lx - lx.max(), 0.0))
+    x *= mean / max(float(_v2_meanm(x)), 1e-12)
+    return (40.0 * mean) * np.tanh(x / (40.0 * mean)), h, day
+
+def _yo_start(r):
+    return int(r.integers(12, 18)) if r.random() < 0.5 else int(r.integers(0, 24))
+
+def _yo_o3(r, n):
+    h0, d0 = _yo_start(r), int(r.integers(0, 7))
+    no, h, day = _yo_nox(r, n, h0, d0, _yo_lu(r, 1.2, 10.0), True)
+    nd = int(day[-1]) + 2
+    hx = np.arange(24, dtype=np.float64) + 0.5
+    pk = r.uniform(13.0, 16.5)
+    dd = (hx - pk + 12.0) % 24.0 - 12.0
+    G = np.exp(-0.5 * (dd / np.where(dd < 0.0, r.uniform(3.0, 5.5), r.uniform(2.5, 4.5))) ** 2)
+    ri = r.uniform(12.0, 17.0)
+    w = r.uniform(0.2, 0.8)
+    S = w * (G - _v2_meanm(G)) / float(np.ptp(G)) + (1.0 - w) * 0.5 * _yo_bump(pk - ri, ri)
+    S = (S - _v2_meanm(S)) / float(np.ptp(S))
+    a_d = np.maximum(1.0 + _yo_ou(r, nd, _yo_lu(r, 1.0, 4.0), r.uniform(0.2, 0.4)), 0.1)
+    td = (np.arange(n, dtype=np.float64) + h0) / 24.0
+    rel = r.uniform(0.3, 0.7) * a_d[day] * S[h]
+    rel += _yo_smooth(r, n, _yo_lu(r, 5.0, 16.0), r.uniform(0.22, 0.4))
+    rel += np.interp(td, np.arange(nd + 1, dtype=np.float64), _yo_ou(r, nd + 1, _yo_lu(r, 8.0, 40.0), r.uniform(0.005, 0.04)))
+    rel += _yo_ou(r, n, r.uniform(0.7, 2.0), r.uniform(0.005, 0.025))
+    x = np.maximum(1.0 + rel, 0.03) / (1.0 + (no / r.uniform(5.0, 14.0)) ** r.uniform(2.2, 4.0))
+    x *= float(np.exp(min(max(r.normal(np.log(47.0), 0.15), np.log(18.0)), np.log(95.0)))) / float(_v2_mean(x))
+    x = np.maximum(x, r.uniform(0.3, 2.5))
+    u = r.random()
+    q = 0.5 if u < 0.65 else (1.0 if u < 0.9 else 0.1)
+    return _yo_quant(r, x, q, r.uniform(0.0, 0.03) if q == 0.5 else 0.0)
+
+def _yo_no(r, n):
+    h0, d0 = _yo_start(r), int(r.integers(0, 7))
+    x, _, _ = _yo_nox(r, n, h0, d0, _yo_lu(r, 0.8, 12.0), False)
+    if r.random() < 0.15:
+        x = np.maximum(x, 0.5 if r.random() < 0.5 else 1.0)
+    u = r.random()
+    q = 0.5 if u < 0.8 else (1.0 if u < 0.9 else 0.1)
+    return _yo_quant(r, x, q, r.uniform(0.0, 0.03) if q == 0.5 else 0.0)
+
+def _yo_pm(r, n, Hp):
+    nh = n // Hp + 3
+    nd = nh // 24 + 2
+    off = int(r.integers(0, Hp))
+    th = np.arange(nh, dtype=np.int64) + int(r.integers(0, 24))
+    hh = th % 24
+    day = th // 24
+
+    z = _yo_ou(r, nh, _yo_lu(r, 36.0, 200.0), r.uniform(0.3, 0.8))
+    pk = r.uniform(18.0, 31.0)
+    hx = np.arange(24, dtype=np.float64) + 0.5
+    prof = np.cos(_YO_TWO_PI * (hx - pk) / 24.0) + r.uniform(0.0, 0.5) * np.cos(2.0 * _YO_TWO_PI * (hx - r.uniform(0.0, 24.0)) / 24.0)
+    prof /= max(float(np.ptp(prof)), 1e-9)
+    z += r.uniform(0.1, 1.3) * prof[hh] * np.exp(r.normal(0.0, 0.45, nd))[day]
+    z += _yo_ou(r, nh, r.uniform(1.0, 6.0), r.uniform(0.1, 0.45))
+
+    ke = int(min(r.poisson(nh / 24.0 * _yo_lu(r, 0.03, 0.5)), 40))
+    for _ in range(ke):
+        s = int(r.integers(0, nh))
+        a = min(r.exponential(r.uniform(0.5, 1.2)), 4.0)
+        ru, pl, fa = r.uniform(1.0, 12.0), r.uniform(0.0, 12.0), r.uniform(0.5, 3.0)
+        e = min(nh, s + int(ru + pl + fa) + 2)
+        x = np.arange(e - s, dtype=np.float64)
+        z[s:e] += a * np.clip(np.minimum(x / ru, (ru + pl + fa - x) / fa), 0.0, 1.0)
+    kf = int(min(r.poisson(nh / 24.0 * _yo_lu(r, 0.02, 0.4)), 30))
+    for _ in range(kf):
+        s = int(r.integers(0, nh))
+        a, fa, tau = r.uniform(0.5, 2.2), r.uniform(0.5, 3.0), r.uniform(6.0, 72.0)
+        x = np.arange(nh - s, dtype=np.float64)
+        z[s:] -= a * np.minimum(x / fa, 1.0) * np.exp(-np.maximum(x - fa, 0.0) / tau)
+    lv = float(min(max(r.normal(np.log(4.8), 0.95), np.log(0.25)), np.log(90.0)))
+    u = r.random()
+    kind = 0 if u < 0.87 else (1 if u < 0.90 else (2 if u < 0.93 else (3 if u < 0.96 else 4)))
+    if kind == 3:
+        lv = float(np.log(_yo_lu(r, 60.0, 800.0)))
+    z += lv - float(np.median(z))
+    zc = np.interp((np.arange(n, dtype=np.float64) + off) / Hp, np.arange(nh, dtype=np.float64), z)
+    zc += _yo_ou(r, n, r.uniform(1.0, 8.0), r.uniform(0.02, 0.12))
+    v = np.exp(np.minimum(zc, np.log(5.0 * _YO_SAT)))
+
+    q = 1.0 if (Hp == 6 and r.random() < 0.8) else 0.1
+    p1 = r.uniform(0.02, 0.5) if r.random() < 0.85 else 1.0
+    p2 = r.uniform(0.0, 0.35) if r.random() < 0.35 else 0.0
+    p4 = r.uniform(0.0, 0.3) if r.random() < 0.25 else 0.0
+    c = 3 - (r.random(n) < p1) * 2
+    c = np.where((c == 3) & (r.random(n) < p2), 2, c)
+    c = np.where((c == 3) & (r.random(n) < p4), 4, c)
+    if q == 1.0:
+        c = np.ones(n, dtype=np.int64)
+    noisy = r.random() < (0.5 if Hp == 6 else 0.16)
+    sm = r.uniform(0.15, 0.8) if noisy else r.uniform(0.01, 0.07)
+    sa = r.uniform(0.0, 0.08) * (1.0 + 4.0 * noisy)
+    fl = q if r.random() < 0.8 else (0.2 if q < 1.0 and r.random() < 0.75 else 0.0)
+    df = r.uniform(2.5, 8.0)
+    e = np.clip(r.standard_t(df, (n, 4)), -8.0, 8.0) * float(np.sqrt((df - 2.0) / df))
+    rd = v[:, None] * (1.0 + sm * e) + sa * r.standard_normal((n, 4))
+    rd = np.minimum(np.maximum(np.round(rd / q) * q, fl), _YO_SAT)
+    cs = np.cumsum(rd, axis=1)
+    y = cs[np.arange(n), c - 1] / c
+    if kind == 1:
+        y = np.full(n, float(r.choice((0.1, 0.2, 0.3, 0.5))) if q < 1.0 else 1.0)
+        m = r.random(n) < _yo_lu(r, 0.002, 0.03)
+        y[m] += np.round(np.exp(r.uniform(-2.0, 2.5, int(m.sum()))), 1)
+    elif kind == 2:
+        y[1::2] *= r.uniform(0.45, 0.8)
+    if r.random() < 0.9:
+        m = r.random(n) < (_yo_lu(r, 0.001, 0.015) if noisy else _yo_lu(r, 0.0001, 0.003))
+        y[m] = np.minimum(y[m] * np.exp(r.uniform(0.5, 2.5, int(m.sum()))), _YO_SAT)
+    if kind == 4:
+        m = r.random(n) < _yo_lu(r, 0.003, 0.05)
+        y[m] = 0.0
+    return np.round(y, 2)
+
+def _yo_ozone(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    kind = _yo_pick(r, _YO_KIND_CUM)
+    if kind < 2:
+        u = r.random()
+        n = (int(r.uniform(780.0, 1120.0)) if u < 0.75 else int(_yo_lu(r, _YO_MIN_N, 780.0)) if u < 0.90
+             else int(r.uniform(1120.0, 2600.0)))
+        n = min(n, L)
+        y = _yo_o3(r, n) if kind == 0 else _yo_no(r, n)
+    else:
+        Hp = _YO_CAD_HP[_yo_pick(r, _YO_CAD_CUM)]
+        u = r.random()
+        if Hp == 24:
+            n = L if u < 0.40 else (int(_yo_lu(r, _YO_MIN_N, 1100.0)) if u < 0.55 else int(r.uniform(min(1100.0, L), L)))
+        else:
+            n = int(r.uniform(450.0, 3000.0)) if Hp == 12 else int(_yo_lu(r, _YO_MIN_N, 1100.0))
+        n = min(max(n, min(_YO_MIN_N, L)), L)
+        y = _yo_pm(r, n, Hp)
+    n = min(n, y.size)
+    y = np.asarray(y[y.size - n:], dtype=np.float64)
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if not np.all(np.isfinite(out)):
+        out = np.where(np.isfinite(out), out, 0.0)
+    if float(np.ptp(out)) == 0.0:
+        out[L - 1 - int(r.integers(0, max(n, 1)))] += 0.5
+    return out
+
+_YP_TWO_PI = 2.0 * np.pi
+
+def _yp_profile(r):
+    h = np.arange(24, dtype=np.float64)
+    kind = r.integers(4)
+    if kind == 0:
+        s = np.exp(-0.5 * ((h - r.uniform(7, 9)) / r.uniform(1.0, 2.0)) ** 2) + r.uniform(0.6, 1.2) * np.exp(-0.5 * ((h - r.uniform(16, 18.5)) / r.uniform(1.0, 2.5)) ** 2)
+    elif kind == 1:
+        s = np.exp(-0.5 * ((h - r.uniform(11, 15)) / r.uniform(2.5, 4.5)) ** 2)
+    elif kind == 2:
+        s = np.exp(-0.5 * (((h - r.uniform(18, 22) + 12) % 24 - 12) / r.uniform(2.0, 3.5)) ** 2)
+    else:
+        s = 0.5 + 0.5 * np.cos(_YP_TWO_PI * (h - r.uniform(10, 16)) / 24.0)
+    s = (s - s.min()) / max(s.max() - s.min(), 1e-9)
+    p = np.exp(r.uniform(1.0, 3.5) * (s - 1.0))
+    return p / _v2_meanm(p)
+
+def _yp_hourly0(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    if r.random() < 0.85:
+        n = int(np.exp(r.uniform(np.log(580), np.log(2000))))
+    else:
+        n = int(r.uniform(2000, max(2001, L)))
+    n = max(256, min(n, L))
+    days = n // 24 + 3
+    prof = _yp_profile(r)
+    wk = np.ones(7)
+    wk[5:] = r.uniform(0.4, 1.4)
+    wk /= _v2_meanm(wk)
+    h0, d0 = int(r.integers(24)), int(r.integers(7))
+    day_lvl = np.exp(r.normal(0.0, r.uniform(0.1, 0.4), days))
+    tau, sd = r.uniform(3.0, 20.0), r.uniform(0.05, 0.3)
+    a = np.exp(-1.0 / tau)
+    e = r.normal(0.0, sd * np.sqrt(1.0 - a * a), days)
+    slow = np.empty(days)
+    slow[0] = r.normal(0.0, sd)
+    for i in range(1, days):
+        slow[i] = a * slow[i - 1] + e[i]
+    t = np.arange(n) + h0
+    d = t // 24
+    lam = np.exp(r.uniform(np.log(1.0), np.log(12.0))) * prof[t % 24] * wk[(d + d0) % 7] * day_lvl[d] * np.exp(slow[d] - sd * sd / 2)
+    k = r.uniform(2.0, 30.0)
+    y = r.poisson(lam * r.gamma(k, 1.0 / k, n)).astype(np.float64)
+    if float(y.max()) <= float(y.min()):
+        y[int(r.integers(n))] += 1.0
+    out = np.empty(L, dtype=np.float64)
+    out[: L - n] = y[0]
+    out[L - n:] = y
+    return out
+
+_YQ_TWO_PI = 2.0 * np.pi
+
+_YQ_KIND_CUM = np.cumsum([0.55, 0.13, 0.08, 0.04, 0.02, 0.09, 0.03, 0.03, 0.03])
+_YQ_MIN_N = 320
+
+_YQ_BLEN = (
+    ((0.66, 99999, 99999), (0.01, 320, 400), (0.06, 500, 800), (0.15, 800, 960), (0.03, 960, 1200), (0.03, 1200, 2000),
+     (0.03, 2000, 3000), (0.03, 3000, 4160)),
+    ((0.37, 99999, 99999), (0.012, 320, 420), (0.36, 420, 486), (0.011, 486, 800), (0.07, 800, 1200), (0.031, 1200, 2000),
+     (0.07, 2000, 3000), (0.068, 3000, 4160)),
+)
+_YQ_BLEN_CUM = tuple(np.cumsum([b[0] for b in bands]) for bands in _YQ_BLEN)
+
+def _yq_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yq_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yq_scan(phi, u, y0):
+    A = np.array(phi, dtype=np.float64)
+    B = np.array(u, dtype=np.float64)
+    n = A.size
+    k = 1
+    while k < n:
+        B[k:] = B[k:] + A[k:] * B[:-k]
+        A[k:] = A[k:] * A[:-k]
+        k *= 2
+    return A * y0 + B
+
+def _yq_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    return _yq_scan(np.full(n, phi), e, r.standard_normal() * sd)
+
+def _yq_bump(h, c, w):
+    d = (h - c + 12.0) % 24.0 - 12.0
+    return np.exp(-0.5 * (d / w) ** 2)
+
+def _yq_clock(r, n, P):
+    s0 = int(r.integers(0, P))
+    i = np.arange(n) + s0
+    return (i % P) * (24.0 / P), i // P, (i // P + int(r.integers(0, 7))) % 7
+
+def _yq_holidays(r, nd, per_year):
+    hol = np.zeros(nd + 1, dtype=bool)
+    k = int(r.poisson(per_year * nd / 365.0))
+    if k > 0:
+        hol[r.integers(0, nd + 1, k)] = True
+    return hol
+
+def _yq_commute(r, hr, sharp):
+    w = (0.5, 1.2, 0.7, 1.6) if sharp else (0.8, 1.6, 1.0, 2.0)
+    s = _yq_bump(hr, r.uniform(7.0, 9.0), r.uniform(w[0], w[1])) + r.uniform(0.6, 1.2) * _yq_bump(hr, r.uniform(16.3, 18.8), r.uniform(w[2], w[3])) \
+        + r.uniform(0.1, 0.5) * _yq_bump(hr, r.uniform(11.5, 14.0), 2.5)
+    return s / max(float(s.max()), 1e-9)
+
+def _yq_counts(r, lam, cv):
+    if cv > 0.02:
+        lam = lam * r.gamma(1.0 / (cv * cv), cv * cv, lam.size)
+    return r.poisson(np.minimum(lam, 1e7)).astype(np.float64)
