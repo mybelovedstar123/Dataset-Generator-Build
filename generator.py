@@ -20435,3 +20435,257 @@ def _xd_fx(r, n):
     dp = int(np.clip(int(r.integers(4, 7)) - 1 - np.floor(np.log10(lev)), 2, 6))
     x = np.round(x, dp)
     return _xd_carry(r, x, r.uniform(0.0, 0.012) if r.random() < 0.85 else r.uniform(0.03, 0.1))
+
+def _xd_pol(r, n):
+    tb = np.arange(n, dtype=np.float64) - float(n - 1)
+    u = r.random()
+    f = r.uniform(0.3, 0.65) if u < 0.85 else r.uniform(0.0, 0.3)
+    lvl = _xd_cycle(r, tb, f)
+    if r.random() < _XD_MIRROR:
+        lvl = 1.0 - lvl
+    amp = r.uniform(1.5, 5.5)
+    q = _XD_GRID[int(r.integers(0, len(_XD_GRID)))]
+    base = np.round((-r.uniform(0.0, 1.0) if r.random() < 0.4 else r.uniform(0.0, 4.0)) / q) * q
+    x = base + _xd_stairs(r, amp * lvl, r.uniform(28.0, 75.0), q)
+    if r.random() < 0.3:
+        x = x + r.choice([-0.75, -0.5, -0.1, 0.1, 0.5, 0.75])
+    if not np.any(x != x[0]):
+        k = int(r.integers(max(1, n // 4), max(2, n - 8)))
+        x[k:] = x[k:] + (q if r.random() < 0.5 else -q)
+    return np.round(x, 3)
+
+def _xd_draw(r, L):
+    u = r.random()
+    kind = 0 if u < _XD_KIND_CUM[0] else 1 if u < _XD_KIND_CUM[1] else 2
+    n = _xd_len(r, L, kind)
+    x = _xd_mkt(r, n) if kind == 0 else _xd_fx(r, n) if kind == 1 else _xd_pol(r, n)
+    return kind, x
+
+def _xd_rates(r, L):
+    L = int(L)
+    if L < 64:
+        return None
+    try:
+        _, x = _xd_draw(r, L)
+        x = np.asarray(x, dtype=np.float64)
+        if x.ndim != 1 or x.size < 2 or x.size > L or not bool(np.all(np.isfinite(x))):
+            return None
+        if float(np.max(np.abs(x))) > 1e12 or not bool(np.any(x != x[0])):
+            return None
+        return _xd_pad(x, L)
+    except Exception:
+        return None
+
+_XE_KIND_CUM = np.cumsum([0.44, 0.32, 0.24])
+_XE_TWO_PI = 2.0 * np.pi
+_XE_LAM_LO = 0.02
+_XE_LAM_HI = 5.0e4
+
+def _xe_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _xe_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _xe_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _xe_ar1(e, phi)
+
+def _xe_len(u, L, kind):
+    lo = float(min(320, L))
+    if kind == 0:
+        full, a, b = 0.03, 320.0, 2000.0
+    elif kind == 1:
+        full, a, b = 0.24, 320.0, 1600.0
+        if 0.66 <= u < 0.76:
+            return int(min(L, max(lo, round(1500.0 * (4096.0 / 1500.0) ** ((u - 0.66) / 0.10)))))
+    else:
+        full, a, b = 0.27, 330.0, 3300.0
+    if u >= 1.0 - full:
+        return L
+    q = u / (0.66 if kind == 1 else 1.0 - full)
+    return int(min(L, max(lo, round(a * (b / a) ** min(q, 1.0)))))
+
+def _xe_head(n, amp, c, span):
+    t = np.arange(n, dtype=np.float64)
+    w = 1.0 - np.log1p(t / c) / np.log1p(span / c)
+    return amp * np.maximum(w, 0.0)
+
+def _xe_cycle(r, n, per, amp, p_end, sd_end):
+    ph_end = 0.5 + r.normal(0.0, sd_end) if r.random() < p_end else r.random()
+    ph = (np.arange(n, dtype=np.float64) - (n - 1)) / per + ph_end
+    h2 = r.uniform(0.0, 0.3)
+    return amp * (np.cos(_XE_TWO_PI * ph) + h2 * np.cos(2.0 * _XE_TWO_PI * ph + r.uniform(0.0, _XE_TWO_PI)))
+
+def _xe_episodes(r, n, rate, dur_lo, dur_hi, amp_lo, amp_hi, plateau):
+    out = np.zeros(n, dtype=np.float64)
+    k = int(min(r.poisson(rate * n), 40))
+    if k <= 0:
+        return out
+    t = np.arange(n, dtype=np.float64)
+    for _ in range(k):
+        i = int(r.integers(0, n))
+        d = _xe_lu(r, dur_lo, dur_hi)
+        a = r.uniform(amp_lo, amp_hi)
+        if r.random() < plateau:
+            j = int(min(n, i + int(d) + 1))
+            out[i:j] += a
+        else:
+            j = int(min(n, i + int(6.0 * d) + 2))
+            out[i:j] += a * np.exp(-(t[i:j] - i) / d)
+    return out
+
+def _xe_ztp(r, lam):
+    lam = np.minimum(np.maximum(lam, _XE_LAM_LO), _XE_LAM_HI)
+    p1 = -np.expm1(-lam)
+    t1 = -np.log1p(-r.random(lam.size) * p1) / lam
+    return 1.0 + r.poisson(lam * np.maximum(1.0 - t1, 0.0)).astype(np.float64)
+
+def _xe_rate(m):
+    lam = m
+    for _ in range(12):
+        lam = m * (1.0 - float(np.exp(-lam)))
+    return max(lam, 0.05)
+
+def _xe_trade(r, n, kind, fresh, m):
+    calm = min(1.0, (9.0 / m) ** 0.5)
+    gain = min(max(0.5 + 0.23 * float(np.log2(m / 2.0)), 0.35), 1.3)
+    if kind == 0:
+        sw = r.uniform(0.45, 0.85) * calm
+        day = 1440.0
+        g = _xe_lu(r, 0.6, 1.7) * gain
+    else:
+        sw = r.uniform(0.50, 0.95) * calm
+        day = 8640.0
+        g = _xe_lu(r, 0.6, 1.7) * gain
+    s1 = g * r.uniform(0.30, 0.70)
+    s2 = g * r.uniform(0.15, 0.45)
+    s3 = g * _xe_lu(r, 0.06, 0.50)
+    x = np.full(n, np.log(_xe_rate(m)) - 0.5 * (sw * sw + s1 * s1 + s2 * s2 + s3 * s3))
+    x += _xe_ou(r, n, _xe_lu(r, 0.6, 4.0), s1)
+    x += _xe_ou(r, n, _xe_lu(r, 6.0, 50.0), s2)
+    x += _xe_ou(r, n, _xe_lu(r, 80.0, max(300.0, 0.5 * n)), s3)
+    x += _xe_cycle(r, n, day, r.uniform(0.15, 0.65) if kind == 0 else r.uniform(0.25, 0.90), 0.8, 0.10)
+    if fresh:
+
+        if r.random() < min(max((m - 4.0) / 8.0, 0.0), 0.95) * (1.0 if kind == 0 else 0.8):
+            amp = min(r.normal(1.2, 0.8) if kind == 0 else r.normal(0.9, 0.7), 3.6)
+            span = _xe_lu(r, 60.0, 600.0) if kind == 0 else _xe_lu(r, 20.0, 250.0)
+        else:
+            amp = r.normal(-0.3, 0.35)
+            span = _xe_lu(r, 20.0, 250.0)
+        x += _xe_head(n, amp, _xe_lu(r, 2.0, 12.0), span)
+
+    x += _xe_episodes(r, n, _xe_lu(r, 0.0005, 0.005), 3.0, 60.0, 0.4, 1.5, 0.25)
+
+    e = sw * r.standard_normal(n)
+    e += (r.random(n) < _xe_lu(r, 0.003, 0.03)) * r.exponential(r.uniform(0.3, 0.7), n)
+    return _xe_ztp(r, np.exp(np.minimum(x + e, 11.0)))
+
+def _xe_edits(r, n, fresh, m):
+    big = m > 40.0
+    if big:
+        sw = r.uniform(0.15, 0.45)
+        g = _xe_lu(r, 0.4, 1.0)
+        cyc = r.uniform(0.05, 0.30)
+    else:
+        gain = min(max(0.35 + 0.33 * float(np.log2(m / 2.0)), 0.25), 1.5)
+        sw = r.uniform(0.40, 0.75) * (1.0 + 0.5 * max(0.0, 1.0 - m / 4.0))
+        g = _xe_lu(r, 0.5, 1.5) * gain
+        cyc = r.uniform(0.25, 0.85) * min(1.0, 0.3 + 0.7 * gain)
+    s1 = g * r.uniform(0.15, 0.40)
+    s2 = g * r.uniform(0.05, 0.25)
+    s3 = g * r.uniform(0.03, 0.15)
+    x = np.full(n, np.log(_xe_rate(m)) - 0.5 * (sw * sw + s1 * s1 + s2 * s2 + s3 * s3))
+    x += _xe_ou(r, n, _xe_lu(r, 1.0, 6.0), s1)
+    x += _xe_ou(r, n, _xe_lu(r, 8.0, 60.0), s2)
+    x += _xe_ou(r, n, _xe_lu(r, 80.0, 400.0), s3)
+
+    per = 1440.0 * (1.0 if m > 7.0 else r.uniform(0.72, 1.0))
+    x += _xe_cycle(r, n, per, cyc, 0.6, 0.12)
+    if fresh:
+        amp = -r.exponential(0.9 if 3.0 < m <= 40.0 else 0.35) if r.random() < 0.8 else r.normal(0.1, 0.25)
+        x += _xe_head(n, max(amp, -2.2), _xe_lu(r, 3.0, 20.0), _xe_lu(r, 100.0, 600.0))
+
+    x += _xe_episodes(r, n, _xe_lu(r, 0.0002, 0.002), 4.0, 300.0, 0.4, 1.5, 0.7)
+    e = sw * r.standard_normal(n)
+    e += (r.random(n) < _xe_lu(r, 0.002, 0.02)) * r.exponential(r.uniform(0.3, 0.6), n)
+    lam = np.exp(np.minimum(x + e, 11.0))
+    if big:
+
+        d = r.uniform(0.05, 0.45)
+        flip = np.cumsum(r.random(n) < r.uniform(0.0, 0.05))
+        lam = lam * np.exp(d * np.where((np.arange(n) + flip) % 2 == 0, 1.0, -1.0))
+        lam = lam * np.where(r.random(n) < r.uniform(0.0, 0.12), r.uniform(0.01, 0.4, n), 1.0)
+    y = _xe_ztp(r, lam)
+    if big and r.random() < 0.6:
+        y = np.minimum(y, float((250, 500, 500, 1000)[int(r.integers(0, 4))]))
+    return y
+
+def _xe_series(r, L, kind):
+
+    z = float(r.standard_normal())
+    if kind == 0:
+        m = min(max(9.2 * float(np.exp((0.52 if z > 0.0 else 0.82) * z)), 1.3), 45.0)
+    elif kind == 1:
+        m = min(max(5.65 * float(np.exp(0.72 * z)), 1.25), 60.0)
+    elif z > 1.5:
+        m = _xe_lu(r, 60.0, 300.0)
+    else:
+        m = max(4.35 * float(np.exp((1.25 if z > 0.0 else 0.48) * z)), 1.5)
+    rho = (0.0, 0.35, 0.7)[kind]
+    zl = rho * z + float(np.sqrt(1.0 - rho * rho)) * float(r.standard_normal())
+    n = _xe_len(1.0 / (1.0 + float(np.exp(-1.702 * zl))), L, kind)
+    if n < 8:
+        return None
+    fresh = n < L
+    y = _xe_trade(r, n, kind, fresh, m) if kind < 2 else _xe_edits(r, n, fresh, m)
+    if fresh and r.random() < (0.5 if kind < 2 else 0.7):
+        y[0] = max(1.0, float(np.floor(y[0] * r.uniform(0.05, 1.0) + 0.5)))
+    if r.random() < (0.6 if kind < 2 else 0.85):
+        y[-1] = max(1.0, float(np.floor(y[-1] * r.uniform(0.05, 1.0) + 0.5)))
+    return y
+
+def _xe_counts(r, L):
+    L = int(L)
+    if L < 64:
+        return None
+    kind = min(int(np.searchsorted(_XE_KIND_CUM, r.random() * _XE_KIND_CUM[-1], side="right")), 2)
+    y = _xe_series(r, L, kind)
+    if y is None or y.size < 8 or y.size > L:
+        return None
+    out = np.empty(L, dtype=np.float64)
+    n = y.size
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+import json as _xz_json
+import os as _xz_os
+
+_XZ_TAG = 0x58A0_0001
+_XZ_L = 4096
+_XZ_MAX_SHARE = 0.25
+_XZ_FAMS = (("airq", "_xa_airq"), ("grid15", "_xb_grid15"), ("min1440", "_xc_min1440"), ("rates", "_xd_rates"),
+            ("counts", "_xe_counts"))
+
+def _xz_num(v, default: float) -> float:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if np.isfinite(v) and v >= 0.0 else default
+
+_XZParent = Generator
