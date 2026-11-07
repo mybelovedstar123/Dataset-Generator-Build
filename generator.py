@@ -28770,3 +28770,265 @@ _validated_cycle_menu = _c251_validated_cycle_menu
 #    candidates in the same lag order with the same strict '<' update. q10/q90 only reach the output through
 #    span = max(q90 - q10, peak * 1e-12, 1e-12) > 0, so the sign of a selected zero cannot matter.
 _c251_tail_rebase_parent = _apply_tail_rebase
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_tr_gather(block, boundary, pre):
+    n = block.shape[0]
+    L = block.shape[1]
+    for r in range(n):
+        b0 = boundary[r] - 512
+        for j in range(512):
+            idx = b0 + j
+            if idx < 0:
+                idx += L
+            pre[r, j] = block[r, idx]
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_qlin1(buf, n, q):
+    vi = float(n - 1) * q
+    if vi >= n - 1:
+        pi = -1
+        k = n - 1
+        kn = n - 1
+    elif vi < 0:
+        pi = 0
+        k = 0
+        kn = 0
+    else:
+        pi = int(np.floor(vi))
+        k = pi
+        kn = pi + 1
+    g = vi - float(pi)
+    _c251_kth(buf, 0, n, k)
+    a = buf[k]
+    if kn == k:
+        b = a
+    else:
+        b = buf[k + 1]
+        for t in range(k + 2, n):
+            if buf[t] < b:
+                b = buf[t]
+    d = b - a
+    if g >= 0.5:
+        return b - d * (1.0 - g)
+    return a + d * g
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_med_even(src, lo, m, buf):
+    for k in range(m):
+        x = src[lo + k]
+        j = k
+        while j > 0 and buf[j - 1] > x:
+            buf[j] = buf[j - 1]
+            j -= 1
+        buf[j] = x
+    h = m // 2
+    return (0.0 + ((0.0 + buf[h - 1]) + buf[h])) / 2.0
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_npmax(a, b):
+    # np.maximum(a, b) for float64: NaN-propagating, the first operand on ties
+    if a != a:
+        return a
+    if b != b:
+        return b
+    return a if a >= b else b
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_tr_stats(pre, span, anchors, repeat_fraction, local_move, drift, strict_linear, recurring_nonflat, best_lag):
+    n = pre.shape[0]
+    buf = np.empty(192, dtype=np.float64)
+    sb = np.empty(32, dtype=np.float64)
+    dl = np.empty(191, dtype=np.float64)
+    d96 = np.empty(96, dtype=np.float64)
+    qq = np.empty(2, dtype=np.float64)
+    lags = (7, 12, 24, 48, 96)
+    for r in range(n):
+        p = pre[r]
+        # recent = p[320:512]
+        peak = abs(p[320])
+        for t in range(192):
+            v = p[320 + t]
+            buf[t] = v
+            av = abs(v)
+            peak = _c251_npmax(peak, av)
+        _c251_qlin2(buf, 192, 0.10, 0.90, qq)
+        sp = _c251_npmax(_c251_npmax(qq[1] - qq[0], peak * 1e-12), 1e-12)
+        span[r] = sp
+        tol = _c251_npmax(peak * 1e-12, 1e-12)
+        c = 0
+        for t in range(191):
+            dv = abs(p[321 + t] - p[320 + t])
+            dl[t] = dv
+            if dv <= tol:
+                c += 1
+        repeat_fraction[r] = c / 191
+        local_move[r] = _c251_qlin1(dl, 191, 0.90) / sp
+        m_last = _c251_med_even(p, 480, 32, sb)
+        m_first = _c251_med_even(p, 320, 32, sb)
+        drift[r] = abs(m_last - m_first) / sp
+        anchors[r] = _c251_med_even(p, 496, 16, sb)
+        # periodic_continue: fit = p[0:416], val = p[416:512]
+        fa = _c251_med_even(p, 400, 16, sb)
+        for t in range(96):
+            d96[t] = abs(p[416 + t] - fa)
+        he = ((0.0 + _v2_pw(d96, 0, 96)) / 96) / sp
+        slope = (_c251_med_even(p, 384, 32, sb) - _c251_med_even(p, 352, 32, sb)) / 32.0
+        for t in range(96):
+            d96[t] = abs(p[416 + t] - (fa + slope * float(t + 1)))
+        le = ((0.0 + _v2_pw(d96, 0, 96)) / 96) / sp
+        pm = abs(slope) * 96.0 / sp
+        strict_linear[r] = (le <= 0.08) and (le <= 0.30 * he) and (pm >= 0.20) and (pm <= 0.90)
+        thr = 0.05 * sp
+        c = 0
+        for t in range(416):
+            if abs(p[t] - fa) > thr:
+                c += 1
+        af = c / 416
+        pe = np.inf
+        bl = 7
+        for li in range(5):
+            lag = lags[li]
+            base = 416 - lag
+            for t in range(96):
+                d96[t] = abs(p[416 + t] - p[base + (t % lag)])
+            err = ((0.0 + _v2_pw(d96, 0, 96)) / 96) / sp
+            if err < pe:
+                pe = err
+                bl = lag
+        best_lag[r] = bl
+        recurring_nonflat[r] = (af >= 0.15) and (pe <= 0.12) and (pe <= 0.75 * he)
+
+
+def _c251_apply_tail_rebase(
+    rng: np.random.Generator,
+    block: np.ndarray,
+    rate: float,
+    *,
+    periodic_continue: bool = False,
+    preserve_periodic_native: bool = False,
+    _route_mode: str = "all",
+) -> np.ndarray:
+    if rate <= 0.0:
+        return block
+    n, L = block.shape
+    if n == 0 or L < 608:
+        return block
+    if not periodic_continue or type(block) is not np.ndarray or block.dtype != np.float64:
+        return _c251_tail_rebase_parent(rng, block, rate, periodic_continue=periodic_continue,
+                                        preserve_periodic_native=preserve_periodic_native, _route_mode=_route_mode)
+    st0 = rng.bit_generator.state
+    selected = rng.random(n) < rate
+    back = rng.integers(256, min(721, L - 32), size=n)
+    boundary = L - back
+    pre = np.empty((n, 512), dtype=np.float64)
+    _c251_tr_gather(block, np.ascontiguousarray(boundary, dtype=np.int64), pre)
+    if not bool(np.isfinite(pre).all()):
+        rng.bit_generator.state = st0
+        return _c251_tail_rebase_parent(rng, block, rate, periodic_continue=periodic_continue,
+                                        preserve_periodic_native=preserve_periodic_native, _route_mode=_route_mode)
+    span = np.empty(n, dtype=np.float64)
+    anchors = np.empty(n, dtype=np.float64)
+    repeat_fraction = np.empty(n, dtype=np.float64)
+    local_move = np.empty(n, dtype=np.float64)
+    drift = np.empty(n, dtype=np.float64)
+    strict_linear = np.empty(n, dtype=np.bool_)
+    recurring_nonflat = np.empty(n, dtype=np.bool_)
+    best_lag = np.empty(n, dtype=np.int64)
+    _c251_tr_stats(pre, span, anchors, repeat_fraction, local_move, drift, strict_linear, recurring_nonflat, best_lag)
+    long_recurring = np.zeros(n, dtype=bool)
+    long_histories = {}
+    if _LONG_CYCLE_ENABLED and periodic_continue:
+        pending = np.flatnonzero(selected & (~recurring_nonflat) & (~strict_linear)
+                                 & (boundary >= 1024))
+        if pending.size:
+            long_offsets = np.arange(-1024, 0, dtype=np.int64)[None, :]
+            long_pre = block[pending[:, None], boundary[pending, None] + long_offsets]
+            long_ok, long_lag = _validated_long_cycle(long_pre)
+            accepted = pending[long_ok]
+            long_recurring[accepted] = True
+            best_lag[accepted] = long_lag[long_ok]
+            for pos in np.flatnonzero(long_ok):
+                long_histories[int(pending[pos])] = long_pre[pos]
+    if _LONGER_CYCLE_ENABLED and periodic_continue:
+        pending = np.flatnonzero(selected & (~recurring_nonflat) & (~strict_linear)
+                                 & (~long_recurring) & (boundary >= 2048))
+        if pending.size:
+            longer_offsets = np.arange(-2048, 0, dtype=np.int64)[None, :]
+            longer_pre = block[pending[:, None], boundary[pending, None] + longer_offsets]
+            longer_ok, longer_lag = _validated_longer_cycle(longer_pre)
+            accepted = pending[longer_ok]
+            long_recurring[accepted] = True
+            best_lag[accepted] = longer_lag[longer_ok]
+            for pos in np.flatnonzero(longer_ok):
+                long_histories[int(pending[pos])] = longer_pre[pos]
+    eligible = selected & (~recurring_nonflat) & (~strict_linear) & (~long_recurring) & (
+        (repeat_fraction >= 0.35)
+        | ((local_move <= 0.03) & (drift <= 0.12))
+    )
+    hold = rng.random(n) < 0.95
+    retain = rng.uniform(0.05, 0.25, size=n)
+    periodic_rows = selected & (recurring_nonflat | long_recurring)
+    linear_rows = selected & strict_linear & (~recurring_nonflat)
+
+    native_linear_rows = linear_rows & ((np.arange(n, dtype=np.int64) & 1) == 0)
+    if _route_mode not in ("all", "periodic", "quiet"):
+        raise ValueError("invalid continuation route mode")
+    if _route_mode == "periodic":
+        eligible = np.zeros(n, dtype=bool)
+        linear_rows = np.zeros(n, dtype=bool)
+        native_linear_rows = np.zeros(n, dtype=bool)
+    elif _route_mode == "quiet":
+        periodic_rows = np.zeros(n, dtype=bool)
+        linear_rows = np.zeros(n, dtype=bool)
+        native_linear_rows = np.zeros(n, dtype=bool)
+
+    cycle_rng = (None if _CYCLE_PREDICTIVE_MODE in ("median", "native")
+                 else np.random.Generator(rng.bit_generator.jumped()))
+    for row in np.nonzero(eligible | periodic_rows | linear_rows)[0]:
+        b = int(boundary[row])
+        if periodic_rows[row]:
+            if preserve_periodic_native:
+                continue
+            lag = int(best_lag[row])
+            block[row, b:] = _empirical_cycle_tail(
+                long_histories.get(row, pre[row]), lag, L - b, cycle_rng, _CYCLE_PREDICTIVE_MODE)
+            continue
+        if linear_rows[row]:
+            if native_linear_rows[row]:
+                continue
+            slope_now = (
+                np.median(pre[row, -32:])
+                - np.median(pre[row, -64:-32])
+            ) / 32.0
+            line = anchors[row] + slope_now * np.arange(1, L - b + 1)
+            block[row, b:] = np.clip(
+                line, anchors[row] - span[row], anchors[row] + span[row]
+            )
+            continue
+        anchor = float(anchors[row])
+        if hold[row]:
+            tail = np.full(L - b, anchor)
+        else:
+            tail = anchor + float(retain[row]) * (block[row, b:] - anchor)
+        block[row, b:] = tail
+    return block
+
+
+_apply_tail_rebase = _c251_apply_tail_rebase
+
+
+# ═══════════════ c251-P4: exact fast seeding (numpy SeedSequence -> PCG64), used by P4/P8. ═══════════════
+# uid76 already carries two SeedSequence replicas: the vectorised _ss_columns/_pcg64_seed_words (self-tested against
+# numpy at import by _assert_seeding_replica, and the source of every row stream) and the _FastCoin pool +
+# _fcx_nb_state/_fcx_nb_step/_fcx_nb_out PCG64 kernels (the _fcx_coin path). P4 reuses them unchanged and adds its
+# own import-time self-test against numpy (on any divergence the fast paths switch themselves off and the original
+# numpy constructions run). A replica yields the SAME PCG64 state (seed/inc words of SeedSequence.generate_state(4,
+# uint64), pcg64_set_seed, has_uint32 = uinteger = 0), so every later draw is bit-identical; no RNG call is added,
+# removed or reordered anywhere.
+from numpy.random.bit_generator import ISpawnableSeedSequence as _C251ISS
