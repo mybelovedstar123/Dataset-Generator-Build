@@ -25667,3 +25667,298 @@ def _yq_counts(r, lam, cv):
     if cv > 0.02:
         lam = lam * r.gamma(1.0 / (cv * cv), cv * cv, lam.size)
     return r.poisson(np.minimum(lam, 1e7)).astype(np.float64)
+
+def _yq_bike(r, n, cad):
+    P = 1440 if cad == 0 else 288
+    hr, day, dow = _yq_clock(r, n, P)
+    nd = int(day[-1]) + 1
+    wkend = (dow >= 5) | _yq_holidays(r, nd, 10.0)[day]
+
+    typ = _yq_pick(r, np.cumsum([0.45, 0.35, 0.20]))
+    nu = _yq_lu(r, 0.04, 0.7) if cad else _yq_lu(r, 0.02, 0.5)
+    if typ == 0:
+        sh = _yq_commute(r, hr, False)
+    elif typ == 1:
+        sh = _yq_bump(hr, r.uniform(13.0, 17.0), r.uniform(2.5, 4.5))
+    else:
+        sh = 0.5 + 0.5 * _yq_bump(hr, r.uniform(11.0, 18.0), r.uniform(4.0, 7.0))
+    w_we = r.uniform(0.35, 1.3) if typ == 0 else r.uniform(0.7, 1.6)
+    act = nu + (1.0 - nu) * np.where(wkend, w_we * _yq_bump(hr, r.uniform(12.5, 16.5), r.uniform(2.5, 4.5)), sh)
+    act = act * np.exp(r.normal(0.0, r.uniform(0.05, 0.35), nd + 1)[day])
+    act = act / max(float(_v2_meanm(act)), 1e-9)
+    z = r.standard_normal()
+    ev_day = float(np.exp((np.log(400.0) if cad == 0 else np.log(90.0)) + z * ((1.6, 1.5) if cad == 0 else (2.4, 1.45))[z > 0]))
+    ev_day = min(max(ev_day, 0.5), 4000.0)
+    k = r.poisson(act * (ev_day / P)).astype(np.float64)
+    cap = int(min(max(np.exp(r.normal(np.log(13.0 if cad else 15.0) + 0.15 * np.log(ev_day / 60.0), 0.55)), 2.0), 90.0))
+    f0 = r.beta(0.9, 1.7)
+
+    amp = (r.uniform(0.05, 0.45) if typ == 0 else r.uniform(0.0, 0.15)) * (1.0 if r.random() < 0.5 else -1.0) * (1.0 if cad else 1.4)
+    sig = 1.0 / (1.0 + np.exp(-(hr - r.uniform(7.5, 10.0)) / 0.8)) - 1.0 / (1.0 + np.exp(-(hr - r.uniform(16.5, 19.5)) / 1.0))
+    m = cap * (f0 + amp * (sig - 0.4) * np.where(wkend, r.uniform(0.0, 0.5), 1.0) + _yq_ou(r, nd + 1, _yq_lu(r, 1.0, 8.0), r.uniform(0.0, 0.3 if cad else 0.4))[day])
+    K = _yq_lu(r, 3.0, 45.0) * (1.0 + (0.3 if cad else 0.55) * np.log1p(ev_day / 100.0))
+    a = np.minimum(k / K, 0.85)
+    if r.random() < 0.7:
+        vis = r.random(n) < _yq_lu(r, 0.05, 2.5) / P * np.where((hr > 5.0) & (hr < 22.0), 1.4, 0.3)
+        a = np.where(vis, r.uniform(0.5, 0.95), a)
+        m = np.where(vis, cap * r.uniform(0.3, 0.75), m)
+    eta = r.uniform(0.5, 0.85) * np.sqrt(k) * r.standard_normal(n)
+    nb = r.random(n) < 1.0 - np.exp(-_yq_lu(r, 0.002, 0.05) * k)
+    if nb.any():
+        eta[nb] += (r.geometric(r.uniform(0.25, 0.6), int(nb.sum())) + 1.0) * np.where(r.random(int(nb.sum())) < 0.5, -1.0, 1.0)
+    y = _yq_scan(1.0 - a, a * m + eta, cap * f0 + r.normal(0.0, 1.0))
+    dis = np.zeros(n)
+    if r.random() < 0.5:
+        dis = np.clip(np.rint(np.cumsum(r.normal(0.0, 1.0, n) * (r.random(n) < _yq_lu(r, 0.2, 4.0) / P)) + r.uniform(0.0, 2.5)),
+                      0.0, max(cap // 4, 1))
+    bikes = np.minimum(np.clip(np.rint(y), 0.0, cap), cap - dis)
+    if r.random() < 0.6:
+        f = np.flatnonzero(r.random(n) < 1.0 - np.exp(-_yq_lu(r, 0.002, 0.25) * k - 0.002))
+        if f.size:
+            bikes[f] = np.clip(bikes[f] + np.where(r.random(f.size) < 0.5, -1.0, 1.0), 0.0, cap - dis[f])
+    if r.random() < 0.5:
+        for i in r.integers(0, n, int(min(r.poisson(_yq_lu(r, 0.02, 1.5) * (1.0 + ev_day / 200.0) * n / P), 60))):
+            ln = 1 + int(r.geometric(0.5 if cad else 0.25))
+            bikes[i:i + ln] = np.maximum(bikes[i:i + ln] - float(r.integers(1, 4)), 0.0) if r.random() < 0.6 else \
+                np.minimum(bikes[i:i + ln] + 1.0, cap - dis[i:i + ln])
+    if r.random() < 0.12:
+        for _ in range(int(r.integers(1, 3))):
+            i = int(r.integers(0, n))
+            ln = int(_yq_lu(r, 1.0, 30.0) * P / 24.0)
+            bikes[i:i + ln] = bikes[i]
+            dis[i:i + ln] = dis[i]
+    eb = np.zeros(n)
+    if r.random() < 0.6:
+        eb = np.minimum(np.rint(bikes * np.clip(r.beta(1.5, 3.0) + _yq_ou(r, nd + 1, 2.0, 0.08)[day], 0.0, 1.0)), bikes)
+    return np.vstack([bikes, cap - dis - bikes, eb, dis])
+
+def _yq_hourly(r, n, flow):
+    hr, day, dow = _yq_clock(r, n, 24)
+    nd = int(day[-1]) + 1
+    hol = _yq_holidays(r, nd, r.uniform(6.0, 14.0))
+    dtype = np.where(hol[day] | (dow == 6), 2, np.where(dow == 5, 1, 0))
+    sparse = flow and r.random() < 0.25
+    shape = _yq_pick(r, np.cumsum([0.5, 0.3, 0.2] if not flow else [0.45, 0.2, 0.35]))
+    if shape == 0:
+        wd = _yq_commute(r, hr, not flow)
+    elif shape == 1:
+        wd = _yq_bump(hr, r.uniform(12.0, 15.5), r.uniform(3.0, 5.0)) + r.uniform(0.0, 0.4) * _yq_bump(hr, r.uniform(18.0, 21.0), 1.5)
+    else:
+        wd = 0.6 * _yq_bump(hr, r.uniform(7.0, 9.0), r.uniform(1.5, 2.5)) + _yq_bump(hr, r.uniform(15.0, 18.0), r.uniform(2.0, 3.5)) \
+            + 0.4 * _yq_bump(hr, 12.5, 3.0)
+    wd = wd / max(float(wd.max()), 1e-9)
+    we = _yq_bump(hr, r.uniform(11.5, 15.5), r.uniform(2.5, 4.5))
+    night = _yq_lu(r, 0.002, 0.05) if not flow else _yq_lu(r, 0.01, 0.25)
+    wf = (r.uniform(0.3, 0.9), r.uniform(0.2, 0.8)) if shape != 1 else (r.uniform(0.8, 1.6), r.uniform(0.6, 1.4))
+    prof = np.where(dtype == 0, wd, np.where(dtype == 1, wf[0], wf[1]) * we)
+    x = np.log(night + (1.0 - night) * prof)
+    x += _yq_ou(r, nd + 1, _yq_lu(r, 0.5, 4.0), _yq_lu(r, 0.03, 0.25) if not flow else r.uniform(0.03, 0.25))[day]
+    if not flow and r.random() < 0.8:
+        rain = r.random(nd + 1) < r.uniform(0.03, 0.2)
+        x += np.where(rain[day], np.log(r.uniform(0.3, 0.9)) * prof, 0.0)
+    x += _yq_ou(r, nd + 1, _yq_lu(r, 10.0, 60.0), r.uniform(0.04, 0.3))[day]
+    if r.random() < 0.5:
+        x += r.uniform(0.0, 0.35) * np.cos(_YQ_TWO_PI * (day / 365.25) + r.uniform(0.0, _YQ_TWO_PI))
+    if r.random() < 0.06:
+        x[int(r.integers(n // 6, n)):] += r.normal(0.0, 0.4)
+    if sparse:
+        base = _yq_lu(r, 0.3, 3.0)
+    elif flow:
+        base = float(np.exp(r.normal(np.log(1500.0), 1.6)))
+    else:
+        base = float(np.exp(r.normal(np.log(45.0), 1.8)))
+    base = min(max(base, 0.2), 3.0e5)
+    lam = base * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 8.0))
+    if flow and not sparse and base > 80.0:
+        tot = np.rint(lam * np.exp(r.normal(0.0, r.uniform(0.01, 0.08), n)))
+    else:
+        tot = _yq_counts(r, lam, r.uniform(0.0, 0.3) if flow else r.uniform(0.03, 0.45))
+    if sparse:
+        tot = np.maximum(tot, 1.0) if r.random() < 0.7 else tot
+    s = np.clip(0.5 + r.uniform(0.0, 0.3) * (1.0 if r.random() < 0.5 else -1.0) * (_yq_bump(hr, 8.0, 2.0) - _yq_bump(hr, 17.5, 2.0)), 0.02, 0.98)
+    A = r.binomial(np.minimum(tot, 1e9).astype(np.int64), s).astype(np.float64)
+    if not flow and r.random() < 0.06:
+        i = int(r.integers(0, n))
+        ln = int(_yq_lu(r, 6.0, 120.0))
+        tot[i:i + ln] = 0.0
+        A[i:i + ln] = 0.0
+    return np.vstack([tot, A, tot - A])
+
+def _yq_daily(r, n, low):
+    t = np.arange(n, dtype=np.float64)
+    dow = (np.arange(n) + int(r.integers(0, 7))) % 7
+    wk = r.normal(0.0, 0.04, 7)
+    if r.random() < (0.45 if not low else 0.6):
+        wk[5] += np.log(_yq_lu(r, 0.15, 1.5))
+        wk[6] = wk[5] + np.log(r.uniform(0.5, 1.1))
+    hol = _yq_holidays(r, n, 10.0)[:n]
+    x = np.where(hol, wk[6] + r.normal(0.0, 0.1, n), wk[dow])
+    x += r.uniform(0.0, 0.45) * np.cos(_YQ_TWO_PI * t / 365.25 + r.uniform(0.0, _YQ_TWO_PI))
+    x += _yq_ou(r, n, _yq_lu(r, 1.0, 5.0), r.uniform(0.03, 0.3))
+    x += _yq_ou(r, n, _yq_lu(r, 30.0, 300.0), r.uniform(0.03, 0.3) if not low else r.uniform(0.3, 1.0))
+    if r.random() < 0.15:
+        x[int(r.uniform(0.1, 0.95) * n):] += r.normal(0.0, 0.7)
+    base = float(np.exp(r.normal(0.0, 1.3))) if low else float(np.exp(r.normal(np.log(300.0), 3.0)))
+    lam = min(max(base, 0.05), 3.0e6) * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 8.0))
+    c = _yq_counts(r, lam, r.uniform(0.0, 0.25) if base < 5000 else 0.0)
+    if not low and r.random() < 0.15:
+        c = np.round(lam / _v2_mean(lam) * 100.0 * np.exp(r.normal(0.0, 0.02, n)), 1)
+    return np.vstack([c, _yq_counts(r, lam * r.uniform(0.1, 0.9), 0.1)])
+
+def _yq_metric(r, n, P, style):
+    hr, day, dow = _yq_clock(r, n, P)
+    nd = int(day[-1]) + 1
+    dc = _yq_commute(r, hr, False) if r.random() < 0.6 else _yq_bump(hr, r.uniform(11.0, 17.0), r.uniform(3.0, 5.0))
+    wkend = dow >= 5
+    if style == 0:
+        hi = _yq_lu(r, 30.0, 2000.0)
+        y = np.rint(r.random(n) * hi * (1.0 + r.uniform(0.0, 0.3) * (dc - 0.5))) if r.random() < 0.7 else \
+            np.rint(np.exp(r.normal(np.log(hi / 3.0), r.uniform(0.3, 1.2), n)))
+        mu = np.full(n, hi / 2.0)
+    elif style == 1:
+        lvl = r.uniform(15.0, 110.0)
+        mu = lvl * (1.0 - r.uniform(0.0, 0.4) * dc * np.where(wkend, 0.3, 1.0)) * np.exp(_yq_ou(r, n, _yq_lu(r, 5.0, 300.0), r.uniform(0.02, 0.15)))
+        y = mu * np.exp(r.normal(0.0, r.uniform(0.02, 0.2), n))
+        if r.random() < 0.4:
+            y = np.where(r.random(n) < r.uniform(0.05, 0.4), 0.0, y)
+        y = np.rint(y)
+    elif style == 2:
+        lvl = float(np.exp(r.normal(np.log(300.0), 1.4)))
+        mu = lvl * (1.0 + r.uniform(0.05, 0.5) * (dc - 0.5) * np.where(wkend, 0.5, 1.0)) * np.exp(_yq_ou(r, n, _yq_lu(r, 10.0, 2000.0), r.uniform(0.01, 0.15)))
+        y = mu + r.normal(0.0, 1.0, n) * np.sqrt(mu) * r.uniform(0.1, 1.5)
+        y = np.round(y, 3) / 100.0 if r.random() < 0.08 else np.rint(np.maximum(y, 0.0))
+        if r.random() < 0.6:
+            keep = r.random(n) < r.uniform(0.2, 0.9)
+            keep[0] = True
+            y = y[np.maximum.accumulate(np.where(keep, np.arange(n), 0))]
+    elif style == 3:
+        ks = int(r.integers(2, 12))
+        stp = 1.0 if ks <= 3 else float(r.choice([5.0, 10.0, 20.0, 60.0]))
+        lv = (np.arange(ks) - int(r.integers(0, 2))) * stp
+        sw = r.random(n) < r.uniform(0.05, 0.6)
+        sw[0] = True
+        st = np.where(sw, r.integers(0, ks, n), 0)
+        y = lv[st[np.maximum.accumulate(np.where(sw, np.arange(n), 0))]]
+        mu = np.full(n, float(_v2_meanm(lv)))
+    elif style == 4:
+        base = r.uniform(45.0, 80.0)
+        mu = base - r.uniform(8.0, 25.0) * (_yq_bump(hr, r.uniform(13.0, 16.0), r.uniform(3.0, 5.0)) - 0.4) \
+            + _yq_ou(r, nd + 1, _yq_lu(r, 2.0, 10.0), r.uniform(4.0, 12.0))[day] + _yq_ou(r, n, P / 6.0, r.uniform(0.5, 3.0))
+        y = np.clip(np.rint(mu), 5.0, 100.0)
+    elif style == 5:
+        lvl = _yq_lu(r, 0.03, 0.25)
+        mu = lvl * np.exp(_yq_ou(r, n, _yq_lu(r, 4.0, 30.0), r.uniform(0.4, 0.8)) + r.uniform(0.0, 0.4) * (dc - 0.5))
+        y = np.round(np.where(r.random(n) < r.uniform(0.0, 0.08), 0.0, mu), 3)
+    elif style == 6:
+        lam = _yq_lu(r, 0.4, 5.0) * np.exp(r.uniform(0.0, 1.2) * (dc - 0.5) + _yq_ou(r, n, _yq_lu(r, 2.0, P), r.uniform(0.1, 0.5)))
+        y = _yq_counts(r, lam, r.uniform(0.0, 0.4))
+        if r.random() < 0.6:
+            y = np.maximum(y, 1.0)
+        if r.random() < 0.4:
+            keep = r.random(n) < r.uniform(0.3, 0.8)
+            keep[0] = True
+            y = y[np.maximum.accumulate(np.where(keep, np.arange(n), 0))]
+        mu = lam
+    else:
+        on = _yq_ou(r, n, _yq_lu(r, 3.0, 40.0), 1.0) > r.uniform(0.8, 2.0)
+        mu = r.uniform(3.0, 15.0) * np.ones(n)
+        y = np.where(on, np.round(mu * np.exp(r.normal(0.0, 0.3, n)), 1), 0.0)
+    y = np.asarray(y, dtype=np.float64)
+    if P >= 288 and style in (0, 1, 2, 3) and r.random() < 0.3:
+        off = (_yq_bump(hr, r.uniform(2.0, 4.5), r.uniform(1.0, 2.5)) > 0.5) & (r.random(n) < r.uniform(0.4, 0.9))
+        if r.random() < 0.6:
+            y = y[np.maximum.accumulate(np.where(off, 0, np.arange(n)))]
+        else:
+            y = np.where(off, 0.0, y)
+    sib = np.round(y * r.uniform(0.3, 1.0) + r.normal(0.0, 1.0, n) * _v2_std(y) * r.uniform(0.05, 0.5), 3)
+    return np.vstack([y, sib, np.round(np.asarray(mu, dtype=np.float64), 3)])
+
+def _yq_transport_draw(r, L, C=1):
+    L = int(L)
+    kind = _yq_pick(r, _YQ_KIND_CUM)
+    u = r.random()
+    if kind == 0:
+        cad = 0 if r.random() < 0.25 else 1
+        b = _YQ_BLEN[cad][_yq_pick(r, _YQ_BLEN_CUM[cad])]
+        n = L if b[2] > 9999 else int(r.integers(b[1], b[2]))
+        z = _yq_bike(r, min(n, L), cad)
+        D, lab = (1440, "bike1") if cad == 0 else (288, "bike5")
+    elif kind in (1, 2):
+        n = (int(np.exp(r.normal(np.log(900.0), 0.55))) if u < 0.96 else L) if kind == 1 else \
+            (int(r.uniform(1700.0, 2400.0)) if u < 0.6 else int(_yq_lu(r, 340.0, 1700.0)))
+        z = _yq_hourly(r, max(min(n, L), _YQ_MIN_N), kind == 2)
+        D, lab = 24, ("countH" if kind == 1 else "other_H")
+    elif kind == 3:
+        n = L if u < 0.35 else int(np.exp(r.normal(np.log(1800.0), 0.6)))
+        z = _yq_daily(r, max(min(n, L), _YQ_MIN_N), False)
+        D, lab = 7, "other_D"
+    elif kind == 4:
+        z = _yq_daily(r, max(min(int(np.exp(r.normal(np.log(560.0), 0.4))), L), _YQ_MIN_N), True)
+        D, lab = 7, "countD"
+    else:
+        P = {5: 1440, 6: 288, 7: 48, 8: 96}[kind]
+        if kind == 5:
+            n = L if u < 0.25 else (int(_yq_lu(r, 280.0, 1200.0)) if u < 0.8 else int(r.uniform(1200.0, max(L, 1201))))
+            style = _yq_pick(r, np.cumsum([0.3, 0.2, 0.3, 0.2]))
+        elif kind == 6:
+            n = L if u < 0.1 else int(_yq_lu(r, 320.0, 1000.0))
+            style = (2, 6, 7)[_yq_pick(r, np.cumsum([0.4, 0.35, 0.25]))]
+        elif kind == 7:
+            n = int(r.uniform(1000.0, 2100.0))
+            style = 5 if r.random() < 0.75 else 6
+        else:
+            n = L if u < 0.4 else int(_yq_lu(r, 280.0, 2400.0))
+            style = 4 if r.random() < 0.7 else 6
+        z = _yq_metric(r, max(min(n, L), _YQ_MIN_N), P, style)
+        D, lab = P, {1440: "other_min", 288: "other_5min", 48: "other_30min", 96: "other_15min"}[P]
+    n = min(z.shape[1], L)
+    z = z[:, z.shape[1] - n:]
+    if C == 1:
+        return z[0], D, lab
+    rows = [c % z.shape[0] for c in range(C)]
+    if kind == 0 and C == 2 and r.random() < 0.15:
+        rows[1] = 2
+    return z[rows], D, lab
+
+def _yq_pad(y, L):
+    n = y.shape[-1]
+    out = np.empty(y.shape[:-1] + (L,), dtype=np.float64)
+    out[..., :L - n] = y[..., :1]
+    out[..., L - n:] = y
+    return out
+
+def _yq_transport(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    y, D, lab = _yq_transport_draw(r, L)
+    out = _yq_pad(np.asarray(y, dtype=np.float64), L)
+    if float(np.ptp(out)) == 0.0:
+        out[L - 1 - int(r.integers(0, max(y.size, 1)))] += 1.0
+    return out
+
+def _yq_transport_mc(r, L, C):
+    L, C = int(L), int(C)
+    if L < 256:
+        return None
+    if C <= 1:
+        return _yq_transport(r, L).reshape(1, L)
+    z, D, lab = _yq_transport_draw(r, L, C)
+    out = _yq_pad(np.asarray(z, dtype=np.float64), L)
+    for c in range(C):
+        if float(np.ptp(out[c])) == 0.0:
+            out[c, L - 1 - int(r.integers(0, max(z.shape[1], 1)))] += 1.0
+    return out
+
+_YR_TWO_PI = 2.0 * np.pi
+_YR_KIND_CUM = np.cumsum([0.48, 0.24, 0.16, 0.12])
+_YR_MIN_N = 320
+_YR_MAX_CAL = 32768
+_YR_SUB_P = (288, 1440, 144, 24)
+_YR_SUB_CUM = np.cumsum([0.40, 0.25, 0.15, 0.20])
+
+def _yr_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yr_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
