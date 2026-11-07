@@ -16736,13 +16736,58 @@ def _k87_quiet(r):
     recent = np.asarray(r[-192:], dtype=np.float64)
     if recent.size < 64:
         return False
+    key = (recent.shape, recent.tobytes())
+    hit = _K87_MEMO.get(key)
+    if hit is not None:
+        return hit
+    if len(_K87_MEMO) >= 4096:
+        _K87_MEMO.clear()
+    out = _k87_quiet_eval(recent)
+    _K87_MEMO[key] = out
+    return out
+
+def _k87_quiet_slow(recent):
     d = np.abs(np.diff(recent))
     q10, q90 = np.quantile(recent, (0.10, 0.90)); peak = float(np.max(np.abs(recent)))
     span = max(float(q90 - q10), peak * 1e-12, 1e-12); tol = max(peak * 1e-12, 1e-12)
-    if float(np.mean(d <= tol)) >= 0.35:
+    if float(_v2_mean(d <= tol)) >= 0.35:
         return True
     drift = abs(float(np.median(recent[-32:]) - np.median(recent[:32]))) / span
     return float(np.quantile(d, 0.90)) / span <= 0.03 and drift <= 0.12
+
+def _k87_lin(s, q):
+    v = (s.size - 1) * q
+    j = int(np.floor(v))
+    g = v - float(j)
+    a = s[j]
+    b = s[j + 1]
+    diff = b - a
+    if g >= 0.5:
+        return b - diff * (1 - g)
+    return a + diff * g
+
+def _k87_quiet_eval(recent):
+    if recent.ndim != 1 or recent.size < 64:
+        return _k87_quiet_slow(recent)
+    s = np.sort(recent)
+    lo = s[0]
+    hi = s[-1]
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return _k87_quiet_slow(recent)
+    d = np.abs(np.diff(recent))
+    q10 = _k87_lin(s, 0.10)
+    q90 = _k87_lin(s, 0.90)
+    peak = float(max(abs(lo), abs(hi)))
+    span = max(float(q90 - q10), peak * 1e-12, 1e-12); tol = max(peak * 1e-12, 1e-12)
+    if np.count_nonzero(d <= tol) / d.size >= 0.35:
+        return True
+    sd = np.sort(d)
+    if not np.isfinite(sd[-1]):
+        return _k87_quiet_slow(recent)
+    m1 = np.sort(recent[-32:])
+    m0 = np.sort(recent[:32])
+    drift = abs(float((m1[15] + m1[16]) / 2 - (m0[15] + m0[16]) / 2)) / span
+    return float(_k87_lin(sd, 0.90)) / span <= 0.03 and drift <= 0.12
 
 def _band_weights():
     w = np.array([float(_BAND_MIX.get(name, 0.0)) for name, _ in _TEACH_FAMILIES], dtype=np.float64)
@@ -16783,21 +16828,21 @@ class Generator(_PublishedGenerator):
         try:
             for i, x in enumerate(base):
                 if _BAND_Q > 0.0 and np.ndim(x) == 1:
-                    v = np.random.default_rng(np.random.SeedSequence([self._seed, _BAND_TAG], spawn_key=(i,))).random()
+                    v = _fcx_coin(self._seed, _BAND_TAG, i)
                     if v < _BAND_Q and not _k87_quiet(x):
                         y = np.asarray(self._bteach.next(), dtype=np.float64)
                         a = np.asarray(x, dtype=np.float64).reshape(1, -1); b = y.reshape(-1, y.shape[-1])
                         L = min(a.shape[-1], b.shape[-1])
                         z = np.concatenate([a[:, a.shape[-1] - L:], b[:, b.shape[-1] - L:]], axis=0)
                         if _CPL > 0.0 and z.shape[0] == 2:
-                            d0 = np.diff(z[0]); s0 = float(np.std(d0)); d1 = np.diff(z[1]); s1 = float(np.std(d1))
+                            d0 = np.diff(z[0]); s0 = float(_v2_std(d0)); d1 = np.diff(z[1]); s1 = float(_v2_std(d1))
                             if s0 > 0.0 and s1 > 0.0 and np.isfinite(s0) and np.isfinite(s1):
-                                zz = np.concatenate([[0.0], np.clip((d0 - d0.mean()) / s0, -6.0, 6.0)])
+                                zz = np.concatenate([[0.0], np.clip((d0 - _v2_meanm(d0)) / s0, -6.0, 6.0)])
                                 p = int(np.argmax(z[1] != z[1][0]))
                                 zz[:p] = 0.0
                                 z = np.stack([z[0], z[1] + (_CPL * s1) * zz])
                         if (np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12))
-                                and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12)):
+                                and _v2_std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12)):
                             x = np.ascontiguousarray(z)
                 yield x
         finally:
@@ -16885,7 +16930,7 @@ def _w86e2_smooth2(r, m, tau):
 
     phi = float(np.exp(-1.0 / max(tau, 1.0)))
     y = _w86e2_ar_e(_w86e2_ar_e(r.standard_normal(m + int(4 * tau) + 8), phi), phi)[-m:]
-    return y / (float(np.std(y)) + 1e-12)
+    return y / (float(_v2_std(y)) + 1e-12)
 
 def _w86e2_holds(r, x, p):
     if p <= 0.0:
@@ -17439,7 +17484,7 @@ def _w86c_day_profile(rng, P, office):
     span = lp.max() - lp.min()
     lp = (lp - lp.max()) / (span if span > 1e-9 else 1.0) * np.log(1.0 / trough)
     p = np.exp(lp)
-    return p / p.mean()
+    return p / _v2_meanm(p)
 
 def _w86c_event_hourly(rng, n):
     P = 48 if rng.random() < 0.2 else 24
@@ -17458,7 +17503,7 @@ def _w86c_event_hourly(rng, n):
         else:
             wk[4:6] *= rng.uniform(1.0, 1.15)
             wk[6] *= rng.uniform(0.85, 1.05)
-        wk /= wk.mean()
+        wk /= _v2_meanm(wk)
         dow = (day + int(rng.integers(0, 7))) % 7
 
         nd = int(day.max()) + 1
@@ -17587,7 +17632,7 @@ def _w86a_pollutant(r, S):
     h, day = _w86a_clock(r, S, P, prof, key)
     dow = (day + int(r.integers(0, 7))) % 7
     pr = prof(h)
-    pr = pr - pr.mean()
+    pr = pr - _v2_meanm(pr)
     wk = np.ones(S)
     if sp in ('no2', 'no', 'co'):
         wk = np.where(dow >= 5, np.log(r.uniform(0.6, 0.9)), 0.0)
@@ -17869,10 +17914,22 @@ def _w86b_rates_one(r):
     kind = 'policy' if r.random() < _W86B_POL_P else 'mkt'
     return _w86r_record(r, _pt_sample_series_length(r), kind)
 
+_W86B_MEMO = {}
+
 def _w86b_intlike(x):
 
     t = np.asarray(x[-512:], dtype=np.float64)
-    return bool(t.size and np.mean(t == np.round(t)) >= 0.98)
+    if not t.size:
+        return False
+    key = (t.shape, t.tobytes())
+    hit = _W86B_MEMO.get(key)
+    if hit is not None:
+        return hit
+    if len(_W86B_MEMO) >= 4096:
+        _W86B_MEMO.clear()
+    out = bool(np.count_nonzero(t == np.round(t)) / t.size >= 0.98)
+    _W86B_MEMO[key] = out
+    return out
 
 _W86B_FAMILIES = (("w86b_energy", _w86b_energy_one, 0.40), ("w86b_civic", _w86b_civic_one, 0.20),
                   ("w86b_rates", _w86b_rates_one, 0.20), ("w86b_air", _w86b_air_one, 0.20))
@@ -17925,7 +17982,7 @@ def _w86b_add(stream, x):
     z[0] = x
     z[1] = y
     if (np.all(np.isfinite(z)) and np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12))
-            and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12) and np.array_equal(z[0], x)):
+            and _v2_std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12) and np.array_equal(z[0], x)):
         return z
     stream.last_fam = -1
     return None
@@ -17951,7 +18008,7 @@ class Generator(_W86BParent):
         try:
             for i, x in enumerate(base):
                 if _W86B_Q > 0.0 and np.ndim(x) == 1:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _W86B_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _W86B_COIN_TAG, i)
                     if u < _W86B_Q and not _k87_quiet(x) and not _w86b_intlike(x):
                         z = _w86b_add(self._w86b_stream, x)
                         if z is not None:
@@ -17978,13 +18035,25 @@ _P25_CUM = np.cumsum([w for _, w in _P25_FAMILIES])
 def _p25_len(r, lo, hi):
     return int(r.integers(lo, hi + 1))
 
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_ar1_fill(out, e, phi):
+    for t in range(1, out.shape[0]):
+        out[t] = phi * out[t - 1] + e[t]
+
+def _fcx_ar1(out, e, phi):
+    if (type(out) is np.ndarray and out.dtype == np.float64 and out.ndim == 1 and type(e) is np.ndarray
+            and e.dtype == np.float64 and e.ndim == 1 and e.shape[0] >= out.shape[0] and type(phi) in (float, np.float64)):
+        _fcx_ar1_fill(out, np.ascontiguousarray(e), float(phi))
+        return
+    for t in range(1, out.shape[0]):
+        out[t] = phi * out[t - 1] + e[t]
+
 def _p25_ar1(r, n, phi, sd):
     phi = float(np.clip(phi, -0.99, 0.99))
     e = r.standard_normal(n) * sd * np.sqrt(max(1.0 - phi * phi, 1e-8))
     out = np.empty(n, dtype=np.float64)
     out[0] = r.standard_normal() * sd
-    for t in range(1, n):
-        out[t] = phi * out[t - 1] + e[t]
+    _fcx_ar1(out, e, phi)
     return out
 
 def _p25_daily_share(r):
@@ -18025,7 +18094,7 @@ def _p25_weekday_counts(r):
     if r.random() < 0.25:
         dow[5] = r.uniform(0.7, 1.15)
         dow[6] = r.uniform(0.55, 1.05)
-    dow = dow / dow.mean()
+    dow = dow / _v2_meanm(dow)
     phase = int(r.integers(0, 7))
     rate = mu * dow[(np.arange(n) + phase) % 7]
     rate = rate * np.exp(_p25_ar1(r, n, r.uniform(0.2, 0.65), r.uniform(0.15, 0.45)))
@@ -18086,7 +18155,7 @@ def _p25_held_intraday(r):
         n = _p25_len(r, 800, 4096)
         mu = float(np.exp(r.uniform(np.log(1.0), np.log(80.0))))
         prof = 0.35 + 0.9 * np.clip(np.sin(2.0 * np.pi * (np.arange(p) / p - r.uniform(0.15, 0.4))), 0, None)
-        prof = prof / max(prof.mean(), 1e-6)
+        prof = prof / max(_v2_meanm(prof), 1e-6)
         rate = mu * prof[np.arange(n) % p]
         x = r.poisson(np.clip(rate, 0, 1e6)).astype(np.float64)
         h = r.random(n) < r.uniform(0.08, 0.4)
@@ -18165,7 +18234,7 @@ def _p25_add(stream, x):
     z[0] = x
     z[1] = y
     if (np.all(np.isfinite(z)) and np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12))
-            and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12) and np.array_equal(z[0], x)):
+            and _v2_std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12) and np.array_equal(z[0], x)):
         return z
     return None
 
@@ -18190,7 +18259,7 @@ class Generator(_P25Parent):
         try:
             for i, x in enumerate(base):
                 if _P25_Q > 0.0 and np.ndim(x) == 1:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _P25_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _P25_COIN_TAG, i)
                     if u < _P25_Q and not _k87_quiet(x) and not _w86b_intlike(x):
                         z = _p25_add(self._p25_stream, x)
                         if z is not None:
@@ -18252,7 +18321,7 @@ class Generator(_KParent):
         try:
             for i, x in enumerate(base):
                 if _K_Q > 0.0 and np.ndim(x) == 1 and np.asarray(x).size >= 64:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _K_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _K_COIN_TAG, i)
                     if u < _K_Q and not _k87_quiet(x):
                         r = np.random.default_rng(np.random.SeedSequence([self._k_seed, _K_TAG], spawn_key=(self._k_n,)))
                         self._k_n += 1
@@ -18297,7 +18366,7 @@ class Generator(_K2Parent):
         try:
             for i, x in enumerate(base):
                 if _K2_Q > 0.0 and np.ndim(x) == 2 and np.shape(x)[0] == 2 and np.shape(x)[1] >= 64:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _K2_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _K2_COIN_TAG, i)
                     if u < _K2_Q and not _k87_quiet(np.asarray(x)[0]):
                         r = np.random.default_rng(np.random.SeedSequence([self._k2_seed, _K2_TAG], spawn_key=(self._k2_n,)))
                         self._k2_n += 1
@@ -18369,7 +18438,7 @@ class Generator(_S1Parent):
         try:
             for i, x in enumerate(base):
                 if _S1_Q > 0.0 and np.ndim(x) == 1:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _S1_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _S1_COIN_TAG, i)
                     if u < _S1_Q and not _k87_quiet(x) and not _w86b_intlike(x):
                         z = _w86b_add(self._s1_stream, x)
                         if z is not None:
@@ -18465,7 +18534,7 @@ _S2_CUM = np.cumsum([w for _, _, w in _S2_FAMILIES]) / sum(w for _, _, w in _S2_
 
 def _s2_corr(r, x):
     x = np.asarray(x, dtype=np.float64)
-    if x.size and np.mean(x[-512:] == np.round(x[-512:])) >= 0.98 and np.nanmin(x) >= 0.0:
+    if x.size and _v2_mean(x[-512:] == np.round(x[-512:])) >= 0.98 and np.nanmin(x) >= 0.0:
         cap = float(np.nanmax(x)) + float(r.integers(0, 6))
         dock = np.maximum(cap - x, 0.0)
         return dock[None, :]
@@ -18507,7 +18576,7 @@ class Generator(_S2Parent):
         try:
             for i, x in enumerate(base):
                 if _S2_Q > 0.0 and np.ndim(x) == 1 and np.asarray(x).size >= 64:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _S2_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _S2_COIN_TAG, i)
                     if u < _S2_Q and not _k87_quiet(x):
                         r = self._s2_stream.rng()
                         f = int(np.searchsorted(_S2_CUM, r.random() * 0.999999))
@@ -18693,12 +18762,12 @@ def _c128_tidal_fnoise(r, n, f_corner, order=2.0, peak=None):
     spec = (r.standard_normal(f.size) + 1j * r.standard_normal(f.size)) * amp
     spec[0] = 0.0
     x = np.fft.irfft(spec, m)[:n]
-    s = float(x.std())
+    s = float(_v2_stdm(x))
     return x / s if s > 0 else x
 
 def _c128_tidal_rough(r, n, d_sd, lo=2.0, hi=15.0):
     z = _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(lo, hi)), order=2.0)
-    dz = float(np.std(np.diff(z))) if n > 2 else 1.0
+    dz = float(_v2_std(np.diff(z))) if n > 2 else 1.0
     return z * (d_sd / max(dz, 1e-12))
 
 def _c128_tidal_quant(x, q):
@@ -18767,7 +18836,7 @@ def _c128_tidal_gauge(r, L):
             if a_tot < 0.08 and r.random() < 0.5:
                 amp_s = amp_s * r.uniform(1.5, 4.0)
             env = np.exp(0.45 * _c128_tidal_fnoise(r, n, cad / (60.0 * 18.0), order=2.0))
-            x = x + amp_s * env / max(float(np.sqrt(np.mean(env * env))), 1e-9) * \
+            x = x + amp_s * env / max(float(np.sqrt(_v2_mean(env * env))), 1e-9) * \
                 _c128_tidal_fnoise(r, n, 0.0, peak=(1.0 / p_s, 1.0 / (p_s * q)))
 
     if r.random() < 0.8:
@@ -18776,7 +18845,7 @@ def _c128_tidal_gauge(r, L):
         s_w = _c128_tidal_lu(r, 0.01, 0.05)
     if r.random() < 0.35:
         e = r.standard_t(float(r.uniform(2.5, 6.0)), n)
-        e = e / max(float(e.std()), 1e-9)
+        e = e / max(float(_v2_stdm(e)), 1e-9)
     else:
         e = r.standard_normal(n)
     x = x + s_w * e
@@ -18868,11 +18937,11 @@ def _c128_tidal_press(r, L):
         d_sd = _c128_tidal_lu(r, 0.008, 0.035)
         x = x + _c128_tidal_rough(r, n, d_sd, 1.5, 10.0)
         e = r.standard_t(float(r.uniform(2.2, 4.0)), n)
-        x = x + d_sd * r.uniform(0.2, 0.6) * e / max(float(e.std()), 1e-9)
+        x = x + d_sd * r.uniform(0.2, 0.6) * e / max(float(_v2_stdm(e)), 1e-9)
     else:
         x = x + _c128_tidal_rough(r, n, r.uniform(0.2, 0.6), 1.2, 5.0)
         e = r.standard_t(float(r.uniform(2.2, 4.0)), n)
-        x = x + r.uniform(0.05, 0.25) * e / max(float(e.std()), 1e-9)
+        x = x + r.uniform(0.05, 0.25) * e / max(float(_v2_stdm(e)), 1e-9)
     x = level + x
     v = r.random()
     if cad <= 1.0:
@@ -18896,9 +18965,9 @@ def _c128_tidal_buoy(r, L):
     diel = np.cos(_C128_TIDAL_TWO_PI * (t / day + r.random()))
     syn = _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(0.8, 6.0) * day), 1.7)
     syn = syn + r.uniform(0.0, 1.2) * r.choice(np.array([-1.0, 1.0])) * (t / max(n, 1) - 0.5)
-    syn = syn / max(float(syn.std()), 1e-9)
+    syn = syn / max(float(_v2_stdm(syn)), 1e-9)
     ht = r.standard_t(float(r.uniform(2.2, 5.0)), n)
-    ht = ht / max(float(ht.std()), 1e-9)
+    ht = ht / max(float(_v2_stdm(ht)), 1e-9)
     if kind < 0.3:
         lg = np.log(r.uniform(0.3, 1.5)) + r.uniform(0.35, 0.7) * syn
         k = int(r.poisson(max(n / (day * r.uniform(4.0, 12.0)), 0.3)))
@@ -19165,7 +19234,7 @@ def _c128_hydro_geomag(r, n):
     sq = np.exp(-0.5 * (d / w) ** 2)
     d2 = (tod - c - r.uniform(0.15, 0.3) + 0.5) % 1.0 - 0.5
     sq = sq - r.uniform(0.0, 0.4) * np.exp(-0.5 * (d2 / r.uniform(0.06, 0.15)) ** 2)
-    sq = (sq - sq.mean()) / max(np.ptp(sq), 1e-9)
+    sq = (sq - _v2_meanm(sq)) / max(np.ptp(sq), 1e-9)
     pp = _c128_hydro_logu(r, 15.0, 70.0) * (-1.0 if r.random() < 0.75 else 1.0)
     x = lvl + pp * sq * _c128_hydro_dayfac(r, n, int(P), r.uniform(0.08, 0.3))
     x += r.uniform(-4.0, 4.0) * t / P
@@ -19382,6 +19451,9 @@ def _c128_infra_ar1_t(r, n, phi, sd, tail):
 
 def _c128_infra_ar1_filter(e, phi):
     y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
     n = y.size
     k = 1
     p = float(phi)
@@ -19439,7 +19511,7 @@ def _c128_infra_daily(r, n, P, depth, wk_amp, wk_lvl, day_sd):
     dav = np.interp(fr, grid, _c128_infra_ar1(r, nd, r.uniform(0.3, 0.9), 1.3 * day_sd))
     amp = (1.0 - depth) * np.exp(dav) * np.where(weekend, wk_amp, 1.0)
     env = (depth + amp * prof) * np.exp(dlv) * np.where(weekend, wk_lvl, 1.0)
-    return env / max(env.mean(), 1e-12)
+    return env / max(_v2_meanm(env), 1e-12)
 
 def _c128_infra_ixp_period(r):
     u = r.random()
@@ -19931,7 +20003,7 @@ def _c128_mobility_dock(r, L):
     dayenv = _c128_mobility_sig((ph - r.uniform(0.22, 0.30)) / 0.02) * _c128_mobility_sig((r.uniform(0.85, 0.97) - ph) / 0.03)
     com = r.uniform(0.0, 1.0) * (_c128_mobility_bump(ph, r.uniform(0.30, 0.37), 0.03) + _c128_mobility_bump(ph, r.uniform(0.70, 0.77), 0.04))
     act = (qn + (1.0 - qn) * (dayenv * r.uniform(0.4, 1.0) + com)) * np.exp(_c128_mobility_ar1(r, n, r.uniform(0.99, 0.999), r.uniform(0.3, 1.2)))
-    p_ev = np.clip(lam * act / max(float(act.mean()), 1e-9), 0.0, 0.9)
+    p_ev = np.clip(lam * act / max(float(_v2_meanm(act)), 1e-9), 0.0, 0.9)
     ev = np.flatnonzero(r.random(n) < p_ev)
     beta, phs = r.uniform(0.0, 0.35), r.uniform(0.0, 1.0)
     pplus = (0.5 + beta * np.sin(2.0 * np.pi * (ph[ev] - phs))).tolist()
@@ -20144,7 +20216,7 @@ def _xa_series(r, n, kind):
     c3 = r.uniform(0.0, 0.25)
     prof = (np.cos(_XA_TWO_PI * (hh - p1) / 24.0) + c2 * np.cos(2.0 * _XA_TWO_PI * (hh - p2) / 24.0)
             + c3 * np.cos(3.0 * _XA_TWO_PI * (hh - r.uniform(0.0, 24.0)) / 24.0))
-    prof *= sig * r.uniform(*K['prof']) / float(np.sqrt(np.mean(prof * prof)))
+    prof *= sig * r.uniform(*K['prof']) / float(np.sqrt(_v2_mean(prof * prof)))
     nd = int(day[-1]) + 1
     dayf = np.clip(1.0 + r.uniform(0.25, 0.60) * r.standard_normal(nd), 0.15, 2.4)
     wk = np.zeros(7)
@@ -20162,7 +20234,7 @@ def _xa_series(r, n, kind):
     else:
         x = np.exp(np.clip(z, -12.0, 12.0))
     level = _xa_lu(r, 0.2, 50.0)
-    x *= level / float(np.mean(x))
+    x *= level / float(_v2_mean(x))
 
     rho = _xa_lu(r, *K['grid'])
     u_odd, u_dec = r.random(), r.random()
@@ -20235,6 +20307,9 @@ def _xb_lu(u, lo, hi):
 
 def _xb_ar1(e, phi):
     y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
     n = y.size
     k = 1
     p = float(phi)
@@ -20298,8 +20373,8 @@ def _xb_co2(r, n, a, sod, day, dow0):
     rest = (0.1 + 0.5 * u[6]) * _xb_bump(74.0 + 10.0 * u[7], 5.0 + 6.0 * u[8]) + 0.3 * u[9] * _xb_bump(28.0 + 6.0 * u[10], 4.0 + 5.0 * u[11])
     sun = 0.25 + 0.75 * r.beta(1.5 + 2.5 * u[12], 0.8 + 1.0 * u[13], nd)
     prof = rest[sod] - dip[sod] * sun[day]
-    prof = prof - float(prof.mean())
-    prof = prof / max(float(prof.std()), 1e-9)
+    prof = prof - float(_v2_meanm(prof))
+    prof = prof / max(float(_v2_stdm(prof)), 1e-9)
     slow = _xb_ou2(r, n, _xb_lu(u[14], 50.0, 260.0), 2.0 + 4.0 * u[15])
     res = _xb_ou2(r, n, _xb_lu(u[16], 5.0, 22.0), 1.0 + 2.5 * u[17], tail=0.15 + 0.5 * u[18])
     z = float(np.sqrt(qp)) * prof + float(np.sqrt(1.0 - qp)) * (float(np.sqrt(fs)) * slow + float(np.sqrt(1.0 - fs)) * res)
@@ -20332,7 +20407,7 @@ def _xb_wind(r, n, a, sod, day, dow0):
     nk = n // 48 + 3
     vol = np.exp((0.25 + 0.5 * u[1]) * np.interp(a - a[0], np.arange(nk, dtype=np.float64) * 48.0, _xb_ou(r, nk, 3.0)))
     g = _xb_ou2(r, n, _xb_lu(u[2], 30.0, 150.0), 1.0 + 4.5 * u[3], tail=0.3 * u[4], vol=vol)
-    g = g / max(float(g.std()), 1e-9)
+    g = g / max(float(_v2_stdm(g)), 1e-9)
     z = g + _xb_lu(u[5], 0.02, 0.12) * _xb_ou(r, n, 1.5 + 8.0 * u[6])
     if u[7] < 0.5:
         z = z + (0.05 + 0.35 * u[8]) * (_xb_bump(96.0 * u[9], 14.0 + 10.0 * u[10]) - 0.3)[sod]
@@ -20400,9 +20475,9 @@ def _xb_load(r, n, a, sod, day, dow0):
         evb = (0.5 + 0.5 * u[10]) * _xb_bump(70.0 + 12.0 * u[11], 6.0 + 6.0 * u[12])
         wd = (0.5 + 0.5 * u[2]) * _xb_bump(28.0 + 10.0 * u[3], 6.0 + 6.0 * u[13]) + md + evb - ng
         we = (0.2 + 0.4 * u[2]) * _xb_bump(34.0 + 10.0 * u[3], 8.0 + 6.0 * u[13]) + md + evb - ng
-    sc = max(float(wd.std()), 1e-9)
-    wd = (wd - float(wd.mean())) / sc
-    we = (we - float(we.mean())) / sc
+    sc = max(float(_v2_stdm(wd)), 1e-9)
+    wd = (wd - float(_v2_meanm(wd))) / sc
+    we = (we - float(_v2_meanm(we))) / sc
     depth = 0.06 + 0.12 * u[14]
     wkmix = sat * (0.5 + 0.5 * u[15]) + sun
     amp = (1.0 - wkmix * (0.1 + 0.4 * u[16])) * np.exp(0.06 * r.standard_normal(nd))
@@ -20485,6 +20560,9 @@ def _xc_lu(r, lo, hi):
 
 def _xc_filt(e, phi):
     y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
     n = y.size
     k = 1
     p = float(phi)
@@ -20642,7 +20720,7 @@ def _xc_rate_std(r, n):
     fast = _xc_ar1(r, n, _xc_lu(r, 4.0, 30.0), 0.020 * q * _xc_lu(r, 0.6, 1.7), r.uniform(0.0, 0.6))
     z = z + _xc_box(fast, int(r.integers(3, 8)))
 
-    lx = lc + lvl + z * np.exp(-r.uniform(0.2, 0.7) * (lc - float(lc.mean())))
+    lx = lc + lvl + z * np.exp(-r.uniform(0.2, 0.7) * (lc - float(_v2_meanm(lc))))
     size = 0.08 * q ** 0.5 * _xc_lu(r, 0.5, 2.0)
     lx = lx + _xc_steps(r, n, _xc_count(r, 0.3, 0.5, 5.0), 15.0, 300.0, 0.3 * size, 4.0 * size, 0.8)
     lx = lx + _xc_steps(r, n, _xc_count(r, 0.2, 1.0, 12.0), 2.0, 14.0, 0.2 * size, 2.5 * size, 0.9)
@@ -20749,7 +20827,7 @@ def _xc_tide(r, L):
     s_w = _xc_lu(r, 0.0005, 0.01) if r.random() < 0.8 else _xc_lu(r, 0.01, 0.05)
     if r.random() < 0.35:
         e = r.standard_t(float(r.uniform(2.5, 6.0)), n)
-        e = e / max(float(e.std()), 1e-9)
+        e = e / max(float(_v2_stdm(e)), 1e-9)
     else:
         e = r.standard_normal(n)
     x = x + s_w * e
@@ -21026,6 +21104,9 @@ def _xe_lu(r, lo, hi):
 
 def _xe_ar1(e, phi):
     y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
     n = y.size
     k = 1
     p = float(phi)
@@ -21266,7 +21347,7 @@ class Generator(_XZParent):
         try:
             for i, x in enumerate(base):
                 if fams:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _XZ_TAG], spawn_key=(i,))).random(slots)
+                    u = _fcx_coins(seed, _XZ_TAG, i, slots)
                     for k, q, f in fams:
                         if u[k] >= q:
                             continue
@@ -21289,24 +21370,7 @@ class Generator(_XZParent):
         finally:
             base.close()
 
-
-# ═══════════════ c-acuh: official air / USDA prices / health / CO2 series ADDED as channel 3 under moving 3-channel rows ═══════════════
-# Every record of the parent (uid220 = king171 + c91/c124 hold layers + c128) is yielded unchanged, in order, except: an exactly
-# THREE-channel float64 record (length >= 256, all finite) whose channel 0 is moving (not constant, not _k87_quiet, not
-# _w86b_intlike — the lineage's own helpers, unchanged) gains ONE extra channel (channel 3). Channels 0-2 are the record itself,
-# byte-identical. No existing function, table or weight is changed; univariate and 2-channel records (held / quiet / integer rows)
-# are never touched.
-# Why: on the real duel windows uid220 (and its init) are miscalibrated exactly where its corpus has no matching builder — official
-# air quality (forecast too low, upper band too narrow: future pollution episodes break above the past range), USDA daily price
-# panels (prices turn down below the band), health surveillance (waves end below the band) and CO2 intensity (band too narrow:
-# multi-day weather regimes). The four builders are calibrated to pool statistics (cadence, history length, level, daily profile,
-# persistence, episode rate/size, turn rate, quantisation); each content series is generated at a real-like length and LEFT-PADDED
-# with its first value, as the validator pads short histories. Statistics only: no real values or sequences are embedded.
-# Record i's draws come only from SeedSequence([seed, _ACUH_TAG], spawn_key=(i,)), so every parent RNG advances exactly as without
-# this block. A 4-channel record is billed at points+mv20 (4 x L x 100/120 instead of 3 x L x 100/120).
-
 _ACUH_TWO_PI = 2.0 * np.pi
-
 
 def _acuh_pad(x, L):
     out = np.empty(L, dtype=np.float64)
@@ -21318,34 +21382,25 @@ def _acuh_pad(x, L):
         out[L - n:] = x
     return out
 
-
 def _acuh_ar1(r, n, phi, sd):
     e = r.standard_normal(n) * sd
     x = np.empty(n)
     x[0] = e[0] / max(np.sqrt(1.0 - phi * phi), 1e-3)
-    for t in range(1, n):
-        x[t] = phi * x[t - 1] + e[t]
+    _fcx_ar1(x, e, phi)
     return x
 
-
 def _acuh_smooth_noise(r, n, corner):
-    """unit-sd low-pass noise (corner in cycles/sample)"""
     m = 1 << int(np.ceil(np.log2(max(2 * n, 64))))
     f = np.fft.rfftfreq(m)
     spec = (r.standard_normal(f.size) + 1j * r.standard_normal(f.size)) / (1.0 + (f / max(corner, 1e-9)) ** 2)
     spec[0] = 0.0
     x = np.fft.irfft(spec, m)[:n]
-    s = float(np.std(x))
+    s = float(_v2_std(x))
     return x / s if s > 0 else x
-
 
 def _acuh_quantise(x, q):
     return np.round(x / q) * q if q > 0 else x
 
-
-# ───────────────────────────── official air quality ─────────────────────────────
-# pollutant: (weight, median level lo/hi, daily profile shape, profile amplitude (log) lo/hi, hourly AR phi lo/hi,
-#             episode rate per 1000 h lo/hi, episode log-amplitude mean, zero-floor share, integer-feed probability, quantum)
 _ACUH_AIR_P = {
     "no2":  (0.29, (6.0, 30.0), "traffic", (0.25, 0.9), (0.80, 0.90), (10, 34), 0.9, 0.00, 0.15, 0.1),
     "pm25": (0.21, (3.0, 9.0), "morning", (0.15, 0.45), (0.90, 0.95), (13, 25), 1.0, 0.00, 0.10, 0.1),
@@ -21360,9 +21415,7 @@ _ACUH_AIR_P = {
 _ACUH_AIR_NAMES = tuple(_ACUH_AIR_P)
 _ACUH_AIR_CUM = np.cumsum([_ACUH_AIR_P[k][0] for k in _ACUH_AIR_NAMES]) / sum(_ACUH_AIR_P[k][0] for k in _ACUH_AIR_NAMES)
 
-
 def _acuh_air_profile(r, shape, hours):
-    """log-scale diurnal profile (zero mean, unit peak-to-peak) at the given hours of day"""
     h = hours % 24.0
     if shape == "traffic":
         p = np.exp(-0.5 * ((h - r.uniform(6.5, 8.5)) / r.uniform(1.0, 2.0)) ** 2) + \
@@ -21371,13 +21424,12 @@ def _acuh_air_profile(r, shape, hours):
         p = np.exp(-0.5 * ((h - r.uniform(13.0, 16.0)) / r.uniform(2.5, 4.0)) ** 2)
     elif shape == "midday":
         p = np.exp(-0.5 * ((h - r.uniform(10.0, 13.0)) / r.uniform(2.0, 4.0)) ** 2)
-    else:  # morning + night accumulation (PM)
+    else:
         p = np.exp(-0.5 * ((h - r.uniform(6.0, 9.0)) / r.uniform(1.5, 3.0)) ** 2) + \
             r.uniform(0.3, 0.9) * np.exp(-0.5 * ((((h - r.uniform(21.0, 24.0)) + 12) % 24 - 12) / r.uniform(2.0, 4.0)) ** 2)
-    p = p - p.mean()
+    p = p - _v2_meanm(p)
     rng = np.ptp(p)
     return p / rng if rng > 0 else p
-
 
 def _acuh_air(r, L):
     k = _ACUH_AIR_NAMES[int(np.searchsorted(_ACUH_AIR_CUM, r.random() * 0.999999, side="right"))]
@@ -21388,13 +21440,13 @@ def _acuh_air(r, L):
     hours = t + r.uniform(0, 24)
     base = np.log(np.exp(r.uniform(np.log(lev[0]), np.log(lev[1]))))
     prof = _acuh_air_profile(r, shape, hours) * r.uniform(*amp) * 1.25
-    wk = r.uniform(0.0, 0.15) * (((hours // 24) % 7) < 5) if shape == "traffic" else 0.0     # weekday traffic uplift
-    syn = _acuh_smooth_noise(r, n, 1.0 / r.uniform(48, 240)) * r.uniform(0.15, 0.45)              # multi-day weather regimes
-    drift = np.linspace(0.0, r.normal(0.0, 0.6), n)                                          # slow seasonal drift, either sign
+    wk = r.uniform(0.0, 0.15) * (((hours // 24) % 7) < 5) if shape == "traffic" else 0.0
+    syn = _acuh_smooth_noise(r, n, 1.0 / r.uniform(48, 240)) * r.uniform(0.15, 0.45)
+    drift = np.linspace(0.0, r.normal(0.0, 0.6), n)
     ph = r.uniform(*phi)
     noise = _acuh_ar1(r, n, ph, r.uniform(0.10, 0.25) * np.sqrt(1 - ph * ph) * 1.5)
     lx = base + prof + wk + syn + drift + noise
-    # episodes: Poisson onsets, fast rise, exponential decay; multi-day smog events (rarer, longer) on top
+
     ep = np.zeros(n)
     nep = r.poisson(n * r.uniform(*rate) / 1000.0)
     for s in r.integers(0, n, nep):
@@ -21408,10 +21460,10 @@ def _acuh_air(r, L):
             env = np.sin(np.linspace(0, np.pi, d)) ** 2 * r.uniform(0.4, 1.3)
             e = min(n, s + d); lx[s:e] += env[:e - s]
     x = np.exp(lx) * (1.0 + ep)
-    if zfloor > 0:                                                                            # detection floor -> exact zeros
+    if zfloor > 0:
         thr = np.quantile(x, r.uniform(0.6, 1.4) * zfloor)
         x = np.where(x < thr, 0.0, x)
-    signed = k in ("no2", "no", "o3", "other") and zfloor < 0.3 and r.random() < 0.3       # sensors reporting around zero (offset noise)
+    signed = k in ("no2", "no", "o3", "other") and zfloor < 0.3 and r.random() < 0.3
     if signed:
         x = x + r.normal(0.0, r.uniform(0.3, 2.0)) * 0.3 + r.standard_normal(n) * r.uniform(0.2, 1.2)
     if r.random() < p_int:
@@ -21424,37 +21476,33 @@ def _acuh_air(r, L):
         x = x + _acuh_quantise(np.abs(r.standard_normal(n)) * 0.1, 0.1)
     return _acuh_pad(x, L)
 
-
-# ───────────────────────────── USDA daily price panels ─────────────────────────────
 def _acuh_usda(r, L):
     n = int(r.integers(440, 720))
     t = np.arange(n, dtype=np.float64)
     level = np.exp(r.uniform(np.log(80.0), np.log(850.0)))
     cv = np.exp(r.uniform(np.log(0.05), np.log(0.4)))
-    # smooth trend: a few slow cycles (seasonal price cycles) + slow random walk -> ~3-10 turns per 100 days of a 15-day slope
+
     tr = np.zeros(n)
-    tr += np.sin(_ACUH_TWO_PI * t / r.uniform(230.0, 280.0) + r.uniform(0, _ACUH_TWO_PI)) * r.uniform(0.6, 1.2)   # annual cycle (business days)
+    tr += np.sin(_ACUH_TWO_PI * t / r.uniform(230.0, 280.0) + r.uniform(0, _ACUH_TWO_PI)) * r.uniform(0.6, 1.2)
     for _ in range(int(r.integers(1, 4))):
         per = r.uniform(30.0, 120.0)
         tr += r.uniform(0.15, 0.6) * np.sin(_ACUH_TWO_PI * t / per + r.uniform(0, _ACUH_TWO_PI))
     tr += _acuh_ar1(r, n, r.uniform(0.97, 0.995), r.uniform(0.0, 0.05))
-    tr = (tr - tr.mean()) / (tr.std() + 1e-12)
-    w_noise = r.uniform(0.06, 0.35) if r.random() < 0.85 else r.uniform(0.6, 1.4)            # some panels are noise-dominated
+    tr = (tr - _v2_meanm(tr)) / (_v2_stdm(tr) + 1e-12)
+    w_noise = r.uniform(0.06, 0.35) if r.random() < 0.85 else r.uniform(0.6, 1.4)
     noise = _acuh_ar1(r, n, r.uniform(0.0, 0.4), w_noise)
-    if r.random() < 0.35:                                                                     # weekly/print-day effect
+    if r.random() < 0.35:
         noise += r.uniform(0.05, 0.3) * np.where((t % 5) == r.integers(0, 5), 1.0, 0.0)
     z = tr + noise
-    if r.random() < 0.12:                                                                     # price-list / contract step
+    if r.random() < 0.12:
         s = int(r.integers(n // 5, 4 * n // 5)); z[s:] += r.normal(0, 0.6)
-    x = level * (1.0 + cv * z / (np.std(z) + 1e-12))
+    x = level * (1.0 + cv * z / (_v2_std(z) + 1e-12))
     x = np.maximum(x, level * 0.05)
     x = _acuh_quantise(x, 0.01 if r.random() < 0.9 else 1.0)
-    if r.random() < 0.06:                                                                     # missing-report zeros (rare)
+    if r.random() < 0.06:
         x[r.random(n) < r.uniform(0.01, 0.08)] = 0.0
     return _acuh_pad(x, L)
 
-
-# ───────────────────────────── CO2 intensity / grid mix ─────────────────────────────
 def _acuh_co2(r, L):
     u = r.random()
     kind = "ec" if u < 0.55 else ("dk" if u < 0.65 else "gb")
@@ -21469,11 +21517,11 @@ def _acuh_co2(r, L):
         level = np.exp(r.uniform(np.log(50.0), np.log(120.0)))
     else:
         level = np.exp(r.uniform(np.log(40.0), np.log(500.0)))
-    # daily profile: evening peak / solar dip, amplitude varies day to day
+
     shape = np.cos(_ACUH_TWO_PI * day + phase) + r.uniform(0.0, 0.6) * np.cos(2 * _ACUH_TWO_PI * day + r.uniform(0, _ACUH_TWO_PI))
     amp_d = np.exp(_acuh_smooth_noise(r, n, 1.0 / (P * r.uniform(2, 6))) * r.uniform(0.05, 0.25))
     prof = shape / (np.ptp(shape) + 1e-12) * r.uniform(0.15, 1.0) * amp_d
-    # multi-day weather (wind / solar) regimes: big level swings, either direction
+
     reg = _acuh_smooth_noise(r, n, 1.0 / (P * r.uniform(1.5, 6.0))) * r.uniform(0.15, 0.45)
     lx = np.log(level) + prof + reg
     if kind == "gb":
@@ -21492,15 +21540,12 @@ def _acuh_co2(r, L):
         x = _acuh_quantise(x, 0.1 if level > 20 else 0.01)
     return _acuh_pad(x, L)
 
-
-# ───────────────────────────── health surveillance ─────────────────────────────
 def _acuh_waves(r, n, n_waves, rise, fall):
-    """seasonal epidemic waves: roughly annual centres (365 +- 30 days, random phase) with random sizes"""
     t = np.arange(n, dtype=np.float64)
     w = np.zeros(n)
     c0 = r.uniform(-365.0, 0.0)
     centres = [c0 + 365.0 * k + r.normal(0, 30) for k in range(int(n / 365) + 3)]
-    if r.random() < 0.4:                                                                      # an extra off-season wave (e.g. summer COVID)
+    if r.random() < 0.4:
         centres.append(r.uniform(0, n))
     for c in centres:
         a = float(np.exp(r.normal(-0.5, 0.6)))
@@ -21508,45 +21553,41 @@ def _acuh_waves(r, n, n_waves, rise, fall):
         w += a * np.where(t < c, np.exp(-np.minimum(np.abs(c - t) / ru, 400.0) ** 1.3), np.exp(-np.minimum(np.abs(t - c) / fa, 400.0) ** 1.1))
     return w
 
-
 def _acuh_health(r, L):
     u = r.random()
-    if u < 0.70:                                                                              # CDC-like daily percentages
+    if u < 0.70:
         n = int(r.integers(500, 540))
         base = np.exp(r.uniform(np.log(0.02), np.log(8.0)))
         w = _acuh_waves(r, n, 0, (20, 60), (25, 80))
         smooth = base * (r.uniform(0.01, 0.3) + np.exp(r.uniform(np.log(2.0), np.log(25.0))) * w)
         noise = 1.0 + _acuh_ar1(r, n, r.uniform(0.0, 0.4), r.uniform(0.04, 0.18))
         x = smooth * np.maximum(noise, 0.05)
-        if r.random() < 0.3:                                                                  # weekday visit mix
+        if r.random() < 0.3:
             x *= 1.0 + r.uniform(0.01, 0.06) * np.cos(_ACUH_TWO_PI * np.arange(n) / 7 + r.uniform(0, _ACUH_TWO_PI))
-        if r.random() < 0.5:                                                                  # end-of-feed reporting dip
+        if r.random() < 0.5:
             k = int(r.integers(2, 10)); x[-k:] *= np.linspace(1.0, r.uniform(0.6, 0.95), k)
         x = _acuh_quantise(x, 0.01 if base < 5 else 0.1)
-    else:                                                                                     # RKI-like integer counts
+    else:
         n = int(r.integers(2300, min(L, 2420) + 1)) if r.random() < 0.8 else int(r.integers(780, 3200))
         n = min(n, L)
         base = np.exp(r.uniform(np.log(0.5), np.log(300.0)))
         w = _acuh_waves(r, n, 0, (25, 80), (30, 120))
         lam = base * (r.uniform(0.01, 0.2) + np.exp(r.uniform(np.log(2.0), np.log(25.0))) * w)
         x = r.poisson(np.maximum(lam, 0.0)).astype(np.float64)
-        if r.random() < 0.35:                                                                 # weekly reporting: value held for the week
+        if r.random() < 0.35:
             idx = np.arange(n) // 7 * 7
             x = x[np.minimum(idx + int(r.integers(0, 7)), n - 1)]
-        if r.random() < 0.5:                                                                  # end-of-feed reporting lag
+        if r.random() < 0.5:
             k = int(r.integers(3, 15)); x[-k:] = np.floor(x[-k:] * np.linspace(1.0, r.uniform(0.3, 0.9), k))
     if np.ptp(x) == 0:
         x = x + np.round(np.abs(r.standard_normal(x.size)))
     return _acuh_pad(np.asarray(x, dtype=np.float64), L)
 
-
-
-
 _ACUH_FAMS = (
-    ("air", 0.50, _acuh_air),        # official hourly air quality (NO2, PM2.5, O3, NO, PM10, BC, CO, SO2)
-    ("usda", 0.20, _acuh_usda),      # daily price panels
-    ("health", 0.15, _acuh_health),  # CDC-like daily percentages / RKI-like daily counts
-    ("co2", 0.15, _acuh_co2),        # CO2 intensity / grid mix (5 / 15 / 30 min)
+    ("air", 0.50, _acuh_air),
+    ("usda", 0.20, _acuh_usda),
+    ("health", 0.15, _acuh_health),
+    ("co2", 0.15, _acuh_co2),
 )
 _ACUH_CUM = np.cumsum([w for _, w, _ in _ACUH_FAMS]) / sum(w for _, w, _ in _ACUH_FAMS)
 _ACUH_TAG = 0xAC0E5A01
@@ -21554,10 +21595,7 @@ _ACUH_Q = 1.0
 _ACUH_HOST_C = 3
 _ACUH_MIN_LEN = 256
 
-
 def _acuh_eligible(x):
-    """Host test: an exactly _ACUH_HOST_C-channel float64 record (length >= _ACUH_MIN_LEN, all finite) whose channel 0 is moving:
-    not constant, not _k87_quiet, not _w86b_intlike (the lineage's helpers, unchanged)."""
     if not (isinstance(x, np.ndarray) and x.ndim == 2 and x.shape[0] == _ACUH_HOST_C and x.dtype == np.float64
             and x.shape[1] >= _ACUH_MIN_LEN):
         return False
@@ -21568,25 +21606,38 @@ def _acuh_eligible(x):
         return False
     return not _k87_quiet(x0) and not _w86b_intlike(x0)
 
-
 def _acuh_keep(w, x):
-    """The added series is kept only as an array of exactly (L,), all finite, not constant and not a copy of any channel."""
     L = int(x.shape[1])
     if not (isinstance(w, np.ndarray) and w.shape == (L,) and bool(np.all(np.isfinite(w))) and not bool(np.all(w == w[0]))):
         return False
+    wc = None
+    ww = 0.0
+    wok = False
     for c in range(x.shape[0]):
         a = x[c]
-        if np.std(a) > 0 and abs(float(np.corrcoef(a, w)[0, 1])) >= 0.999:
-            return False
+        sa = _v2_std(a)
+        if sa > 0:
+            if wc is None:
+                wm = _v2_meanm(w)
+                wc = w - wm
+                ww = float(np.dot(wc, wc))
+                wok = (math.isfinite(ww) and 1e-150 < ww < 1e150
+                       and float(np.sqrt(ww / L)) > 1e-6 * float(np.max(np.abs(w))))
+            if wok and math.isfinite(float(sa)) and float(sa) > 1e-6 * float(np.max(np.abs(a))):
+                ac = a - _v2_meanm(a)
+                aa = float(np.dot(ac, ac))
+                aw = float(np.dot(ac, wc))
+                if math.isfinite(aa) and math.isfinite(aw) and 1e-150 < aa < 1e150:
+                    est = abs(aw) / (math.sqrt(aa) * math.sqrt(ww))
+                    if est < 0.98:
+                        continue
+            if abs(float(np.corrcoef(a, w)[0, 1])) >= 0.999:
+                return False
     return True
-
 
 _ACUHParent = Generator
 
-
 class Generator(_ACUHParent):
-    """Parent records unchanged; an exactly three-channel float record whose channel 0 is moving gains ONE extra channel (an air /
-    USDA / health / CO2 series) as channel 3. Channels 0-2 stay byte-identical; univariate and 2-channel records are never touched."""
 
     @property
     def name(self) -> str:
@@ -21618,3 +21669,70 @@ class Generator(_ACUHParent):
                 yield x
         finally:
             base.close()
+
+_YA_TWO_PI = 2.0 * np.pi
+_YA_N_LONG = (770, 990)
+_YA_N_SHORT = (128, 770)
+_YA_N_FWD = (990, 1500)
+_YA_N_CUM = np.cumsum([0.36, 0.54, 0.10])
+_YA_KIND_CUM = np.cumsum([0.38, 0.30, 0.12, 0.12, 0.08])
+
+_YA_KINDS = (
+    dict(sig=(0.578, 0.71), slow=(0.018, 0.045), shift=(1.17, 1.83), wcy=(0.229, 0.413), tau=(2.5, 5.5),
+         sm=(0.324, 0.756), syn=(0.627, 0.855), jmp=(0.015, 0.045), jsz=(0.375, 0.844), rev=0.1, noi=(0.11, 0.22),
+         df=(2.6, 4.5), prof=(0.242, 0.462), h2=(0.35, 2.2), wk=(0.51, 0.93), lam=(0.04, 0.22), grid=(0.001, 0.06),
+         gap=(0.5, 8.0), glong=0.02),
+    dict(sig=(0.515, 0.625), slow=(0.037, 0.075), shift=(2.15, 2.44), wcy=(0.276, 0.459), tau=(5.0, 9.0),
+         sm=(0.432, 1.08), syn=(0.57, 0.855), jmp=(0.015, 0.045), jsz=(0.45, 0.9), rev=0.7, noi=(0.088, 0.165),
+         df=(3.4, 6.0), prof=(0.165, 0.352), h2=(0.1, 0.6), wk=(0.832, 1.0), lam=(0.0, 0.06), grid=(0.003, 0.15),
+         gap=(1.0, 8.0), glong=0.02),
+    dict(sig=(0.445, 0.539), slow=(0.022, 0.06), shift=(1.97, 2.49), wcy=(0.276, 0.459), tau=(3.5, 6.5),
+         sm=(0.27, 0.648), syn=(0.513, 0.798), jmp=(0.018, 0.0525), jsz=(0.562, 1.22), rev=0.4, noi=(0.205, 0.329),
+         df=(2.35, 3.4), prof=(0.264, 0.484), h2=(0.1, 0.6), wk=(0.79, 1.0), lam=(0.0, 0.06), grid=(0.035, 0.08),
+         gap=(2.0, 10.0), glong=0.02),
+    dict(sig=(0.624, 0.756), slow=(0.037, 0.075), shift=(1.74, 2.31), wcy=(0.183, 0.367), tau=(4.0, 8.0),
+         sm=(0.27, 0.648), syn=(0.57, 0.821), jmp=(0.018, 0.0525), jsz=(0.375, 0.75), rev=0.25, noi=(0.226, 0.349),
+         df=(2.55, 3.6), prof=(0.22, 0.418), h2=(0.3, 1.5), wk=(0.51, 0.93), lam=(0.03, 0.18), grid=(0.006, 0.02),
+         gap=(1.0, 7.0), glong=0.05),
+    dict(sig=(0.195, 0.256), slow=(0.045, 0.09), shift=(1.99, 2.81), wcy=(0.276, 0.459), tau=(5.0, 11.0),
+         sm=(0.324, 0.81), syn=(0.57, 0.855), jmp=(0.012, 0.0375), jsz=(0.75, 1.69), rev=0.4, noi=(0.176, 0.323),
+         df=(2.25, 3.4), prof=(0.198, 0.396), h2=(0.6, 2.4), wk=(0.888, 1.0), lam=(0.0, 0.06), grid=(0.05, 0.13),
+         gap=(3.0, 16.0), glong=0.15),
+)
+_YA_P_SHIFT = 0.96
+_YA_P_UP = 0.5
+_YA_P_RAMP = 0.85
+_YA_T0R = (0.49, 0.77)
+_YA_WR = (0.12, 0.30)
+_YA_T0S = (0.30, 0.70)
+_YA_WS = (6.0, 60.0)
+_YA_WPER = (5.5, 8.0)
+_YA_WRHO = (0.65, 0.88)
+_YA_P_QUIET = 0.7
+_YA_DAYF = (0.25, 0.60)
+_YA_P_FLOOR = (0.10, 0.30, 0.15, 0.05, 0.40)
+_YA_KPEAK = np.arange(1.0, 33.0)
+_YA_GAP_LEN = np.array([1, 2, 3, 4, 5, 6])
+_YA_GAP_CUM = np.cumsum([0.58, 0.21, 0.10, 0.05, 0.03, 0.03])
+
+def _ya_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _ya_ar1(e, phi):
+
+    n = e.size
+    if phi <= 1e-9:
+        return e.copy()
+    k = -float(np.log(phi))
+    b = n if k * n < 500.0 else max(8, int(500.0 / k))
+    w = np.exp(k * np.arange(min(b, n), dtype=np.float64))
+    if b >= n:
+        return np.cumsum(e * w) / w
+    out = np.empty(n, dtype=np.float64)
+    c = 0.0
+    for a in range(0, n, b):
+        ww = w[:min(b, n - a)]
+        seg = (np.cumsum(e[a:a + b] * ww) + phi * c) / ww
+        out[a:a + b] = seg
+        c = float(seg[-1])
+    return out
