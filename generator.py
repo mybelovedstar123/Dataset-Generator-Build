@@ -22870,3 +22870,283 @@ def _ye_trade(r, n, kind, fresh, m):
     e = sw * r.standard_normal(n)
     e += (r.random(n) < _ye_lu(r, 0.003, 0.03)) * r.exponential(r.uniform(0.3, 0.7), n)
     return _ye_ztp(r, np.exp(np.minimum(x + e, 11.0)))
+
+def _ye_edits(r, n, fresh, m):
+    big = m > 40.0
+    lm = 0.0 if big else min(max(float(np.log2(m / 3.0)) / 2.5, 0.0), 1.0)
+    if big:
+        sw = r.uniform(0.55, 0.80)
+        s1, s2, s3 = (_ye_lu(r, 0.3, 0.6) * r.uniform(lo, hi) for lo, hi in ((0.15, 0.4), (0.4, 0.8), (0.1, 0.3)))
+        cyc = r.uniform(0.10, 0.40)
+    else:
+
+        v = (0.50 + 2.00 * lm * lm) * _ye_lu(r, 0.7, 1.4)
+        sw = float(np.sqrt(v * (0.62 - 0.52 * lm) * r.uniform(0.8, 1.2)))
+        s1 = float(np.sqrt(v * (0.25 - 0.17 * lm) * r.uniform(0.6, 1.4)))
+        s2 = float(np.sqrt(v * (0.08 + 0.22 * lm) * r.uniform(0.6, 1.4)))
+        s3 = float(np.sqrt(v * (0.02 + 0.10 * lm) * r.uniform(0.6, 1.4)))
+        cyc = r.uniform(0.10, 0.40) + lm * r.uniform(0.35, 0.85)
+    x = _ye_ou(r, n, _ye_lu(r, 1.5, 6.0), s1)
+    x += _ye_ou(r, n, _ye_lu(r, 10.0, 60.0), s2)
+    x += _ye_ou(r, n, _ye_lu(r, 100.0, 400.0), s3)
+
+    per = 1440.0 * (1.0 if m > 7.0 else r.uniform(0.72, 1.0))
+    x += _ye_cycle(r, n, per, cyc, 0.75, 0.12)
+    if fresh:
+        amp = -r.exponential(0.8 if 3.0 < m <= 40.0 else 0.3) if r.random() < 0.75 else r.normal(0.1, 0.25)
+        x += _ye_head(n, max(amp, -2.0), _ye_lu(r, 3.0, 20.0), _ye_lu(r, 100.0, 600.0))
+
+    x += _ye_episodes(r, n, _ye_lu(r, 0.0002, 0.002) * (0.3 if big else 1.0 - 0.6 * lm), 4.0, 300.0, 0.3, 1.2, 0.7)
+    x += sw * r.standard_normal(n)
+
+    k = 1.6 if big else 3.0 - 1.2 * lm
+    if k < 2.4:
+        x = np.where(x > 0.0, k * np.log1p(np.maximum(x, 0.0) / k), x)
+    if not big:
+        x += (r.random(n) < _ye_lu(r, 0.004, 0.04) * (1.0 - 0.95 * lm)) * r.exponential(r.uniform(0.3, 0.65), n)
+    x = np.minimum(x, 9.0)
+    lam = np.exp(np.minimum(np.log(_ye_rate(m)) + x - float(np.log(_v2_mean(np.exp(x)))), 11.0))
+    if big:
+
+        d = r.uniform(0.03, 0.30)
+        flip = np.cumsum(r.random(n) < r.uniform(0.0, 0.05))
+        lam = lam * np.exp(d * np.where((np.arange(n) + flip) % 2 == 0, 1.0, -1.0))
+        lam = lam * np.where(r.random(n) < r.uniform(0.0, 0.12), r.uniform(0.01, 0.4, n), 1.0)
+    y = _ye_ztp(r, lam)
+    if big and r.random() < 0.6:
+        y = np.minimum(y, float((250, 500, 500, 1000)[int(r.integers(0, 4))]))
+    return y
+
+def _ye_series(r, L, kind):
+
+    z = float(r.standard_normal())
+    if kind == 0:
+        m = min(max(9.0 * float(np.exp((0.35 if z > 0.0 else 0.80) * z)), 1.3), 40.0)
+    elif kind == 1:
+        m = min(max(6.6 * float(np.exp(0.62 * z)), 1.25), 60.0)
+    elif z > 1.3:
+        m = _ye_lu(r, 60.0, 300.0)
+    else:
+        m = max(4.1 * float(np.exp((1.25 if z > 0.0 else 0.70) * z)), 1.8 + 0.3 * r.random())
+    rho = (0.0, 0.3, 0.8)[kind]
+    n = _ye_len(rho * z + float(np.sqrt(1.0 - rho * rho)) * float(r.standard_normal()), L, kind)
+    if n < 8:
+        return None
+    fresh = n < L
+    y = _ye_trade(r, n, kind, fresh, m) if kind < 2 else _ye_edits(r, n, fresh, m)
+    if fresh:
+        u = r.random()
+        short = kind == 0 and n < 512
+        if kind < 2 and u < (0.10 if short else 0.22 if kind == 0 else 0.16):
+            y[0] = float(np.floor(y[0] * _ye_lu(r, 2.0, 8.0) + 0.5))
+        elif u < (0.90 if short else (0.85, 0.75, 0.50)[kind]):
+            y[0] = max(1.0, float(np.floor(y[0] * r.uniform(0.45 if short else 0.1 if kind < 2 else 0.0, 1.0) + 0.5)))
+    if r.random() < (0.6 if kind < 2 else 0.85):
+        y[-1] = max(1.0, float(np.floor(y[-1] * r.uniform(0.05, 1.0) + 0.5)))
+    return y
+
+def _ye_counts(r, L):
+    L = int(L)
+    if L < 64 or L > 65536:
+        return None
+    kind = min(int(np.searchsorted(_YE_KIND_CUM, r.random() * _YE_KIND_CUM[-1], side="right")), 2)
+    y = _ye_series(r, L, kind)
+    if y is None or y.size < 8 or y.size > L:
+        return None
+    out = np.empty(L, dtype=np.float64)
+    n = y.size
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+_YF_TWO_PI = 2.0 * np.pi
+_YF_KIND_CUM = np.cumsum([0.40, 0.40, 0.20])
+_YF_P_FULL = 0.70
+_YF_N_SHORT = (600, 3500)
+
+_YF_A_PER = np.array([24, 96, 288, 1440, 48, 144])
+_YF_A_PER_CUM = np.cumsum([0.25, 0.25, 0.20, 0.12, 0.10, 0.08])
+_YF_A_DEC_CUM = np.cumsum([0.25, 0.25, 0.30, 0.20])
+_YF_A_Q = (3.0e-4, 0.30)
+_YF_A_P_NOISY = 0.15
+_YF_A_P_SKEW = 0.60
+_YF_A_P_UP = 0.5
+
+_YF_A_P_NOBLIP = 0.25
+_YF_A_BLIP_RATE = (0.002, 0.08)
+_YF_A_BLIP2 = 0.86
+_YF_A_BLIP_PAR = 3.5
+_YF_A_BLIP_MAX = 31
+_YF_A_FRZ_MIN = 128
+_YF_A_FRZ_ADD = (1.0, 1400.0)
+_YF_A_GAP = 320
+
+_YF_A_P_TAIL = 0.35
+_YF_A_AFTER = 64
+
+_YF_B_PER = np.array([288, 1440, 96, 48])
+_YF_B_PER_CUM = np.cumsum([0.50, 0.25, 0.15, 0.10])
+_YF_B_RATE = (0.005, 1.0, 2.2)
+_YF_B_SIG = (0.3, 1.2)
+_YF_B_TAU = (100.0, 2000.0)
+_YF_B_P_CYC = 0.6
+_YF_B_CYC = (0.2, 1.4)
+_YF_B_OPEN = 64
+_YF_B_OPEN_RATE = 0.15
+_YF_B_P_MARGIN = 0.5
+_YF_B_MARGIN = 0.6
+_YF_B_P_TT = 0.27
+_YF_B_CLOSED = (0.10, 0.45)
+_YF_B_P_LEAKY = 0.45
+_YF_B_LEAK = (0.10, 0.50)
+
+_YF_C_P_SLOT = 0.30
+_YF_C_PER = np.array([48, 24, 96])
+_YF_C_OPEN = 4
+_YF_C_GAP_MAX = 512.0
+
+def _yf_lu(u, lo, hi):
+    return float(lo * (hi / lo) ** u)
+
+def _yf_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yf_ou(r, m, tau, tail=0.0):
+    phi = float(np.exp(-1.0 / max(tau, 0.05)))
+    e = r.standard_normal(m)
+    if tail > 0.0:
+        e *= np.exp(tail * r.standard_normal(m) - tail * tail)
+    e0 = float(e[0])
+    e *= float(np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    e[0] = e0
+    return _yf_ar1(e, phi)
+
+def _yf_unit(z):
+    z = z - float(_v2_meanm(z))
+    return z / max(float(_v2_stdm(z)), 1e-12)
+
+def _yf_mask(n, a, b):
+    a = np.clip(np.asarray(a, dtype=np.int64), 0, n)
+    b = np.clip(np.asarray(b, dtype=np.int64), 0, n)
+    d = np.bincount(a, minlength=n + 1) - np.bincount(b, minlength=n + 1)
+    return np.cumsum(d[:n]) > 0
+
+def _yf_fill(x, held):
+    src = np.where(held, 0, np.arange(x.size))
+    return x[np.maximum.accumulate(src)]
+
+def _yf_cycle(r, t, P, n_harm, day_sd):
+    v = r.random((n_harm, 2))
+    ph = t * (_YF_TWO_PI / P)
+    c = np.zeros(t.size, dtype=np.float64)
+    for k in range(n_harm):
+        c += (0.35 + v[k, 0]) / (k + 1.0) ** 1.3 * np.cos((k + 1.0) * ph + _YF_TWO_PI * v[k, 1])
+    nd = int(t[-1] // P) + 2
+    f = np.exp(day_sd * r.standard_normal(nd))
+    c *= np.interp(t, (np.arange(nd, dtype=np.float64) + 0.5) * P, f)
+    return _yf_unit(c)
+
+def _yf_stale_base(r, n):
+    u = r.random(20)
+    P = int(_YF_A_PER[min(int(np.searchsorted(_YF_A_PER_CUM, u[0], side="right")), _YF_A_PER.size - 1)])
+    t = np.arange(n, dtype=np.float64) + float(int(u[1] * P))
+    vp = 0.95 * u[2] ** 2.2
+    wn = 0.6 + 0.4 * u[3] if u[16] < _YF_A_P_NOISY else _yf_lu(u[3], 0.0003, 0.5)
+    wn = wn * (1.0 - vp)
+    ws = max(1.0 - vp - wn, 0.0)
+    z = np.sqrt(vp) * _yf_cycle(r, t, P, 1 + int(3.0 * u[4]), 0.1 + 0.4 * u[5])
+    z += np.sqrt(ws) * _yf_unit(_yf_ou(r, n, np.sqrt(P) * _yf_lu(u[6], 1.5, 150.0)))
+    z += np.sqrt(wn) * _yf_unit(_yf_ou(r, n, 0.2 + 9.0 * u[7] ** 3, 0.5 * u[8]))
+    if u[9] < _YF_A_P_SKEW:
+        z = np.exp((0.2 + 0.7 * u[10]) * _yf_unit(z))
+        if u[17] >= _YF_A_P_UP:
+            z = float(z.max()) * (1.0 + u[18]) - z
+        lvl = 0.0
+    else:
+        z = _yf_unit(z)
+        lvl = 6.0 * (u[10] - 0.5) if u[11] < 0.25 else _yf_lu(u[10], 2.5, 60.0)
+    dec = min(int(np.searchsorted(_YF_A_DEC_CUM, u[12], side="right")), 3)
+    sdd = max(float(np.diff(z).std()), 1e-12)
+    sc = 10.0 ** (-dec) / (_yf_lu(u[13], _YF_A_Q[0], _YF_A_Q[1]) * sdd)
+    x = np.round((z + lvl) * sc, dec) + 0.0
+    if u[14] >= _YF_A_P_NOBLIP:
+        v = r.random((3, n))
+        s = np.flatnonzero(v[0] < _yf_lu(u[15], _YF_A_BLIP_RATE[0], _YF_A_BLIP_RATE[1]))
+        s = s[s >= 1]
+        if s.size:
+            ln = np.where(v[1, s] < _YF_A_BLIP2, 2.0,
+                          np.minimum(np.floor(3.0 * (1.0 - v[2, s]) ** (-1.0 / _YF_A_BLIP_PAR)), _YF_A_BLIP_MAX))
+            x = _yf_fill(x, _yf_mask(n, s + 1, s + ln.astype(np.int64)))
+    return x
+
+def _yf_stale(r, n):
+    x = _yf_stale_base(r, n)
+    u = r.random(3)
+    F = _YF_A_FRZ_MIN + int(np.floor(_yf_lu(u[0], _YF_A_FRZ_ADD[0], _YF_A_FRZ_ADD[1])))
+    if u[1] < _YF_A_P_TAIL:
+        F = min(F, n - _YF_A_GAP)
+        s = n - F
+    else:
+        F = min(F, n - _YF_A_GAP - _YF_A_AFTER)
+        s = _YF_A_GAP - 1 + int(u[2] * (n - _YF_A_AFTER - F - _YF_A_GAP + 2))
+    x = _yf_fill(x, _yf_mask(n, [s + 1], [s + F]))
+    return x, [(int(s), int(F))]
+
+def _yf_station(r, n):
+    u = r.random(24)
+    P = int(_YF_B_PER[min(int(np.searchsorted(_YF_B_PER_CUM, u[0], side="right")), _YF_B_PER.size - 1)])
+    off = int(u[1] * P)
+    t = np.arange(n, dtype=np.float64) + float(off)
+    cap = 3 + int(_yf_lu(u[2], 1.0, 220.0))
+
+    lam = np.log(_YF_B_RATE[0] + _YF_B_RATE[1] * u[3] ** _YF_B_RATE[2])
+    sig = _YF_B_SIG[0] + (_YF_B_SIG[1] - _YF_B_SIG[0]) * u[4]
+    lam = lam + sig * _yf_ou(r, n, _yf_lu(u[5], _YF_B_TAU[0], _YF_B_TAU[1]))
+    if u[6] < _YF_B_P_CYC:
+        amp = _YF_B_CYC[0] + (_YF_B_CYC[1] - _YF_B_CYC[0]) * u[7]
+        lam = lam + amp * _yf_cycle(r, t, P, 1 + int(2.0 * u[8]), 0.1 + 0.3 * u[9])
+    lam = np.minimum(np.exp(lam), 0.97)
+    lam[:_YF_B_OPEN] = np.maximum(lam[:_YF_B_OPEN], _YF_B_OPEN_RATE)
+    v = r.random((4, n))
+    ev = v[0] < lam
+    frz = []
+    if P <= 288 and u[10] < _YF_B_P_TT:
+        nd = (n + off) // P + 2
+        w = r.random((3, nd))
+        jit = max(1.0, P * (0.005 + 0.075 * u[11]))
+        day = np.arange(nd, dtype=np.int64)
+        a = day * P + int(u[12] * P) - off + np.round(jit * (2.0 * w[0] - 1.0)).astype(np.int64)
+        b = a + int((_YF_B_CLOSED[0] + (_YF_B_CLOSED[1] - _YF_B_CLOSED[0]) * u[13]) * P) \
+            + np.round(jit * (2.0 * w[1] - 1.0)).astype(np.int64)
+        if u[14] < _YF_B_P_LEAKY:
+            keep = w[2] >= (_YF_B_LEAK[0] + (_YF_B_LEAK[1] - _YF_B_LEAK[0]) * u[15])
+            a, b = a[keep], b[keep]
+        closed = _yf_mask(n, a, b)
+        ev &= ~closed
+        e = np.flatnonzero(np.diff(np.concatenate(([False], closed, [False])).astype(np.int8)))
+        frz = [(int(s) - 1, int(q - s) + 1) for s, q in zip(e[0::2], e[1::2]) if s >= 1]
+    k = np.where(v[1] < 0.66, 1.0, np.where(v[1] < 0.79, 2.0, 3.0 + np.floor(-2.0 * np.log(1.0 - v[2]))))
+    d = np.where(ev, np.where(v[3] < 0.5, k, -k), 0.0)
+    s = float(int(u[18] * (cap + 1))) + np.cumsum(d)
+
+    m = float(int(cap * _YF_B_MARGIN * u[19])) if u[20] < _YF_B_P_MARGIN else 0.0
+    W = cap + 2.0 * m
+    x = np.clip(W - np.abs(np.mod(s + m, 2.0 * W) - W) - m, 0.0, float(cap))
+    if float(x.max()) <= float(x.min()):
+        j = 1 + int(u[21] * (n - 1))
+        x[j:] += 1.0 if x[0] <= 0.0 or (x[0] < cap and u[22] < 0.5) else -1.0
+        frz = []
+    return x, frz
