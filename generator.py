@@ -29434,3 +29434,36 @@ class Generator(_C234SParent):
     @property
     def name(self) -> str:
         return 'c268-k76-BIG1-P40U-S2'
+
+
+# ═══════════════ K0: v2 Lane A port of c268-k76-BIG1-P40U-S2. Everything above this banner is byte-identical to c268;
+# the four layers below are appended (never prepended) and add no new content. v2 Lane A runs the generator as 32
+# sandboxed CPU children (1 core, BLAS 1, 2 GiB address space each); child i calls generate(n) with n = budget // 64 + 2
+# (budget 1,562,500,000 points, n = 24,414,064), stops at the budget or at the 90-minute window, and rejects any yield that
+# is not a finite float (C, L) array with 8 <= C <= 32 (a fault spends the hotkey). c268 records are (L,) or (C, L),
+# C = 1..5, L = 4096.
+#  (1) SERIAL MODE (no threads; same stream). c268 builds its base chunks in a lock-step "cascade-generator" thread per
+#      _BaseGenerator (two are live: the base and the novel stream) and spreads each chunk's family groups over 3
+#      "cascade-fam" threads (_PRODUCER_WORKERS = 3). On a 1-core child they add no speed, only a stack and a malloc arena
+#      each. _PRODUCER_WORKERS = 1 selects c268's own inline branch for the family groups; _k0_serial_base_generate is
+#      _BaseGenerator.generate (lines 7278-7846) with the queue/thread hand-off removed: the chunk-builder text is unchanged
+#      and each chunk is yielded where the consumer loop yielded it. The runahead layer (_RAParent) never starts its thread
+#      in this chain (every later layer overrides generate).
+#  (2) BUDGET RESCALE. c268 opens three late layers at fixed fractions of a v1 child budget of 13.32B v1 units:
+#      _C91_CHILD_BUDGET (the C91/c124-b2 univariate hold layer and the y_qhold c1859 multichannel hold layer open at 1/5)
+#      and _C215LP_STREAM_POINTS (LP opens at 40 %). A v2 child stops at 1.5625B points, so unscaled they never open.
+#      Every counter counts c268's v1 billing units (C*L; multichannel records at 100/120). The v2 child budget 64*(n-2)
+#      points is converted into those units with the ratio measured on c268's own record stream (0.8803 v1 units per v2
+#      point over 3 seeds x 20k records), so each layer opens at the same fraction of a child's stream as in v1. Nothing
+#      else is budget-gated: _YZ_CHILD_BUDGET is left alone (YZ/YC have no "open" key in config.json, so they open at 0;
+#      YSS has no phases), and C128 opens at 0 x the C91 budget.
+#  (3) PACKER. Exactly 8 channels per yield, shape (8, 4096), from consecutive c268 records. A multichannel record stays
+#      whole and in order inside one group. A record that does not fit the open slots is carried to the next group, and
+#      the current group is filled first-fit from the following records (at most 64 records carried). No channel is ever
+#      padded, duplicated or split, and a partial group is never yielded. n still bounds the yields: the parent gets the
+#      same n, where it only caps the record count, and every group consumes at least one record.
+#  (4) ASSERT BEFORE YIELD. Every yield is float64, C-contiguous, (8, 4096), finite and within the float32 range.
+#      Records that could not pass the v2 validator (non-finite, |v| > float32 max, L != 4096, C > 8) are dropped before
+#      packing and counted in _k0_dropped_records (never observed on c268's stream).
+
+_PRODUCER_WORKERS = 1
