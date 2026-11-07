@@ -30858,3 +30858,40 @@ def _c259r_aqr_series(r, n):
     q = 0.01 if (uq < 0.40 or lev < 2.0) else 0.1
     x = np.maximum(np.round(x / q) * q, q)
     return np.round(x, 2)
+
+
+def _c259r_aqr(r, L):
+    L = int(L)
+    if L < 512:
+        return None
+    u = r.random()
+    if u < 0.60:
+        n = int(r.uniform(950.0, 1250.0))
+    elif u < 0.85:
+        n = int(r.uniform(400.0, 950.0))
+    else:
+        n = int(r.uniform(1250.0, 3000.0))
+    n = min(n, L)
+    x = _c259r_aqr_series(r, n)
+    if x.shape != (n,) or not bool(np.all(np.isfinite(x))) or float(np.ptp(x)) <= 0.0:
+        return None
+    if np.unique(x).size < 20 or float(np.mean(x <= 0.0)) > 0.02:
+        return None
+    return _c259_pad(x, L)
+
+
+
+# ═══════════════ c259 DAPR: recalibrated 15-min day-ahead prices (replaces DAP15 in the -RR recipes; calrev 10-20 ~15:40 JST) ═══════
+# DAP15's day levels were too persistent: after a high day (z > +0.5 vs the 2-week mean) the eval reverts -0.40 / -0.65 / -0.76 sd at
+# d+1 / d+2 / d+3, DAP15 only -0.16 / -0.34 / -0.40 (daily-mean lag-1 ACF .65 vs .46); its peaks were symmetric (1-h change skew +.04
+# vs +.42) and its spikes too large (diff kurtosis 31 vs 16). DAPR keeps DAP15's layout, levels, solar trough, oversupply, quarter-hour
+# structure and floor, and changes only: day-level AR(1) phi 0.25-0.6 (was 0.55-0.9) and sd 0.12-0.28, drift <= 0.3, regime steps at
+# half the rate, ASYMMETRIC morning / evening peaks (steep ramp-up, slow decline), scarcity days (8-25 % of days, peaks x 1.4-3), more
+# frequent / smaller spikes. Fit (eval | DAPR, 1500 draws; newest 3 pools, 133 series): high-day path d+1/2/3/5 -.40/-.65/-.76/-.79 |
+# -.33/-.64/-.73/-.74; low-day +.33/+.84/+.99/+.97 | +.39/+.67/+.77/+.84; daily-mean ACF1 .46 | .49; change skew lag 1/4/12 +.16/+.42/
+# +.33 | +.29/+.49/+.26 (lag 96 +.29 | +.04, not modelled); diff kurtosis 15.7 | 15.1; profile amp 2.47 | 2.46; ACF 1 d / 1 w .61/.38 |
+# .58/.41; RF family classifier 94 % -> DA prices (DAP15 91 %). Reuses _c259_lu / _c259_ar1 / _c259_pad / _c259_bump from the kinds above.
+def _c259r_abump(h, c, w, kl, kr):
+    """asymmetric circular bump on the 24-h clock: width w * kl before the centre (the ramp up), w * kr after it (the decline)"""
+    d = (h - c + 12.0) % 24.0 - 12.0
+    return np.exp(-0.5 * (d / (w * np.where(d < 0.0, kl, kr))) ** 2)
