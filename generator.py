@@ -20766,3 +20766,279 @@ class Generator(_XZParent):
 # this block. A 4-channel record is billed at points+mv20 (4 x L x 100/120 instead of 3 x L x 100/120).
 
 _ACUH_TWO_PI = 2.0 * np.pi
+
+
+def _acuh_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+
+def _acuh_ar1(r, n, phi, sd):
+    e = r.standard_normal(n) * sd
+    x = np.empty(n)
+    x[0] = e[0] / max(np.sqrt(1.0 - phi * phi), 1e-3)
+    for t in range(1, n):
+        x[t] = phi * x[t - 1] + e[t]
+    return x
+
+
+def _acuh_smooth_noise(r, n, corner):
+    """unit-sd low-pass noise (corner in cycles/sample)"""
+    m = 1 << int(np.ceil(np.log2(max(2 * n, 64))))
+    f = np.fft.rfftfreq(m)
+    spec = (r.standard_normal(f.size) + 1j * r.standard_normal(f.size)) / (1.0 + (f / max(corner, 1e-9)) ** 2)
+    spec[0] = 0.0
+    x = np.fft.irfft(spec, m)[:n]
+    s = float(np.std(x))
+    return x / s if s > 0 else x
+
+
+def _acuh_quantise(x, q):
+    return np.round(x / q) * q if q > 0 else x
+
+
+# ───────────────────────────── official air quality ─────────────────────────────
+# pollutant: (weight, median level lo/hi, daily profile shape, profile amplitude (log) lo/hi, hourly AR phi lo/hi,
+#             episode rate per 1000 h lo/hi, episode log-amplitude mean, zero-floor share, integer-feed probability, quantum)
+_ACUH_AIR_P = {
+    "no2":  (0.29, (6.0, 30.0), "traffic", (0.25, 0.9), (0.80, 0.90), (10, 34), 0.9, 0.00, 0.15, 0.1),
+    "pm25": (0.21, (3.0, 9.0), "morning", (0.15, 0.45), (0.90, 0.95), (13, 25), 1.0, 0.00, 0.10, 0.1),
+    "o3":   (0.10, (35.0, 60.0), "afternoon", (0.45, 1.1), (0.92, 0.95), (1, 5), 0.5, 0.00, 0.50, 0.1),
+    "no":   (0.08, (0.5, 5.0), "traffic", (1.2, 2.6), (0.55, 0.80), (28, 70), 1.5, 0.25, 0.65, 0.1),
+    "pm10": (0.09, (9.0, 20.0), "morning", (0.25, 0.55), (0.70, 0.90), (18, 32), 1.0, 0.00, 0.20, 0.1),
+    "bc":   (0.07, (0.25, 0.9), "traffic", (0.35, 0.75), (0.75, 0.89), (16, 32), 1.0, 0.00, 0.00, 0.001),
+    "co":   (0.05, (0.12, 0.5), "traffic", (0.08, 0.35), (0.86, 0.95), (11, 25), 0.7, 0.00, 0.00, 0.01),
+    "so2":  (0.03, (0.2, 1.0), "midday", (0.5, 1.0), (0.62, 0.78), (18, 40), 1.6, 0.45, 0.80, 0.1),
+    "other": (0.08, (0.5, 20.0), "morning", (0.1, 0.6), (0.6, 0.95), (2, 50), 1.0, 0.02, 0.15, 0.1),
+}
+_ACUH_AIR_NAMES = tuple(_ACUH_AIR_P)
+_ACUH_AIR_CUM = np.cumsum([_ACUH_AIR_P[k][0] for k in _ACUH_AIR_NAMES]) / sum(_ACUH_AIR_P[k][0] for k in _ACUH_AIR_NAMES)
+
+
+def _acuh_air_profile(r, shape, hours):
+    """log-scale diurnal profile (zero mean, unit peak-to-peak) at the given hours of day"""
+    h = hours % 24.0
+    if shape == "traffic":
+        p = np.exp(-0.5 * ((h - r.uniform(6.5, 8.5)) / r.uniform(1.0, 2.0)) ** 2) + \
+            r.uniform(0.6, 1.1) * np.exp(-0.5 * ((h - r.uniform(17.5, 20.5)) / r.uniform(1.5, 3.0)) ** 2)
+    elif shape == "afternoon":
+        p = np.exp(-0.5 * ((h - r.uniform(13.0, 16.0)) / r.uniform(2.5, 4.0)) ** 2)
+    elif shape == "midday":
+        p = np.exp(-0.5 * ((h - r.uniform(10.0, 13.0)) / r.uniform(2.0, 4.0)) ** 2)
+    else:  # morning + night accumulation (PM)
+        p = np.exp(-0.5 * ((h - r.uniform(6.0, 9.0)) / r.uniform(1.5, 3.0)) ** 2) + \
+            r.uniform(0.3, 0.9) * np.exp(-0.5 * ((((h - r.uniform(21.0, 24.0)) + 12) % 24 - 12) / r.uniform(2.0, 4.0)) ** 2)
+    p = p - p.mean()
+    rng = np.ptp(p)
+    return p / rng if rng > 0 else p
+
+
+def _acuh_air(r, L):
+    k = _ACUH_AIR_NAMES[int(np.searchsorted(_ACUH_AIR_CUM, r.random() * 0.999999, side="right"))]
+    _, lev, shape, amp, phi, rate, ep_mu, zfloor, p_int, quantum = _ACUH_AIR_P[k]
+    u = r.random()
+    n = int(r.integers(650, 1001)) if u < 0.92 else int(r.integers(1000, min(L, 4160) + 1))
+    t = np.arange(n, dtype=np.float64)
+    hours = t + r.uniform(0, 24)
+    base = np.log(np.exp(r.uniform(np.log(lev[0]), np.log(lev[1]))))
+    prof = _acuh_air_profile(r, shape, hours) * r.uniform(*amp) * 1.25
+    wk = r.uniform(0.0, 0.15) * (((hours // 24) % 7) < 5) if shape == "traffic" else 0.0     # weekday traffic uplift
+    syn = _acuh_smooth_noise(r, n, 1.0 / r.uniform(48, 240)) * r.uniform(0.15, 0.45)              # multi-day weather regimes
+    drift = np.linspace(0.0, r.normal(0.0, 0.6), n)                                          # slow seasonal drift, either sign
+    ph = r.uniform(*phi)
+    noise = _acuh_ar1(r, n, ph, r.uniform(0.10, 0.25) * np.sqrt(1 - ph * ph) * 1.5)
+    lx = base + prof + wk + syn + drift + noise
+    # episodes: Poisson onsets, fast rise, exponential decay; multi-day smog events (rarer, longer) on top
+    ep = np.zeros(n)
+    nep = r.poisson(n * r.uniform(*rate) / 1000.0)
+    for s in r.integers(0, n, nep):
+        a = np.exp(r.normal(ep_mu - 0.6, 0.55))
+        rise, decay = int(r.integers(1, 4)), r.uniform(1.0, 4.0)
+        seg = np.concatenate([np.linspace(0, 1, rise + 1)[1:], np.exp(-np.arange(1, int(6 * decay) + 2) / decay)])
+        e = min(n, s + seg.size); ep[s:e] += a * seg[:e - s]
+    if r.random() < 0.5 and k in ("pm25", "pm10", "no2", "bc", "other"):
+        for _ in range(int(r.integers(1, 3))):
+            s = int(r.integers(0, n)); d = int(r.integers(24, 96))
+            env = np.sin(np.linspace(0, np.pi, d)) ** 2 * r.uniform(0.4, 1.3)
+            e = min(n, s + d); lx[s:e] += env[:e - s]
+    x = np.exp(lx) * (1.0 + ep)
+    if zfloor > 0:                                                                            # detection floor -> exact zeros
+        thr = np.quantile(x, r.uniform(0.6, 1.4) * zfloor)
+        x = np.where(x < thr, 0.0, x)
+    signed = k in ("no2", "no", "o3", "other") and zfloor < 0.3 and r.random() < 0.3       # sensors reporting around zero (offset noise)
+    if signed:
+        x = x + r.normal(0.0, r.uniform(0.3, 2.0)) * 0.3 + r.standard_normal(n) * r.uniform(0.2, 1.2)
+    if r.random() < p_int:
+        x = np.round(x)
+    else:
+        x = _acuh_quantise(x, quantum if r.random() < 0.8 else quantum / 10.0)
+    if not signed:
+        x = np.maximum(x, 0.0)
+    if np.ptp(x) == 0:
+        x = x + _acuh_quantise(np.abs(r.standard_normal(n)) * 0.1, 0.1)
+    return _acuh_pad(x, L)
+
+
+# ───────────────────────────── USDA daily price panels ─────────────────────────────
+def _acuh_usda(r, L):
+    n = int(r.integers(440, 720))
+    t = np.arange(n, dtype=np.float64)
+    level = np.exp(r.uniform(np.log(80.0), np.log(850.0)))
+    cv = np.exp(r.uniform(np.log(0.05), np.log(0.4)))
+    # smooth trend: a few slow cycles (seasonal price cycles) + slow random walk -> ~3-10 turns per 100 days of a 15-day slope
+    tr = np.zeros(n)
+    tr += np.sin(_ACUH_TWO_PI * t / r.uniform(230.0, 280.0) + r.uniform(0, _ACUH_TWO_PI)) * r.uniform(0.6, 1.2)   # annual cycle (business days)
+    for _ in range(int(r.integers(1, 4))):
+        per = r.uniform(30.0, 120.0)
+        tr += r.uniform(0.15, 0.6) * np.sin(_ACUH_TWO_PI * t / per + r.uniform(0, _ACUH_TWO_PI))
+    tr += _acuh_ar1(r, n, r.uniform(0.97, 0.995), r.uniform(0.0, 0.05))
+    tr = (tr - tr.mean()) / (tr.std() + 1e-12)
+    w_noise = r.uniform(0.06, 0.35) if r.random() < 0.85 else r.uniform(0.6, 1.4)            # some panels are noise-dominated
+    noise = _acuh_ar1(r, n, r.uniform(0.0, 0.4), w_noise)
+    if r.random() < 0.35:                                                                     # weekly/print-day effect
+        noise += r.uniform(0.05, 0.3) * np.where((t % 5) == r.integers(0, 5), 1.0, 0.0)
+    z = tr + noise
+    if r.random() < 0.12:                                                                     # price-list / contract step
+        s = int(r.integers(n // 5, 4 * n // 5)); z[s:] += r.normal(0, 0.6)
+    x = level * (1.0 + cv * z / (np.std(z) + 1e-12))
+    x = np.maximum(x, level * 0.05)
+    x = _acuh_quantise(x, 0.01 if r.random() < 0.9 else 1.0)
+    if r.random() < 0.06:                                                                     # missing-report zeros (rare)
+        x[r.random(n) < r.uniform(0.01, 0.08)] = 0.0
+    return _acuh_pad(x, L)
+
+
+# ───────────────────────────── CO2 intensity / grid mix ─────────────────────────────
+def _acuh_co2(r, L):
+    u = r.random()
+    kind = "ec" if u < 0.55 else ("dk" if u < 0.65 else "gb")
+    P = {"ec": 96, "dk": 288, "gb": 48}[kind]
+    n = L if (kind == "ec" and r.random() < 0.6) or (kind == "dk") else int(r.integers(900, min(L, 2200)))
+    t = np.arange(n, dtype=np.float64)
+    phase = r.uniform(0, _ACUH_TWO_PI)
+    day = t / P
+    if kind == "gb":
+        level = np.exp(r.uniform(np.log(1.0), np.log(50.0)))
+    elif kind == "dk":
+        level = np.exp(r.uniform(np.log(50.0), np.log(120.0)))
+    else:
+        level = np.exp(r.uniform(np.log(40.0), np.log(500.0)))
+    # daily profile: evening peak / solar dip, amplitude varies day to day
+    shape = np.cos(_ACUH_TWO_PI * day + phase) + r.uniform(0.0, 0.6) * np.cos(2 * _ACUH_TWO_PI * day + r.uniform(0, _ACUH_TWO_PI))
+    amp_d = np.exp(_acuh_smooth_noise(r, n, 1.0 / (P * r.uniform(2, 6))) * r.uniform(0.05, 0.25))
+    prof = shape / (np.ptp(shape) + 1e-12) * r.uniform(0.15, 1.0) * amp_d
+    # multi-day weather (wind / solar) regimes: big level swings, either direction
+    reg = _acuh_smooth_noise(r, n, 1.0 / (P * r.uniform(1.5, 6.0))) * r.uniform(0.15, 0.45)
+    lx = np.log(level) + prof + reg
+    if kind == "gb":
+        lx = lx + _acuh_ar1(r, n, r.uniform(-0.3, 0.5), r.uniform(0.08, 0.35))
+    else:
+        lx = lx + _acuh_smooth_noise(r, n, 1.0 / r.uniform(3, 12)) * r.uniform(0.005, 0.04)
+    x = np.exp(lx) if r.random() < 0.5 else level * (1.0 + (lx - np.log(level)))
+    x = np.maximum(x, level * 0.02)
+    if kind == "dk":
+        x = np.round(x)
+    elif kind == "gb":
+        x = _acuh_quantise(x, 0.1)
+        if r.random() < 0.3:
+            x = np.where(x < np.quantile(x, r.uniform(0.05, 0.3)), 0.0, x)
+    else:
+        x = _acuh_quantise(x, 0.1 if level > 20 else 0.01)
+    return _acuh_pad(x, L)
+
+
+# ───────────────────────────── health surveillance ─────────────────────────────
+def _acuh_waves(r, n, n_waves, rise, fall):
+    """seasonal epidemic waves: roughly annual centres (365 +- 30 days, random phase) with random sizes"""
+    t = np.arange(n, dtype=np.float64)
+    w = np.zeros(n)
+    c0 = r.uniform(-365.0, 0.0)
+    centres = [c0 + 365.0 * k + r.normal(0, 30) for k in range(int(n / 365) + 3)]
+    if r.random() < 0.4:                                                                      # an extra off-season wave (e.g. summer COVID)
+        centres.append(r.uniform(0, n))
+    for c in centres:
+        a = float(np.exp(r.normal(-0.5, 0.6)))
+        ru, fa = r.uniform(*rise), r.uniform(*fall)
+        w += a * np.where(t < c, np.exp(-np.minimum(np.abs(c - t) / ru, 400.0) ** 1.3), np.exp(-np.minimum(np.abs(t - c) / fa, 400.0) ** 1.1))
+    return w
+
+
+def _acuh_health(r, L):
+    u = r.random()
+    if u < 0.70:                                                                              # CDC-like daily percentages
+        n = int(r.integers(500, 540))
+        base = np.exp(r.uniform(np.log(0.02), np.log(8.0)))
+        w = _acuh_waves(r, n, 0, (20, 60), (25, 80))
+        smooth = base * (r.uniform(0.01, 0.3) + np.exp(r.uniform(np.log(2.0), np.log(25.0))) * w)
+        noise = 1.0 + _acuh_ar1(r, n, r.uniform(0.0, 0.4), r.uniform(0.04, 0.18))
+        x = smooth * np.maximum(noise, 0.05)
+        if r.random() < 0.3:                                                                  # weekday visit mix
+            x *= 1.0 + r.uniform(0.01, 0.06) * np.cos(_ACUH_TWO_PI * np.arange(n) / 7 + r.uniform(0, _ACUH_TWO_PI))
+        if r.random() < 0.5:                                                                  # end-of-feed reporting dip
+            k = int(r.integers(2, 10)); x[-k:] *= np.linspace(1.0, r.uniform(0.6, 0.95), k)
+        x = _acuh_quantise(x, 0.01 if base < 5 else 0.1)
+    else:                                                                                     # RKI-like integer counts
+        n = int(r.integers(2300, min(L, 2420) + 1)) if r.random() < 0.8 else int(r.integers(780, 3200))
+        n = min(n, L)
+        base = np.exp(r.uniform(np.log(0.5), np.log(300.0)))
+        w = _acuh_waves(r, n, 0, (25, 80), (30, 120))
+        lam = base * (r.uniform(0.01, 0.2) + np.exp(r.uniform(np.log(2.0), np.log(25.0))) * w)
+        x = r.poisson(np.maximum(lam, 0.0)).astype(np.float64)
+        if r.random() < 0.35:                                                                 # weekly reporting: value held for the week
+            idx = np.arange(n) // 7 * 7
+            x = x[np.minimum(idx + int(r.integers(0, 7)), n - 1)]
+        if r.random() < 0.5:                                                                  # end-of-feed reporting lag
+            k = int(r.integers(3, 15)); x[-k:] = np.floor(x[-k:] * np.linspace(1.0, r.uniform(0.3, 0.9), k))
+    if np.ptp(x) == 0:
+        x = x + np.round(np.abs(r.standard_normal(x.size)))
+    return _acuh_pad(np.asarray(x, dtype=np.float64), L)
+
+
+
+
+_ACUH_FAMS = (
+    ("air", 0.50, _acuh_air),        # official hourly air quality (NO2, PM2.5, O3, NO, PM10, BC, CO, SO2)
+    ("usda", 0.20, _acuh_usda),      # daily price panels
+    ("health", 0.15, _acuh_health),  # CDC-like daily percentages / RKI-like daily counts
+    ("co2", 0.15, _acuh_co2),        # CO2 intensity / grid mix (5 / 15 / 30 min)
+)
+_ACUH_CUM = np.cumsum([w for _, w, _ in _ACUH_FAMS]) / sum(w for _, w, _ in _ACUH_FAMS)
+_ACUH_TAG = 0xAC0E5A01
+_ACUH_Q = 1.0
+_ACUH_HOST_C = 3
+_ACUH_MIN_LEN = 256
+
+
+def _acuh_eligible(x):
+    """Host test: an exactly _ACUH_HOST_C-channel float64 record (length >= _ACUH_MIN_LEN, all finite) whose channel 0 is moving:
+    not constant, not _k87_quiet, not _w86b_intlike (the lineage's helpers, unchanged)."""
+    if not (isinstance(x, np.ndarray) and x.ndim == 2 and x.shape[0] == _ACUH_HOST_C and x.dtype == np.float64
+            and x.shape[1] >= _ACUH_MIN_LEN):
+        return False
+    if not bool(np.all(np.isfinite(x))):
+        return False
+    x0 = x[0]
+    if bool(np.all(x0 == x0[0])):
+        return False
+    return not _k87_quiet(x0) and not _w86b_intlike(x0)
+
+
+def _acuh_keep(w, x):
+    """The added series is kept only as an array of exactly (L,), all finite, not constant and not a copy of any channel."""
+    L = int(x.shape[1])
+    if not (isinstance(w, np.ndarray) and w.shape == (L,) and bool(np.all(np.isfinite(w))) and not bool(np.all(w == w[0]))):
+        return False
+    for c in range(x.shape[0]):
+        a = x[c]
+        if np.std(a) > 0 and abs(float(np.corrcoef(a, w)[0, 1])) >= 0.999:
+            return False
+    return True
+
+
+_ACUHParent = Generator
