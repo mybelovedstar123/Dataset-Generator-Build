@@ -30357,3 +30357,243 @@ class Generator(_C251NameParent):
 # ═══════════════ c259 bundle kinds: DAP15 (15-min day-ahead prices, autumn regime) and AQW (hourly air quality, transient
 # accumulation episodes + fast washouts); calibration notes inline. Plain numpy + lfilter (king76 module globals). ═══════════════
 _C259_TWO_PI = 2.0 * np.pi
+
+
+def _c259_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+
+def _c259_ar1(r, n, phi, sd):
+    """stationary AR(1) with marginal sd"""
+    phi = float(min(max(phi, 0.0), 0.9999))
+    e = r.standard_normal(n) * (sd * np.sqrt(1.0 - phi * phi))
+    e[0] = r.standard_normal() * sd
+    return lfilter([1.0], [1.0, -phi], e)
+
+
+def _c259_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = int(x.size)
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+
+def _c259_bump(h, c, w):
+    """circular gaussian bump on the 24-h clock (h, c, w in hours)"""
+    d = (h - c + 12.0) % 24.0 - 12.0
+    return np.exp(-0.5 * (d / w) ** 2)
+
+
+# ── DAP15: European 15-min day-ahead prices, autumn quarter-hour regime ─────────────────────────────────────────────────
+# Eval (106 series, 15-min, all 4160 points -> contexts 4096 / 3904 / 3440): level p10/50/90 32 / 166 / 207 EUR/MWh; CV
+# 0.26 / 0.44 / 1.21; daily-profile ptp/sd 1.03 / 2.58 / 2.85 with the trough (solar) -0.99 sd, a MORNING peak +0.53 sd
+# 6.25 h before it and the evening peak +0.98 sd 6.25 h after it; within-hour |x - hour mean|/sd 0.07 / 0.14 / 0.21;
+# |dx| > 8 MAD 0.6 / 1.7 / 8.7 %; negatives 0 / 1.1 / 2.3 %; day-mean change sd 0.39 / 0.52 / 0.90 sd; last-720 vs
+# previous-1440 drift -0.33 / +0.17 / +0.73 sd; ACF lag 1 / 4 / 96 / 672 = .97 / .89 / .64 / .46; 2 decimals.
+# The king's only price content (_yb_price, a CHANNEL of YC grid15 hosts) has a weak morning peak (60% x 0.1-0.35) and
+# drift p90 +0.38; KING-INIT on these windows is -0.086 % of round on the newest pools (3/3, -10 %/w; old pools -3 %/w).
+def _c259_dap_series(r, n):
+    u = r.random(24)
+    P = 96
+    s0 = int(P * u[0])
+    t = np.arange(n, dtype=np.int64) + s0
+    slot = t % P
+    day = t // P
+    nd = int(day[-1]) + 1
+    dow = (np.arange(nd) + int(7.0 * u[1])) % 7
+    h = (np.arange(P, dtype=np.float64) + 0.5) * (24.0 / P)
+    nordic = u[2] < 0.15
+    lev = _c259_lu(r, 15.0, 70.0) if nordic else _c259_lu(r, 110.0, 240.0)
+    # day-level log path: AR(1) over days + autumn drift (70% up) + rare regime steps
+    lv = _c259_ar1(r, nd, r.uniform(0.55, 0.9), r.uniform(0.35, 0.8) if nordic else r.uniform(0.14, 0.34))
+    drift = r.uniform(0.0, 0.45) * (1.0 if u[3] < 0.7 else -0.6)
+    lv = lv + drift * np.linspace(-1.0, 0.0, nd)
+    for _ in range(int(r.poisson(nd / 40.0 * r.uniform(0.0, 1.5)))):
+        lv[int(r.integers(1, nd)):] += r.normal(0.0, 0.25)
+    lv = lv + np.where(dow == 5, np.log(r.uniform(0.82, 0.97)), 0.0) + np.where(dow == 6, np.log(r.uniform(0.68, 0.92)), 0.0)
+    # autumn daily shape (fractions of the day level): morning + evening peaks, solar trough, night trough
+    tr_c = r.uniform(12.3, 14.0)
+    mor = r.uniform(0.18, 0.45) * _c259_bump(h, tr_c - r.uniform(5.5, 7.0), r.uniform(1.0, 1.8))
+    eve = r.uniform(0.35, 0.75) * _c259_bump(h, tr_c + r.uniform(5.5, 7.0), r.uniform(1.3, 2.4))
+    sol = _c259_bump(h, tr_c, r.uniform(1.8, 3.0))
+    nig = r.uniform(0.0, 0.12) * _c259_bump(h, r.uniform(2.0, 4.5), r.uniform(1.5, 3.0))
+    sun = np.clip(r.beta(1.6 + 2.0 * u[4], 1.0 + 1.0 * u[5], nd) * (1.0 + 0.25 * (dow >= 5)), 0.0, 1.3)
+    sdep = r.uniform(0.25, 0.75) if not nordic else r.uniform(0.0, 0.25)
+    amp_d = np.exp(r.normal(0.0, r.uniform(0.15, 0.35), nd))
+    shape = (mor[slot] + eve[slot] - nig[slot]) * amp_d[day] - sdep * sol[slot] * sun[day]
+    p = lev * np.exp(lv[day]) * (1.0 + shape)
+    # oversupply: windy+sunny days push middays / nights toward zero or below (negatives ~1 % of points)
+    if u[6] < 0.75:
+        ov = (r.random(nd) < r.uniform(0.03, 0.14)) * r.uniform(0.6, 1.6, nd)
+        p = p - lev * ov[day] * np.maximum(sol[slot], 0.6 * nig[slot] / max(float(nig.max()), 1e-9))
+    # quarter-hour structure: hour mean + kappa * (within-hour ramp) + 15-min noise
+    hm = np.add.reduceat(p, np.r_[0, np.flatnonzero(np.diff(t // 4) != 0) + 1])
+    cnt = np.diff(np.r_[0, np.flatnonzero(np.diff(t // 4) != 0) + 1, n])
+    hid = np.cumsum(np.r_[0, (np.diff(t // 4) != 0).astype(np.int64)])
+    hmean = (hm / cnt)[hid]
+    kap = r.uniform(0.8, 2.2)
+    x = hmean + kap * (p - hmean)
+    x = x + lev * r.uniform(0.01, 0.045) * _c259_ar1(r, n, r.uniform(0.0, 0.5), 1.0)
+    qtr = (t % 4).astype(np.int64)
+    saw = r.normal(0.0, r.uniform(0.01, 0.045), 4)
+    x = x + lev * (saw - saw.mean())[qtr]
+    # spikes: evening up-spikes (1-4 slots), rare down-spikes
+    ns = int(r.poisson(n * _c259_lu(r, 0.003, 0.025)))
+    for _ in range(ns):
+        a = int(r.integers(0, n))
+        m = int(r.integers(1, 5))
+        x[a:a + m] += lev * (_c259_lu(r, 0.15, 1.2) if r.random() < 0.75 else -_c259_lu(r, 0.15, 0.8))
+    # floor: soft negative tail (prices rarely below -0.3 * level), 2 decimals
+    if u[7] < 0.10:
+        x = np.maximum(x, 0.0)
+    else:
+        F = lev * r.uniform(0.05, 0.2)
+        neg = x < 0.0
+        x[neg] = -F * np.log1p(-x[neg] / F)
+    return np.round(x, 2)
+
+
+def _c259_dap(r, L):
+    L = int(L)
+    if L < 1024:
+        return None
+    n = L if r.random() < 0.9 else int(r.uniform(2000.0, L))
+    x = _c259_dap_series(r, n)
+    if x.shape != (n,) or not bool(np.all(np.isfinite(x))) or float(np.ptp(x)) <= 0.0 or float(np.mean(x == 0.0)) > 0.02:
+        return None
+    return _c259_pad(x, L)
+
+
+# ── AQW: hourly PM / NO2-type air quality with transient accumulation episodes and fast washouts ────────────────────────
+# Eval (351 hourly series of luchtmeetnet / irceline NO2, NO, PM2.5, PM10, BC, CO; O3/SO2/benzene excluded): length
+# 1027 / 1104 / 1153 (contexts h64 ~1040, h256 ~850, h720 ~380); level 0.39 / 5.7 / 17; CV 0.56 / 0.88 / 2.4; daily
+# profile ptp/sd 0.59 / 0.91 / 1.35; ACF lag 1 / 24 / 72 / 168 = .87 / .28 / .10 / .18; 1-decimal grid 97 % (no integer-valued
+# series in 13 public blocks); exact repeats 0.3 / 5.6 / 28 %; random cuts: the last 24 h sit > 0.5 sd above the context median in
+# 53 % of cuts and then REVERT (next-64-h mean below the last-24-h mean) 68 % of the time (mean -0.36 sd); after a low end
+# the next 64 h rise +0.59 sd. KING-INIT on AQ windows that revert after an elevated end: -0.075 (h256) / -0.139 (h64)
+# nats per window (8 pools), +0.07..+0.15 where they keep rising: the king's AQ content (XZ airq: persistent sigmoid level
+# SHIFTS, 90 % up) teaches persistence of elevated states. AQW teaches transient episodes (gradual build-up, fast washout).
+_C259_AQ_TYPES = (  # name, mix weight, level lo/hi, traffic (double peak + weekday), log-sd scale
+    ("no2", 0.32, 6.0, 35.0, True, 0.55),
+    ("pm25", 0.24, 2.5, 15.0, False, 0.55),
+    ("pm10", 0.12, 6.0, 25.0, False, 0.45),
+    ("bc", 0.12, 0.25, 1.6, True, 0.65),
+    ("no", 0.11, 0.6, 12.0, True, 0.90),
+    ("co", 0.09, 0.15, 0.45, True, 0.35),
+)
+_C259_AQ_CUM = np.cumsum([t[1] for t in _C259_AQ_TYPES])
+
+
+def _c259_aqw_series(r, n):
+    k = min(int(np.searchsorted(_C259_AQ_CUM, r.random() * _C259_AQ_CUM[-1], side="right")), len(_C259_AQ_TYPES) - 1)
+    name, _w, lo, hi, traffic, sig = _C259_AQ_TYPES[k]
+    t = np.arange(n, dtype=np.int64) + int(r.integers(0, 168))
+    hod = (t % 24).astype(np.float64)
+    day = t // 24
+    nd = int(day[-1]) + 1
+    dow = day % 7
+    sig = sig * r.uniform(0.7, 1.3)
+    # slow baseline: OU (tau 150-700 h) + seasonal ramp (autumn build-up 65 %, decline 20 %, flat 15 %)
+    z = _c259_ar1(r, n, float(np.exp(-1.0 / _c259_lu(r, 150.0, 700.0))), sig * r.uniform(0.25, 0.5))
+    uu = r.random()
+    ramp = (r.uniform(0.5, 1.6) if uu < 0.75 else (-r.uniform(0.2, 0.6) if uu < 0.90 else 0.0)) * sig
+    z = z + ramp * np.linspace(-1.0, 0.0, n) * (n / 1100.0) ** 0.5
+    # episodes: stagnation build-up over 0.75-4 days (convex in log), plateau 0-18 h, washout over 2-14 h
+    ne = int(r.poisson(n / 24.0 / r.uniform(3.5, 8.0)))
+    ep = np.zeros(n)
+    tt = np.arange(n, dtype=np.float64)
+    for _ in range(ne):
+        c = r.uniform(-48.0, n + 24.0)
+        up = r.uniform(18.0, 96.0)
+        pl = r.uniform(0.0, 18.0) if r.random() < 0.6 else 0.0
+        dn = r.uniform(2.0, 14.0)
+        A = sig * _c259_lu(r, 0.9, 3.0)
+        s = tt - c
+        rise = np.clip(1.0 + s / up, 0.0, 1.0) ** r.uniform(1.3, 2.5)
+        fall = np.exp(-np.clip(s - pl, 0.0, None) / dn)
+        ep += A * np.where(s <= 0.0, rise, np.where(s <= pl, 1.0, fall))
+    # stagnation also deepens the diurnal swing
+    epn = ep / (float(ep.max()) + 1e-9) if ep.size and float(ep.max()) > 0.0 else ep
+    hh = np.arange(24, dtype=np.float64)
+    if traffic:
+        prof = (r.uniform(0.6, 1.0) * _c259_bump(hh, r.uniform(7.0, 9.0), r.uniform(1.2, 2.2))
+                + r.uniform(0.5, 1.0) * _c259_bump(hh, r.uniform(18.0, 21.5), r.uniform(1.8, 3.5))
+                - r.uniform(0.2, 0.5) * _c259_bump(hh, r.uniform(13.0, 16.0), r.uniform(2.0, 3.5)))
+    else:
+        prof = (r.uniform(0.6, 1.0) * _c259_bump(hh, r.uniform(20.0, 24.5), r.uniform(2.5, 4.5))
+                + r.uniform(0.0, 0.5) * _c259_bump(hh, r.uniform(7.5, 10.0), r.uniform(1.5, 2.5)))
+    prof = prof - prof.mean()
+    prof = prof * (sig * r.uniform(0.12, 0.32) / (float(np.std(prof)) + 1e-9))
+    dmod = np.exp(r.normal(0.0, r.uniform(0.15, 0.4), nd))
+    z = z + prof[(hod.astype(np.int64))] * dmod[day] * (1.0 + r.uniform(0.2, 0.8) * epn)
+    if traffic:
+        wk = np.zeros(7)
+        wk[5] = np.log(r.uniform(0.7, 0.92))
+        wk[6] = np.log(r.uniform(0.55, 0.85))
+        z = z + wk[dow]
+    z = z + ep
+    # short-memory noise (t tails)
+    df = r.uniform(4.0, 12.0)
+    e = np.clip(r.standard_t(df, n), -8.0, 8.0) * np.sqrt((df - 2.0) / df)
+    z = z + lfilter([1.0], [1.0, -r.uniform(0.0, 0.5)], e) * sig * r.uniform(0.15, 0.35)
+    lev = _c259_lu(r, lo, hi)
+    x = lev * np.exp(z - float(np.median(z)))
+    # measurement grid: 1 decimal 90 %, 2 decimals 10 % (and every series below level 2); floor = one quantum. No integer grid
+    # (c259 review R1: no hourly AQ eval series is integer-valued; integer draws aliased onto hourly counts / bike docks).
+    uq = r.random()
+    q = 0.01 if (uq < 0.10 or lev < 2.0) else 0.1
+    x = np.maximum(np.round(x / q) * q, q)
+    return np.round(x, 2)
+
+
+def _c259_aqw(r, L):
+    L = int(L)
+    if L < 512:
+        return None
+    u = r.random()
+    if u < 0.60:
+        n = int(r.uniform(950.0, 1250.0))
+    elif u < 0.85:
+        n = int(r.uniform(400.0, 950.0))
+    else:
+        n = int(r.uniform(1250.0, 3000.0))
+    n = min(n, L)
+    x = _c259_aqw_series(r, n)
+    if x.shape != (n,) or not bool(np.all(np.isfinite(x))) or float(np.ptp(x)) <= 0.0:
+        return None
+    if np.unique(x).size < 20 or float(np.mean(x <= 0.0)) > 0.02:
+        return None
+    return _c259_pad(x, L)
+
+
+# ═══════════════ c201-osm: low-cost PM2.5 sensor feeds (150-s cadence) inserted as eval-layout univariate records ═══════════════
+# Every record of the parent is yielded unchanged and in order. Before record i, with probability _C201O_Q (record i's own
+# coin), ONE univariate series of _C201O_L points is inserted: a citizen-science PM2.5 sensor feed (openSenseMap-style box)
+# laid out as the eval presents it (the real segment at the end, a short history left-padded with its own first value).
+# Why: the pool's osem_pm25 family (~60 sensors, 150-s cadence, a few at 5 min) is a moving family where the real king is
+# WORSE than its own init (-0.68%/window). The corpus has no matching builder: the hourly/15-min pollutant builders
+# (_w86a_pollutant, _xa_airq, _acuh_air) draw official-station feeds at 24-96 steps/day; this family runs 576 steps/day and
+# its texture is a counting-sensor readout: a slowly varying concentration seen through level-dependent noise.
+# Statistics (ranges summarise the family's traits; no values or sequences embedded):
+#   level      median piecewise logU over 0.7-1.6-2.5-4-6.3-10-32-150-700 ug/m3 (10/10/16/35/11/12/5/1%)
+#   concentr.  log path = smoothed slow OU (tau 5-40 h, smoothing 0.8-3 h, sd 0.28-0.82) + smooth 1-4 h component
+#              (sd 0.03-0.15)
+#              + daily cycle (85%: 1st harmonic 0.05-0.72 log, 2nd 0.1-0.9 of it, day-to-day amplitude modulation)
+#              + episodes (0.5-3/day, gradual build-up 0.5-8 h, sharp collapse 1-60 min: the family's hour-scale
+#              changes are negatively skewed) + sharp level steps + rare fog bumps
+#   readout    noise sd = c * level^0.42-0.68 (c logU 0.13-0.25), AR(1) 0.05-0.40, 35% t-tailed; single-point bursts
+#              (0.6-5% of points, +10-100%), emission spikes with 1-8 point exponential tails, rare dips, 999.9 codes (3%);
+#              readings clip at the sensor's 999.9 range (the family never exceeds it); a draw with sustained
+#              readings above it (> 0.2% of points) is dropped, so no saturation holds are created
+#   grid       bin means of 0.1-resolution readings (k = 1 or 3 readings 66%, 1-4 readings 24%, raw 0.1 grid 10%;
+#              a sensor reading below 1.6 ug/m3 sits on the raw 0.1 grid 45% of the time),
+#              2 decimals, floor 0/0.1/0.2
+#   variants   4% two co-located sensors interleaved in one stream (alternating, slips, shared bins); 7% 5-min cadence
+#   lengths    the full 4096 window for 55% (the family's capped 4160-point histories), else 2400-4096 / 700-2400 / 300-700
+# Record i's draws come only from SeedSequence([seed, _C201O_TAG], spawn_key=(i,)), so every parent RNG advances exactly as
+# without this block. The stream stops at n_series records in total (inserts count), like the c246 insert layer.
+_C201O_TAG = 0xC2010E5A
