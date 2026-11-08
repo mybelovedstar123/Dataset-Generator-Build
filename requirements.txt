@@ -249,4 +249,6 @@ scipy==1.17.1 \
 threadpoolctl==3.8.0 \
     --hash=sha256:01080674ad7ac6182429c918a79de92da789bb448acc02fc0b620b1abd6b6137 \
     --hash=sha256:f1b49c82704d50f13ffae019c727b0fa4f6791a58f48f06a09c45face1be66da
-    # via scikit-learn
+    # via
+    #   -r requirements.in
+    #   scikit-learn
