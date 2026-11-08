@@ -31,7 +31,8 @@ coupled channel is stacked under the first.
 |---|---|
 | `generator.py` | The whole generator: engine, vendored *chronoforge* family library, partner family program, teach stream and the public `Generator` |
 | `config.json` | Family weights, length band, observation-layer rates, augmentation, partner-program settings, runtime controls |
-| `requirements.txt` | Hash-pinned runtime dependencies |
+| `requirements.in` | The direct dependencies, pinned by version |
+| `requirements.txt` | Compiled from `requirements.in`: every package, with hashes |
 | `SCAN.json` | Static scan report for the module (`high: 0, warn: 0`) |
 | `.github/` | CI workflow, requirements checker, Dependabot config, issue and PR templates |
 | `CONTRIBUTING.md`, `SECURITY.md` | Contribution rules and vulnerability reporting |
@@ -237,7 +238,7 @@ Invalid values fail fast with `ValueError` / `ConfigError` at construction.
 ## Usage
 
 ```bash
-pip install numpy==2.4.6 scipy==1.17.1 numba==0.66.0 scikit-learn==1.9.0
+pip install -r requirements.txt
 ```
 
 ```python
@@ -256,18 +257,16 @@ the producer threads cleanly.
 
 Every pull request runs [CI](.github/workflows/ci.yml). `generator.py` must compile
 and pass `ruff` for syntax and runtime errors, every JSON file must parse, and every
-line in `requirements.txt` must be an exact `==` pin with a `sha256` hash.
+requirement in `requirements.txt` must be an exact `==` pin with `sha256` hashes that
+pip can install. To change a dependency, edit `requirements.in`, delete
+`requirements.txt` and run
+`pip-compile --generate-hashes --no-strip-extras --output-file=requirements.txt requirements.in`.
 [CONTRIBUTING.md](CONTRIBUTING.md) lists the same checks as local commands, plus the
 reproducibility rules a change must follow.
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Known limitations
 
-- **`requirements.txt` is not installable as written with pip.** It uses `--hash`
-  pins, which switch pip into hash-checking mode. That mode also requires every
-  transitive dependency (`llvmlite`, `joblib`, `threadpoolctl`, ...) to be pinned
-  and hashed. Until those are added, install the four packages by version, as shown
-  above.
 - **`threadpoolctl` is imported unconditionally** but only arrives transitively
   through scikit-learn.
 - **`cascade.interface` is external.** The module cannot be imported outside the

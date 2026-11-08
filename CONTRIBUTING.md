@@ -9,13 +9,11 @@ pull request.
 ```bash
 python -m venv .venv
 . .venv/bin/activate            # Windows: .venv\Scripts\activate
-pip install numpy==2.4.6 scipy==1.17.1 numba==0.66.0 scikit-learn==1.9.0
+pip install -r requirements.txt
 ```
 
-Install by version as shown. `requirements.txt` is in pip's hash-checking mode and
-does not yet pin the transitive dependencies (see *Known limitations* in the
-README). Importing `generator.py` also needs the harness's `cascade` package, or
-a stub module that provides `cascade.interface.DataGenerator`.
+Importing `generator.py` also needs the harness's `cascade` package, or a stub
+module that provides `cascade.interface.DataGenerator`.
 
 ## Reproducibility rules
 
@@ -48,6 +46,7 @@ pip install ruff==0.13.1
 ruff check --no-cache --isolated --select E9,F63,F7 generator.py
 for f in *.json; do python -m json.tool "$f" > /dev/null && echo "ok  $f"; done
 python .github/scripts/check_requirements.py requirements.txt
+pip install --dry-run --require-hashes -r requirements.txt
 ```
 
 ## Commits and pull requests
