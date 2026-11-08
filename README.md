@@ -25,7 +25,7 @@ coupled channel is stacked under the first.
 |---|---|
 | Language | Python 3 (single module, ~30k lines) |
 | Interface | `cascade.interface.DataGenerator` → `Generator(config_dir, *, seed).generate(n_series)` |
-| Output | `numpy.float64` arrays: shape `(4096,)` (univariate) or `(2, L)` (two channels) |
+| Output | Batches: `{"values": float64 (32, 4096), "groups": uint8 (32,)}`, with one group label per packed record |
 | Generative families | ~90 in the engine (74 active at the shipped weights), 48 in the partner program, 6 in the active teach stream |
 | Determinism | Byte-identical output for a given `seed`, independent of thread count or scheduling |
 | Hot paths | Numba-compiled kernels (`nogil=True`), NumPy/SciPy vector code |
@@ -254,8 +254,9 @@ pip install numpy==2.4.6 scipy==1.17.1 numba==0.66.0 scikit-learn==1.9.0
 from generator import Generator      # requires the harness's `cascade` package
 
 gen = Generator(config_dir=".", seed=1234)
-for x in gen.generate(1_000):
-    # x.shape == (4096,)  or  (2, L)
+for batch in gen.generate(1_000):
+    values = batch["values"]    # float64, shape (32, 4096)
+    groups = batch["groups"]    # uint8, shape (32,)
     ...
 ```
 
