@@ -1,5 +1,11 @@
 # Dataset-Generator-Build
 
+[![CI](https://github.com/mybelovedstar123/Dataset-Generator-Build/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mybelovedstar123/Dataset-Generator-Build/actions/workflows/ci.yml)
+![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
+![NumPy 2.4](https://img.shields.io/badge/NumPy-2.4-013243?logo=numpy&logoColor=white)
+![Numba 0.66](https://img.shields.io/badge/Numba-0.66-00A3E0?logo=numba&logoColor=white)
+![Status: experimental](https://img.shields.io/badge/status-experimental-orange)
+
 A deterministic, multi-family **synthetic time-series generator** for pre-training
 forecasting models. It is a single Python module (`generator.py`) driven by one
 configuration file (`config.json`). The module implements the `DataGenerator`
@@ -17,9 +23,9 @@ coupled channel is stacked under the first.
 
 | | |
 |---|---|
-| Language | Python 3 (single module, ~19k lines) |
+| Language | Python 3 (single module, ~30k lines) |
 | Interface | `cascade.interface.DataGenerator` → `Generator(config_dir, *, seed).generate(n_series)` |
-| Output | `numpy.float64` arrays: shape `(4096,)` (univariate) or `(2, L)` (two channels) |
+| Output | Batches: `{"values": float64 (32, 4096), "groups": uint8 (32,)}`, with one group label per packed record |
 | Generative families | ~90 in the engine (74 active at the shipped weights), 48 in the partner program, 6 in the active teach stream |
 | Determinism | Byte-identical output for a given `seed`, independent of thread count or scheduling |
 | Hot paths | Numba-compiled kernels (`nogil=True`), NumPy/SciPy vector code |
@@ -58,13 +64,17 @@ the one below it and changes only the rows its own random stream selects:
 
 ```
 Generator  ("k86-fork/b2")            fork: adds a second channel to a band of non-quiet univariate rows
-  └─ Generator  ("w9qedrki")          stacks a partner / teach-stream channel under ~29.6% of rows
+  └─ Generator  ("w9qedrki")          stacks a partner / teach-stream channel under a share of rows
        ├─ _EngineGenerator            swaps 14.779% of rows for a "novel" family stream (I141 selector)
        │    └─ _BaseGenerator         the engine: family dispatch → build → observe → sanitise → post-process
        │         └─ chronoforge       vendored family library (32 families, observation layer, sanitiser)
        ├─ _pt_Generator               partner family program (names prefixed _pt_)
        └─ _TeachStream                batched "teach" families (IXP traffic, web counters, season onsets, ...)
 ```
+
+This diagram is the core of the stack. `generator.py` now defines `Generator` 38 times:
+each later class wraps the one before it and replaces only the rows its own stream
+selects. Percentages in this README describe the core layers, not the final mix of rows.
 
 The module is organised by banner comments (`# ═══ engine ═══`, `# ═══ chronoforge: cf_rng ═══`, ...),
 so each subsystem can be found by searching for its banner.
@@ -204,7 +214,7 @@ reversal, no tail-concentrated regime breaks, and no blind rounding.
   `signed_flow`, `web_counter`, `season_onset`, `sparse_counts` and
   `ed_visit_share`. An earlier ten-family set is still in the module, but it has
   been superseded. The teach stream supplies 43.75% of partner rows.
-- **Stacking:** a per-row coin (`_Q = 0.296`) decides whether a partner row is stacked
+- **Stacking:** a per-row coin (`_Q`) decides whether a partner row is stacked
   under the engine row, aligned on the right-hand edge.
 - **Coupling:** the second channel gets `0.2 × sd(Δy)` of the first channel's
   standardised increments added, so the channels are correlated rather than
@@ -245,8 +255,9 @@ pip install -r requirements.txt
 from generator import Generator      # requires the harness's `cascade` package
 
 gen = Generator(config_dir=".", seed=1234)
-for x in gen.generate(1_000):
-    # x.shape == (4096,)  or  (2, L)
+for batch in gen.generate(1_000):
+    values = batch["values"]    # float64, shape (32, 4096)
+    groups = batch["groups"]    # uint8, shape (32,)
     ...
 ```
 
@@ -270,6 +281,6 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - **`cascade.interface` is external.** The module cannot be imported outside the
   Cascade harness without a stub that provides `DataGenerator`.
 - **Single large module.** Earlier layers are kept and wrapped (`Generator` is
-  redefined twice; `_EngineGenerator` once) so that every published row stream stays
+  defined 38 times; `_EngineGenerator` twice) so that every published row stream stays
   reproducible. That makes the file long, and its layering is easiest to follow from
   the bottom up.
