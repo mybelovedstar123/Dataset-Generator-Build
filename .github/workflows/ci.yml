@@ -24,7 +24,7 @@ jobs:
       - name: Lint for syntax and runtime errors
         run: |
           pip install --disable-pip-version-check --quiet ruff==0.13.1
-          ruff check --no-cache --isolated --select E9,F63,F7 --output-format github generator.py
+          ruff check --no-cache --isolated --select E9,F63,F7,F82 --output-format github generator.py
 
       - name: Validate JSON files
         run: |

@@ -11015,7 +11015,7 @@ def _isp_rows(rng: np.random.Generator, P: np.ndarray, kind: np.ndarray, L: int,
     del e_v, v_t
 
     def bump(mu, w):
-        d = np.abs(np.mod(tau - mu + 12.0, 24.0) - 12.0)
+        d = np.abs(np.mod(tau - mu + 12.0, 24.0) - 12.0)  # noqa: F821
         return np.exp(-0.5 * (d / w) ** 2)
     mu_m = rng.uniform(6.5, 9.0, size=(n, 1))
     mu_e = rng.uniform(17.0, 20.5, size=(n, 1))
