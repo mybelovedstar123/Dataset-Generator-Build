@@ -20708,6 +20708,13 @@ def _xc_dips(r, lx, k, size):
         lx[i:i + w] -= size * _xc_lu(r, 0.2, 1.5) * np.exp(-np.arange(w) / tau)
     return lx
 
+def _xc_events(r, lx, k_plat, k_bump, k_dip, k_needle, size):
+    n = lx.size
+    lx = lx + _xc_steps(r, n, k_plat, 15.0, 300.0, 0.3 * size, 4.0 * size, 0.8)
+    lx = lx + _xc_steps(r, n, k_bump, 2.0, 14.0, 0.2 * size, 2.5 * size, 0.9)
+    lx = _xc_dips(r, lx, k_dip, 2.0 * size)
+    return _xc_needles(r, lx, k_needle, 0.03, 0.85)
+
 def _xc_rate_std(r, n):
     base = float(np.clip(np.exp(r.normal(np.log(0.27), 0.42)), 0.07, 0.62))
     q = float(np.exp(r.normal(0.0, 0.6)))
@@ -23607,6 +23614,13 @@ def _yg_dips(r, lx, k, size):
         w = min(n - i, int(7.0 * tau) + 2)
         lx[i:i + w] -= size * _yg_lu(r, 0.2, 1.5) * np.exp(-np.arange(w) / tau)
     return lx
+
+def _yg_events(r, lx, k_plat, k_bump, k_dip, k_needle, size):
+    n = lx.size
+    lx = lx + _yg_steps(r, n, k_plat, 15.0, 300.0, 0.3 * size, 4.0 * size, 0.8)
+    lx = lx + _yg_steps(r, n, k_bump, 2.0, 14.0, 0.2 * size, 2.5 * size, 0.9)
+    lx = _yg_dips(r, lx, k_dip, 2.0 * size)
+    return _yg_needles(r, lx, k_needle, 0.03, 0.85)
 
 def _yg_rate_std(r, n):
     base = float(np.clip(np.exp(r.normal(np.log(0.27), 0.42)), 0.07, 0.62))
