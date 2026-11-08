@@ -1,5 +1,11 @@
 # Dataset-Generator-Build
 
+[![CI](https://github.com/mybelovedstar123/Dataset-Generator-Build/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mybelovedstar123/Dataset-Generator-Build/actions/workflows/ci.yml)
+![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
+![NumPy 2.4](https://img.shields.io/badge/NumPy-2.4-013243?logo=numpy&logoColor=white)
+![Numba 0.66](https://img.shields.io/badge/Numba-0.66-00A3E0?logo=numba&logoColor=white)
+![Status: experimental](https://img.shields.io/badge/status-experimental-orange)
+
 A deterministic, multi-family **synthetic time-series generator** for pre-training
 forecasting models. It is a single Python module (`generator.py`) driven by one
 configuration file (`config.json`). The module implements the `DataGenerator`
