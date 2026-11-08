@@ -44,8 +44,8 @@ coupled channel is stacked under the first.
 | **NumPy** | 2.4.6 | All array work; `SeedSequence`/`PCG64` for every random stream |
 | **Numba** | 0.66.0 | ~60 JIT-compiled recurrences (AR/ARMA filters, RK4 integrators, Hawkes, renewal processes). Compiled with `nogil=True` so worker threads run in parallel |
 | **SciPy** | 1.17.1 | `signal.lfilter` (linear recurrences), `ndimage` min/max filters, `special.gammaincinv` |
-| **threadpoolctl** | via scikit-learn | Pins BLAS/OpenMP pools to one thread at import time |
-| **scikit-learn** | 1.9.0 | Pinned, but not imported by `generator.py`; it supplies `threadpoolctl` |
+| **threadpoolctl** | 3.8.0 | Pins BLAS/OpenMP pools to one thread at import time |
+| **scikit-learn** | 1.9.0 | Pinned, but not imported by `generator.py` |
 | **cascade** | harness | Supplies the `DataGenerator` base class. Not on this repo's dependency list; provided by the evaluation sandbox |
 
 Standard library: `threading`, `queue`, `functools`, `json`, `pathlib`.
@@ -267,8 +267,6 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Known limitations
 
-- **`threadpoolctl` is imported unconditionally** but only arrives transitively
-  through scikit-learn.
 - **`cascade.interface` is external.** The module cannot be imported outside the
   Cascade harness without a stub that provides `DataGenerator`.
 - **Single large module.** Earlier layers are kept and wrapped (`Generator` is
