@@ -35,3 +35,6 @@ jobs:
 
       - name: Check requirements.txt pins
         run: python .github/scripts/check_requirements.py requirements.txt
+
+      - name: Check requirements.txt installs in hash-checking mode
+        run: pip install --disable-pip-version-check --dry-run --require-hashes -r requirements.txt

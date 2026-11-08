@@ -15,7 +15,8 @@ PINNED = re.compile(r"[A-Za-z0-9._-]+==[A-Za-z0-9.!+]+(\s+--hash=sha256:[0-9a-f]
 
 def main(path):
     with open(path, encoding="utf-8") as f:
-        lines = f.read().splitlines()
+        # pip-compile writes each requirement across several backslash-continued lines.
+        lines = f.read().replace("\\\n", " ").splitlines()
     bad = []
     for n, line in enumerate(lines, 1):
         req = line.split("#", 1)[0].strip()
