@@ -43,7 +43,7 @@ CI runs these on every pull request. Run them locally first:
 ```bash
 python -m py_compile generator.py
 pip install ruff==0.13.1
-ruff check --no-cache --isolated --select E9,F63,F7 generator.py
+ruff check --no-cache --isolated --select E9,F63,F7,F82 generator.py
 for f in *.json; do python -m json.tool "$f" > /dev/null && echo "ok  $f"; done
 python .github/scripts/check_requirements.py requirements.txt
 pip install --dry-run --require-hashes -r requirements.txt
