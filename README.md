@@ -23,7 +23,7 @@ coupled channel is stacked under the first.
 
 | | |
 |---|---|
-| Language | Python 3 (single module, ~19k lines) |
+| Language | Python 3 (single module, ~30k lines) |
 | Interface | `cascade.interface.DataGenerator` → `Generator(config_dir, *, seed).generate(n_series)` |
 | Output | `numpy.float64` arrays: shape `(4096,)` (univariate) or `(2, L)` (two channels) |
 | Generative families | ~90 in the engine (74 active at the shipped weights), 48 in the partner program, 6 in the active teach stream |
@@ -63,13 +63,17 @@ the one below it and changes only the rows its own random stream selects:
 
 ```
 Generator  ("k86-fork/b2")            fork: adds a second channel to a band of non-quiet univariate rows
-  └─ Generator  ("w9qedrki")          stacks a partner / teach-stream channel under ~29.6% of rows
+  └─ Generator  ("w9qedrki")          stacks a partner / teach-stream channel under a share of rows
        ├─ _EngineGenerator            swaps 14.779% of rows for a "novel" family stream (I141 selector)
        │    └─ _BaseGenerator         the engine: family dispatch → build → observe → sanitise → post-process
        │         └─ chronoforge       vendored family library (32 families, observation layer, sanitiser)
        ├─ _pt_Generator               partner family program (names prefixed _pt_)
        └─ _TeachStream                batched "teach" families (IXP traffic, web counters, season onsets, ...)
 ```
+
+This diagram is the core of the stack. `generator.py` now defines `Generator` 38 times:
+each later class wraps the one before it and replaces only the rows its own stream
+selects. Percentages in this README describe the core layers, not the final mix of rows.
 
 The module is organised by banner comments (`# ═══ engine ═══`, `# ═══ chronoforge: cf_rng ═══`, ...),
 so each subsystem can be found by searching for its banner.
@@ -209,7 +213,7 @@ reversal, no tail-concentrated regime breaks, and no blind rounding.
   `signed_flow`, `web_counter`, `season_onset`, `sparse_counts` and
   `ed_visit_share`. An earlier ten-family set is still in the module, but it has
   been superseded. The teach stream supplies 43.75% of partner rows.
-- **Stacking:** a per-row coin (`_Q = 0.296`) decides whether a partner row is stacked
+- **Stacking:** a per-row coin (`_Q`) decides whether a partner row is stacked
   under the engine row, aligned on the right-hand edge.
 - **Coupling:** the second channel gets `0.2 × sd(Δy)` of the first channel's
   standardised increments added, so the channels are correlated rather than
@@ -279,6 +283,6 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - **`cascade.interface` is external.** The module cannot be imported outside the
   Cascade harness without a stub that provides `DataGenerator`.
 - **Single large module.** Earlier layers are kept and wrapped (`Generator` is
-  redefined twice; `_EngineGenerator` once) so that every published row stream stays
+  defined 38 times; `_EngineGenerator` twice) so that every published row stream stays
   reproducible. That makes the file long, and its layering is easiest to follow from
   the bottom up.
